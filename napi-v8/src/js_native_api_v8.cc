@@ -367,6 +367,16 @@ napi_status NAPI_CDECL napi_create_bigint_words(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
+napi_status NAPI_CDECL napi_create_date(napi_env env, double time, napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> out;
+  if (!v8::Date::New(env->context(), time).ToLocal(&out)) {
+    return napi_generic_failure;
+  }
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
 napi_status NAPI_CDECL napi_create_object(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::Object::New(env->isolate));
@@ -784,6 +794,26 @@ napi_status NAPI_CDECL napi_get_value_bigint_words(napi_env env,
   bigint->ToWordsArray(&sign, &requested, words);
   if (sign_bit != nullptr) *sign_bit = sign;
   *word_count = static_cast<size_t>(requested);
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_is_date(napi_env env, napi_value value, bool* is_date) {
+  if (!CheckEnv(env) || value == nullptr || is_date == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  *is_date = napi_v8_unwrap_value(value)->IsDate();
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_get_date_value(napi_env env, napi_value value, double* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  if (!local->IsDate()) {
+    return napi_v8_set_last_error(env, napi_date_expected, "A date was expected");
+  }
+  *result = local.As<v8::Date>()->ValueOf();
   return napi_v8_clear_last_error(env);
 }
 
