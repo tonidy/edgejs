@@ -817,6 +817,95 @@ napi_status NAPI_CDECL napi_get_date_value(napi_env env, napi_value value, doubl
   return napi_v8_clear_last_error(env);
 }
 
+napi_status NAPI_CDECL napi_is_arraybuffer(napi_env env, napi_value value, bool* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  *result = napi_v8_unwrap_value(value)->IsArrayBuffer();
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL node_api_is_sharedarraybuffer(node_api_basic_env env,
+                                                     napi_value value,
+                                                     bool* result) {
+  auto* napiEnv = const_cast<napi_env>(env);
+  if (!CheckEnv(napiEnv) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(napiEnv, napi_invalid_arg, "Invalid argument");
+  }
+  *result = napi_v8_unwrap_value(value)->IsSharedArrayBuffer();
+  return napi_v8_clear_last_error(napiEnv);
+}
+
+napi_status NAPI_CDECL napi_create_dataview(napi_env env,
+                                            size_t length,
+                                            napi_value arraybuffer,
+                                            size_t byte_offset,
+                                            napi_value* result) {
+  if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::Local<v8::Value> ab = napi_v8_unwrap_value(arraybuffer);
+  if (!ab->IsArrayBuffer() && !ab->IsSharedArrayBuffer()) {
+    return napi_v8_set_last_error(env, napi_arraybuffer_expected, "ArrayBuffer expected");
+  }
+
+  v8::TryCatch tc(env->isolate);
+  auto context = env->context();
+  v8::Local<v8::String> ctor_name = v8::String::NewFromUtf8Literal(env->isolate, "DataView");
+  v8::Local<v8::Value> ctor_val;
+  if (!context->Global()->Get(context, ctor_name).ToLocal(&ctor_val) || !ctor_val->IsFunction()) {
+    return napi_generic_failure;
+  }
+  v8::Local<v8::Function> ctor = ctor_val.As<v8::Function>();
+  v8::Local<v8::Value> args[3] = {
+      ab,
+      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(byte_offset)),
+      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(length)),
+  };
+  v8::Local<v8::Object> out;
+  if (!ctor->NewInstance(context, 3, args).ToLocal(&out)) {
+    if (tc.HasCaught()) {
+      env->last_exception.Reset(env->isolate, tc.Exception());
+      return napi_v8_set_last_error(env, napi_pending_exception, "DataView construction threw");
+    }
+    return napi_generic_failure;
+  }
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_is_dataview(napi_env env, napi_value value, bool* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  *result = napi_v8_unwrap_value(value)->IsDataView();
+  return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_get_dataview_info(napi_env env,
+                                              napi_value dataview,
+                                              size_t* byte_length,
+                                              void** data,
+                                              napi_value* arraybuffer,
+                                              size_t* byte_offset) {
+  if (!CheckEnv(env) || dataview == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::Local<v8::Value> view_val = napi_v8_unwrap_value(dataview);
+  if (!view_val->IsDataView()) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::Local<v8::DataView> view = view_val.As<v8::DataView>();
+  if (byte_length != nullptr) *byte_length = view->ByteLength();
+  if (byte_offset != nullptr) *byte_offset = view->ByteOffset();
+  if (data != nullptr) *data = view->Buffer()->Data();
+  if (arraybuffer != nullptr) {
+    *arraybuffer = napi_v8_wrap_value(env, view->Buffer());
+    if (*arraybuffer == nullptr) return napi_generic_failure;
+  }
+  return napi_v8_clear_last_error(env);
+}
+
 napi_status NAPI_CDECL napi_is_array(napi_env env, napi_value value, bool* result) {
   if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_unwrap_value(value)->IsArray();

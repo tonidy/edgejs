@@ -21,6 +21,7 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_object` (ported to gtest harness)
 - `test_bigint` (ported to gtest harness)
 - `test_date` (ported to gtest harness)
+- `test_dataview` (ported to gtest harness)
 
 ### implement_now
 
@@ -40,7 +41,6 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 ### defer_phase2
 
 - `test_cannot_run_js`
-- `test_dataview`
 - `test_finalizer`
 - `test_handle_scope`
 - `test_instance_data`
