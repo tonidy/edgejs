@@ -15,6 +15,7 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `3_callbacks` (ported to gtest harness)
 - `test_reference` (ported to gtest harness)
 - `test_string` (ported to gtest harness)
+- `test_conversions` (ported to gtest harness)
 
 ### implement_now
 
@@ -25,7 +26,6 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `8_passing_wrapped`
 - `test_array`
 - `test_constructor`
-- `test_conversions`
 - `test_error`
 - `test_exception`
 - `test_function`

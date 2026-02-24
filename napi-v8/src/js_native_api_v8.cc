@@ -553,41 +553,57 @@ napi_status NAPI_CDECL napi_typeof(napi_env env,
 napi_status NAPI_CDECL napi_get_value_double(napi_env env,
                                              napi_value value,
                                              double* result) {
-  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  if (!local->IsNumber()) return napi_number_expected;
+  if (!local->IsNumber()) {
+    return napi_v8_set_last_error(env, napi_number_expected, "A number was expected");
+  }
   *result = local.As<v8::Number>()->Value();
-  return napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_get_value_uint32(napi_env env,
                                              napi_value value,
                                              uint32_t* result) {
-  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  if (!local->IsNumber()) return napi_number_expected;
+  if (!local->IsNumber()) {
+    return napi_v8_set_last_error(env, napi_number_expected, "A number was expected");
+  }
   *result = local->Uint32Value(env->context()).FromMaybe(0);
-  return napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_get_value_int32(napi_env env,
                                             napi_value value,
                                             int32_t* result) {
-  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  if (!local->IsNumber()) return napi_number_expected;
+  if (!local->IsNumber()) {
+    return napi_v8_set_last_error(env, napi_number_expected, "A number was expected");
+  }
   *result = local->Int32Value(env->context()).FromMaybe(0);
-  return napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_get_value_int64(napi_env env,
                                             napi_value value,
                                             int64_t* result) {
-  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  if (!local->IsNumber()) return napi_number_expected;
+  if (!local->IsNumber()) {
+    return napi_v8_set_last_error(env, napi_number_expected, "A number was expected");
+  }
   *result = local->IntegerValue(env->context()).FromMaybe(0);
-  return napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_is_array(napi_env env, napi_value value, bool* result) {
@@ -1012,21 +1028,31 @@ napi_status NAPI_CDECL napi_get_named_property(napi_env env,
 napi_status NAPI_CDECL napi_get_value_bool(napi_env env,
                                            napi_value value,
                                            bool* result) {
-  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  if (!local->IsBoolean()) return napi_boolean_expected;
+  if (!local->IsBoolean()) {
+    return napi_v8_set_last_error(env, napi_boolean_expected, "A boolean was expected");
+  }
   *result = local.As<v8::Boolean>()->Value();
-  return napi_ok;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_get_value_string_utf8(
     napi_env env, napi_value value, char* buf, size_t bufsize, size_t* result) {
-  if (!CheckValue(env, value)) return napi_invalid_arg;
+  if (!CheckEnv(env) || value == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  if (!local->IsString()) return napi_string_expected;
+  if (!local->IsString()) {
+    return napi_v8_set_last_error(env, napi_string_expected, "A string was expected");
+  }
   v8::Local<v8::String> str = local.As<v8::String>();
   if (buf == nullptr) {
-    if (result == nullptr) return napi_invalid_arg;
+    if (result == nullptr) {
+      return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+    }
     *result = str->Utf8LengthV2(env->isolate);
   } else if (bufsize != 0) {
     size_t copied = str->WriteUtf8V2(env->isolate,
@@ -1043,12 +1069,18 @@ napi_status NAPI_CDECL napi_get_value_string_utf8(
 
 napi_status NAPI_CDECL napi_get_value_string_latin1(
     napi_env env, napi_value value, char* buf, size_t bufsize, size_t* result) {
-  if (!CheckValue(env, value)) return napi_invalid_arg;
+  if (!CheckEnv(env) || value == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  if (!local->IsString()) return napi_string_expected;
+  if (!local->IsString()) {
+    return napi_v8_set_last_error(env, napi_string_expected, "A string was expected");
+  }
   v8::Local<v8::String> str = local.As<v8::String>();
   if (buf == nullptr) {
-    if (result == nullptr) return napi_invalid_arg;
+    if (result == nullptr) {
+      return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+    }
     *result = str->Length();
   } else if (bufsize != 0) {
     uint32_t length = static_cast<uint32_t>(
@@ -1070,12 +1102,18 @@ napi_status NAPI_CDECL napi_get_value_string_utf16(napi_env env,
                                                    char16_t* buf,
                                                    size_t bufsize,
                                                    size_t* result) {
-  if (!CheckValue(env, value)) return napi_invalid_arg;
+  if (!CheckEnv(env) || value == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
-  if (!local->IsString()) return napi_string_expected;
+  if (!local->IsString()) {
+    return napi_v8_set_last_error(env, napi_string_expected, "A string was expected");
+  }
   v8::Local<v8::String> str = local.As<v8::String>();
   if (buf == nullptr) {
-    if (result == nullptr) return napi_invalid_arg;
+    if (result == nullptr) {
+      return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+    }
     *result = str->Length();
   } else if (bufsize != 0) {
     uint32_t length = static_cast<uint32_t>(
@@ -1090,6 +1128,71 @@ napi_status NAPI_CDECL napi_get_value_string_utf16(napi_env env,
     *result = 0;
   }
   return napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_coerce_to_bool(napi_env env,
+                                           napi_value value,
+                                           napi_value* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  *result = napi_v8_wrap_value(
+      env, v8::Boolean::New(env->isolate, napi_v8_unwrap_value(value)->BooleanValue(env->isolate)));
+  return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_coerce_to_number(napi_env env,
+                                             napi_value value,
+                                             napi_value* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::TryCatch try_catch(env->isolate);
+  v8::Local<v8::Number> out;
+  if (!napi_v8_unwrap_value(value)->ToNumber(env->context()).ToLocal(&out)) {
+    if (try_catch.HasCaught()) {
+      env->last_exception.Reset(env->isolate, try_catch.Exception());
+    }
+    return napi_v8_set_last_error(env, napi_pending_exception, "Exception during number coercion");
+  }
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_coerce_to_object(napi_env env,
+                                             napi_value value,
+                                             napi_value* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::TryCatch try_catch(env->isolate);
+  v8::Local<v8::Object> out;
+  if (!napi_v8_unwrap_value(value)->ToObject(env->context()).ToLocal(&out)) {
+    if (try_catch.HasCaught()) {
+      env->last_exception.Reset(env->isolate, try_catch.Exception());
+    }
+    return napi_v8_set_last_error(env, napi_pending_exception, "Exception during object coercion");
+  }
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
+}
+
+napi_status NAPI_CDECL napi_coerce_to_string(napi_env env,
+                                             napi_value value,
+                                             napi_value* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::TryCatch try_catch(env->isolate);
+  v8::Local<v8::String> out;
+  if (!napi_v8_unwrap_value(value)->ToString(env->context()).ToLocal(&out)) {
+    if (try_catch.HasCaught()) {
+      env->last_exception.Reset(env->isolate, try_catch.Exception());
+    }
+    return napi_v8_set_last_error(env, napi_pending_exception, "Exception during string coercion");
+  }
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_get_value_external(napi_env env,
