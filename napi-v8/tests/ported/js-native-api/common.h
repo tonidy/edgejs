@@ -49,4 +49,7 @@
 #define DECLARE_NODE_API_PROPERTY(name, func)                            \
   { (name), NULL, (func), NULL, NULL, NULL, napi_default, NULL }
 
+#define DECLARE_NODE_API_GETTER(name, func)                              \
+  { (name), NULL, NULL, (func), NULL, NULL, napi_default, NULL }
+
 #endif  // JS_NATIVE_API_COMMON_H_

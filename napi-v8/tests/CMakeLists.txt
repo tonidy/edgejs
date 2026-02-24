@@ -28,6 +28,10 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     ported/js-native-api/3_callbacks/3_callbacks.c
     ported/js-native-api/4_object_factory/4_object_factory.c
     ported/js-native-api/5_function_factory/5_function_factory.c
+    ported/js-native-api/7_factory_wrap/7_factory_wrap.cc
+    ported/js-native-api/7_factory_wrap/myobject.cc
+    ported/js-native-api/8_passing_wrapped/8_passing_wrapped.cc
+    ported/js-native-api/8_passing_wrapped/myobject.cc
   )
 
   target_include_directories(napi_v8_tier1_tests

@@ -11,6 +11,8 @@ extern "C" napi_value Init_2_function_arguments(napi_env env, napi_value exports
 extern "C" napi_value Init_3_callbacks(napi_env env, napi_value exports);
 extern "C" napi_value Init_4_object_factory(napi_env env, napi_value exports);
 extern "C" napi_value Init_5_function_factory(napi_env env, napi_value exports);
+extern "C" napi_value Init_7_factory_wrap(napi_env env, napi_value exports);
+extern "C" napi_value Init_8_passing_wrapped(napi_env env, napi_value exports);
 
 namespace {
 
@@ -247,6 +249,88 @@ TEST_F(NapiV8Test, Ported5FunctionFactory) {
   char buf[32];
   ASSERT_EQ(napi_get_value_string_utf8(env, out, buf, sizeof(buf), nullptr), napi_ok);
   EXPECT_EQ(std::string(buf), "hello world");
+
+  ASSERT_EQ(napi_v8_destroy_env(env), napi_ok);
+}
+
+TEST_F(NapiV8Test, Ported7FactoryWrap) {
+  v8::Isolate* isolate = runtime_->isolate();
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = v8::Context::New(isolate);
+  v8::Context::Scope context_scope(context);
+
+  napi_env env = nullptr;
+  ASSERT_EQ(napi_v8_create_env(context, 8, &env), napi_ok);
+  ASSERT_NE(env, nullptr);
+
+  napi_value exports = nullptr;
+  ASSERT_EQ(napi_create_object(env, &exports), napi_ok);
+  ASSERT_NE(Init_7_factory_wrap(env, exports), nullptr);
+
+  napi_value create_object = nullptr;
+  ASSERT_EQ(napi_get_named_property(env, exports, "createObject", &create_object), napi_ok);
+  napi_value ten = nullptr;
+  ASSERT_EQ(napi_create_uint32(env, 10, &ten), napi_ok);
+
+  napi_value argv[1] = {ten};
+  napi_value obj = nullptr;
+  ASSERT_EQ(napi_call_function(env, exports, create_object, 1, argv, &obj), napi_ok);
+
+  napi_value plus_one = nullptr;
+  ASSERT_EQ(napi_get_named_property(env, obj, "plusOne", &plus_one), napi_ok);
+
+  napi_value out = nullptr;
+  ASSERT_EQ(napi_call_function(env, obj, plus_one, 0, nullptr, &out), napi_ok);
+  uint32_t v = 0;
+  ASSERT_EQ(napi_get_value_uint32(env, out, &v), napi_ok);
+  EXPECT_EQ(v, 11u);
+
+  ASSERT_EQ(napi_call_function(env, obj, plus_one, 0, nullptr, &out), napi_ok);
+  ASSERT_EQ(napi_get_value_uint32(env, out, &v), napi_ok);
+  EXPECT_EQ(v, 12u);
+
+  ASSERT_EQ(napi_v8_destroy_env(env), napi_ok);
+}
+
+TEST_F(NapiV8Test, Ported8PassingWrapped) {
+  v8::Isolate* isolate = runtime_->isolate();
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = v8::Context::New(isolate);
+  v8::Context::Scope context_scope(context);
+
+  napi_env env = nullptr;
+  ASSERT_EQ(napi_v8_create_env(context, 8, &env), napi_ok);
+  ASSERT_NE(env, nullptr);
+
+  napi_value exports = nullptr;
+  ASSERT_EQ(napi_create_object(env, &exports), napi_ok);
+  ASSERT_NE(Init_8_passing_wrapped(env, exports), nullptr);
+
+  napi_value create_object = nullptr;
+  napi_value add = nullptr;
+  ASSERT_EQ(napi_get_named_property(env, exports, "createObject", &create_object), napi_ok);
+  ASSERT_EQ(napi_get_named_property(env, exports, "add", &add), napi_ok);
+
+  napi_value ten = nullptr;
+  napi_value twenty = nullptr;
+  ASSERT_EQ(napi_create_double(env, 10, &ten), napi_ok);
+  ASSERT_EQ(napi_create_double(env, 20, &twenty), napi_ok);
+
+  napi_value obj1 = nullptr;
+  napi_value obj2 = nullptr;
+  napi_value a1[1] = {ten};
+  napi_value a2[1] = {twenty};
+  ASSERT_EQ(napi_call_function(env, exports, create_object, 1, a1, &obj1), napi_ok);
+  ASSERT_EQ(napi_call_function(env, exports, create_object, 1, a2, &obj2), napi_ok);
+
+  napi_value add_args[2] = {obj1, obj2};
+  napi_value sum = nullptr;
+  ASSERT_EQ(napi_call_function(env, exports, add, 2, add_args, &sum), napi_ok);
+  double dv = 0;
+  ASSERT_EQ(napi_get_value_double(env, sum, &dv), napi_ok);
+  EXPECT_DOUBLE_EQ(dv, 30);
 
   ASSERT_EQ(napi_v8_destroy_env(env), napi_ok);
 }

@@ -20,6 +20,7 @@ struct AccessorPayload {
   void* data;
 };
 
+
 inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
 }
@@ -397,11 +398,12 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
       status = napi_create_function(
           env, desc.utf8name, NAPI_AUTO_LENGTH, desc.method, desc.data, &fnValue);
       if (status != napi_ok) return status;
-      v8::PropertyDescriptor pd(napi_v8_unwrap_value(fnValue));
-      pd.set_enumerable(false);
-      pd.set_configurable(false);
-      pd.set_writable(false);
-      if (!target->DefineProperty(context, key, pd).FromMaybe(false)) {
+      if (!target->DefineOwnProperty(
+               context,
+               key,
+               napi_v8_unwrap_value(fnValue),
+               static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete | v8::ReadOnly))
+               .FromMaybe(false)) {
         return napi_generic_failure;
       }
       continue;
@@ -414,24 +416,18 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
           (desc.setter != nullptr && setterPayload == nullptr)) {
         return napi_generic_failure;
       }
-      v8::Local<v8::FunctionTemplate> getterTpl;
-      v8::Local<v8::FunctionTemplate> setterTpl;
-      if (desc.getter != nullptr) {
-        getterTpl = v8::FunctionTemplate::New(
-            env->isolate, GetterTrampoline, v8::External::New(env->isolate, getterPayload));
-      }
-      if (desc.setter != nullptr) {
-        setterTpl = v8::FunctionTemplate::New(
-            env->isolate, SetterTrampoline, v8::External::New(env->isolate, setterPayload));
-      }
-      v8::PropertyDescriptor pd(
-          desc.getter != nullptr ? getterTpl->GetFunction(context).ToLocalChecked()
-                                 : v8::Local<v8::Value>(),
-          desc.setter != nullptr ? setterTpl->GetFunction(context).ToLocalChecked()
-                                 : v8::Local<v8::Value>());
-      pd.set_enumerable(false);
-      pd.set_configurable(false);
-      if (!target->DefineProperty(context, key, pd).FromMaybe(false)) {
+      v8::Local<v8::Value> payloadData = v8::External::New(
+          env->isolate, desc.getter != nullptr ? static_cast<void*>(getterPayload)
+                                               : static_cast<void*>(setterPayload));
+      if (!target
+               ->SetNativeDataProperty(
+                   context,
+                   key,
+                   desc.getter != nullptr ? GetterTrampoline : nullptr,
+                   desc.setter != nullptr ? SetterTrampoline : nullptr,
+                   payloadData,
+                   static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete))
+               .FromMaybe(false)) {
         return napi_generic_failure;
       }
       continue;
@@ -522,14 +518,48 @@ napi_status NAPI_CDECL napi_define_properties(
       napi_status status = napi_create_function(
           env, desc.utf8name, NAPI_AUTO_LENGTH, desc.method, desc.data, &fnValue);
       if (status != napi_ok) return status;
-      if (!target->Set(context, key, napi_v8_unwrap_value(fnValue)).FromMaybe(false)) {
+      if (!target->DefineOwnProperty(
+               context,
+               key,
+               napi_v8_unwrap_value(fnValue),
+               static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete | v8::ReadOnly))
+               .FromMaybe(false)) {
+        return napi_generic_failure;
+      }
+      continue;
+    }
+
+    if (desc.getter != nullptr || desc.setter != nullptr) {
+      auto* getterPayload = new (std::nothrow) AccessorPayload{env, desc.getter, desc.data};
+      auto* setterPayload = new (std::nothrow) AccessorPayload{env, desc.setter, desc.data};
+      if ((desc.getter != nullptr && getterPayload == nullptr) ||
+          (desc.setter != nullptr && setterPayload == nullptr)) {
+        return napi_generic_failure;
+      }
+      v8::Local<v8::Value> payloadData = v8::External::New(
+          env->isolate, desc.getter != nullptr ? static_cast<void*>(getterPayload)
+                                               : static_cast<void*>(setterPayload));
+      if (!target
+               ->SetNativeDataProperty(
+                   context,
+                   key,
+                   desc.getter != nullptr ? GetterTrampoline : nullptr,
+                   desc.setter != nullptr ? SetterTrampoline : nullptr,
+                   payloadData,
+                   static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete))
+               .FromMaybe(false)) {
         return napi_generic_failure;
       }
       continue;
     }
 
     if (desc.value != nullptr) {
-      if (!target->Set(context, key, napi_v8_unwrap_value(desc.value)).FromMaybe(false)) {
+      if (!target->DefineOwnProperty(
+               context,
+               key,
+               napi_v8_unwrap_value(desc.value),
+               static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::DontDelete | v8::ReadOnly))
+               .FromMaybe(false)) {
         return napi_generic_failure;
       }
     }
