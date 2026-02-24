@@ -60,6 +60,7 @@ struct napi_env__ {
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
   std::vector<void*> threadsafe_functions;
+  std::vector<void*> async_cleanup_hooks;
   std::vector<void*> wrap_finalizers;
   std::vector<TypeTagEntry> type_tag_entries;
 };
@@ -72,5 +73,6 @@ napi_status napi_v8_clear_last_error(napi_env env);
 
 napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value);
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value);
+void napi_v8_run_async_cleanup_hooks(napi_env env);
 
 #endif  // NAPI_V8_ENV_H_

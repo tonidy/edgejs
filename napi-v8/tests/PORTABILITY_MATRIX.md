@@ -60,11 +60,11 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_exception` (ported to gtest harness)
 - `test_instance_data` (ported core addon + `test_ref_then_set` + `test_set_then_ref`)
 - `test_async` (ported to gtest harness)
+- `1_hello_world` (ported to gtest harness)
+- `test_async_cleanup_hook` (ported to gtest harness)
 
 ### defer_phase2
 
-- `1_hello_world`
-- `test_async_cleanup_hook`
 - `test_async_context`
 - `test_buffer`
 - `test_callback_scope`

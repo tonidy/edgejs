@@ -302,6 +302,8 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
 }
 
 napi_env__::~napi_env__() {
+  napi_v8_run_async_cleanup_hooks(this);
+
   for (auto* raw_record : wrap_finalizers) {
     auto* record = static_cast<WrapFinalizerRecord*>(raw_record);
     if (record != nullptr) {

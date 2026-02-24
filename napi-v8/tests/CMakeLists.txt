@@ -253,9 +253,20 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_42_node_async.cc
     ported/node-api/test_async/test_async.c
   )
+  add_fixture_test(napi_v8_test_43_node_hello_world
+    runners/test_43_node_hello_world.cc
+    ported/node-api/1_hello_world/binding.c
+  )
+  add_fixture_test(napi_v8_test_44_node_async_cleanup_hook
+    runners/test_44_node_async_cleanup_hook.cc
+    ported/node-api/test_async_cleanup_hook/binding.c
+  )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_42_node_async PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_44_node_async_cleanup_hook PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_28_node_instance_data PRIVATE "${NAPI_V8_UV_LIB}")
