@@ -245,6 +245,10 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     ported/js-native-api/test_cannot_run_js/test_cannot_run_js.c
   )
   target_compile_definitions(napi_v8_test_40_pending_exception PRIVATE NAPI_VERSION=9)
+  add_fixture_test(napi_v8_test_41_instance_data
+    runners/test_41_instance_data.cc
+    ported/js-native-api/test_instance_data/test_instance_data.c
+  )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_28_node_instance_data PRIVATE "${NAPI_V8_UV_LIB}")

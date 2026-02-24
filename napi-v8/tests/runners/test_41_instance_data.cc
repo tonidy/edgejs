@@ -4,9 +4,9 @@
 
 extern "C" napi_value Init(napi_env env, napi_value exports);
 
-class Test38Finalizer : public FixtureTestBase {};
+class Test41InstanceData : public FixtureTestBase {};
 
-TEST_F(Test38Finalizer, PortedCoreFlow) {
+TEST_F(Test41InstanceData, PortedCoreFlow) {
   EnvScope s(runtime_.get());
   napi_value exports = nullptr;
   ASSERT_EQ(napi_create_object(s.env, &exports), napi_ok);
@@ -14,7 +14,7 @@ TEST_F(Test38Finalizer, PortedCoreFlow) {
 
   napi_value global = nullptr;
   ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
-  ASSERT_EQ(napi_set_named_property(s.env, global, "__tf", exports), napi_ok);
+  ASSERT_EQ(napi_set_named_property(s.env, global, "__tid", exports), napi_ok);
 
   auto run_js = [&](const char* source_text) {
     v8::TryCatch tc(s.isolate);
@@ -37,17 +37,10 @@ TEST_F(Test38Finalizer, PortedCoreFlow) {
   };
 
   ASSERT_TRUE(run_js(R"JS(
-globalThis.__js_finalizer_called = false;
-(() => {
-  const obj = {};
-  __tf.addFinalizer(obj);
-})();
-)JS"));
-
-  ASSERT_TRUE(run_js(R"JS(
-(() => {
-  const obj = {};
-  __tf.addFinalizerWithJS(obj, () => { globalThis.__js_finalizer_called = true; });
-})();
+__tid.setPrintOnDelete();
+if (__tid.increment() !== 42) throw new Error('increment');
+let called = false;
+__tid.objectWithFinalizer(() => { called = true; });
+globalThis.__instanceDataFinalizerCalled = called;
 )JS"));
 }

@@ -2563,10 +2563,7 @@ napi_status NAPI_CDECL napi_add_finalizer(napi_env env,
                                           void* finalize_hint,
                                           napi_ref* result) {
   if (!CheckValue(env, js_object) || finalize_cb == nullptr) return napi_invalid_arg;
-  napi_status status = napi_wrap(env, js_object, finalize_data, nullptr, finalize_hint, result);
-  if (status != napi_ok) return status;
-  finalize_cb(env, finalize_data, finalize_hint);
-  return napi_ok;
+  return napi_wrap(env, js_object, finalize_data, finalize_cb, finalize_hint, result);
 }
 
 napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t* result) {

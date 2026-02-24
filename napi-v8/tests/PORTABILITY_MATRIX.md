@@ -42,6 +42,7 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_reference_double_free` (ported to gtest harness)
 - `test_finalizer` (ported to gtest harness)
 - `test_cannot_run_js` (ported to gtest harness)
+- `test_instance_data` (ported to gtest harness)
 
 ### implement_now
 
@@ -49,7 +50,7 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 
 ### defer_phase2
 
-- `test_instance_data`
+- (none currently)
 
 ## `node-api` (`node/test/node-api`)
 
