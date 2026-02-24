@@ -162,6 +162,20 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_22_node_exception.cc
     ported/node-api/test_exception/test_exception.c
   )
+  add_fixture_test(napi_v8_test_23_instance_data_ref_then_set
+    runners/test_23_instance_data_ref_then_set.cc
+    ported/node-api/test_instance_data/addon.c
+    ported/node-api/test_instance_data/test_ref_then_set.c
+  )
+  add_fixture_test(napi_v8_test_24_instance_data_set_then_ref
+    runners/test_24_instance_data_set_then_ref.cc
+    ported/node-api/test_instance_data/addon.c
+    ported/node-api/test_instance_data/test_set_then_ref.c
+  )
+  add_fixture_test(napi_v8_test_25_object_exceptions
+    runners/test_25_object_exceptions.cc
+    ported/js-native-api/test_object/test_exceptions.c
+  )
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
 endif()

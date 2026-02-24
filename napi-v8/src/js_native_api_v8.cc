@@ -33,6 +33,14 @@ inline bool CheckValue(napi_env env, napi_value value) {
   return CheckEnv(env) && value != nullptr;
 }
 
+inline napi_status ReturnPendingIfCaught(napi_env env, v8::TryCatch& tc, const char* message) {
+  if (tc.HasCaught()) {
+    env->last_exception.Reset(env->isolate, tc.Exception());
+    return napi_v8_set_last_error(env, napi_pending_exception, message);
+  }
+  return napi_v8_set_last_error(env, napi_generic_failure, message);
+}
+
 inline napi_valuetype TypeOf(v8::Local<v8::Value> value) {
   if (value->IsUndefined()) return napi_undefined;
   if (value->IsNull()) return napi_null;
@@ -648,9 +656,10 @@ napi_status NAPI_CDECL napi_get_element(napi_env env,
   if (!CheckValue(env, object) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
+  v8::TryCatch tc(env->isolate);
   v8::Local<v8::Value> out;
   if (!local.As<v8::Object>()->Get(env->context(), index).ToLocal(&out)) {
-    return napi_generic_failure;
+    return ReturnPendingIfCaught(env, tc, "Exception while getting element");
   }
   *result = napi_v8_wrap_value(env, out);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -663,10 +672,11 @@ napi_status NAPI_CDECL napi_set_element(napi_env env,
   if (!CheckValue(env, object) || value == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
+  v8::TryCatch tc(env->isolate);
   if (!local.As<v8::Object>()
            ->Set(env->context(), index, napi_v8_unwrap_value(value))
            .FromMaybe(false)) {
-    return napi_generic_failure;
+    return ReturnPendingIfCaught(env, tc, "Exception while setting element");
   }
   return napi_ok;
 }
@@ -693,7 +703,12 @@ napi_status NAPI_CDECL napi_has_element(napi_env env,
   if (!CheckValue(env, object) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
-  *result = local.As<v8::Object>()->Has(env->context(), index).FromMaybe(false);
+  v8::TryCatch tc(env->isolate);
+  auto has = local.As<v8::Object>()->Has(env->context(), index);
+  if (has.IsNothing()) {
+    return ReturnPendingIfCaught(env, tc, "Exception while checking element");
+  }
+  *result = has.FromJust();
   return napi_ok;
 }
 
@@ -704,7 +719,12 @@ napi_status NAPI_CDECL napi_delete_element(napi_env env,
   if (!CheckValue(env, object) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> local = napi_v8_unwrap_value(object);
   if (!local->IsObject()) return napi_object_expected;
-  *result = local.As<v8::Object>()->Delete(env->context(), index).FromMaybe(false);
+  v8::TryCatch tc(env->isolate);
+  auto deleted = local.As<v8::Object>()->Delete(env->context(), index);
+  if (deleted.IsNothing()) {
+    return ReturnPendingIfCaught(env, tc, "Exception while deleting element");
+  }
+  *result = deleted.FromJust();
   return napi_ok;
 }
 
@@ -953,6 +973,7 @@ napi_status NAPI_CDECL napi_define_properties(
   if (!targetValue->IsObject()) return napi_object_expected;
   v8::Local<v8::Object> target = targetValue.As<v8::Object>();
 
+  v8::TryCatch tc(env->isolate);
   for (size_t i = 0; i < property_count; ++i) {
     const napi_property_descriptor& desc = properties[i];
     v8::Local<v8::Name> key;
@@ -983,7 +1004,7 @@ napi_status NAPI_CDECL napi_define_properties(
                napi_v8_unwrap_value(fnValue),
                ToV8PropertyAttributes(desc.attributes, true))
                .FromMaybe(false)) {
-        return napi_generic_failure;
+        return ReturnPendingIfCaught(env, tc, "Exception while defining property");
       }
       continue;
     }
@@ -1021,7 +1042,7 @@ napi_status NAPI_CDECL napi_define_properties(
                napi_v8_unwrap_value(desc.value),
                ToV8PropertyAttributes(desc.attributes, true))
                .FromMaybe(false)) {
-        return napi_generic_failure;
+        return ReturnPendingIfCaught(env, tc, "Exception while defining property");
       }
     }
   }
@@ -1045,7 +1066,12 @@ napi_status NAPI_CDECL napi_has_named_property(napi_env env,
            .ToLocal(&key)) {
     return napi_generic_failure;
   }
-  *result = targetValue.As<v8::Object>()->Has(context, key).FromMaybe(false);
+  v8::TryCatch tc(env->isolate);
+  auto has = targetValue.As<v8::Object>()->Has(context, key);
+  if (has.IsNothing()) {
+    return ReturnPendingIfCaught(env, tc, "Exception while checking named property");
+  }
+  *result = has.FromJust();
   return napi_ok;
 }
 
@@ -1058,10 +1084,11 @@ napi_status NAPI_CDECL napi_set_property(napi_env env,
   }
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
+  v8::TryCatch tc(env->isolate);
   if (!target.As<v8::Object>()
            ->Set(env->context(), napi_v8_unwrap_value(key), napi_v8_unwrap_value(value))
            .FromMaybe(false)) {
-    return napi_generic_failure;
+    return ReturnPendingIfCaught(env, tc, "Exception while setting property");
   }
   return napi_ok;
 }
@@ -1075,9 +1102,10 @@ napi_status NAPI_CDECL napi_get_property(napi_env env,
   }
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
+  v8::TryCatch tc(env->isolate);
   v8::Local<v8::Value> out;
   if (!target.As<v8::Object>()->Get(env->context(), napi_v8_unwrap_value(key)).ToLocal(&out)) {
-    return napi_generic_failure;
+    return ReturnPendingIfCaught(env, tc, "Exception while getting property");
   }
   *result = napi_v8_wrap_value(env, out);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -1092,7 +1120,12 @@ napi_status NAPI_CDECL napi_has_property(napi_env env,
   }
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
-  *result = target.As<v8::Object>()->Has(env->context(), napi_v8_unwrap_value(key)).FromMaybe(false);
+  v8::TryCatch tc(env->isolate);
+  auto has = target.As<v8::Object>()->Has(env->context(), napi_v8_unwrap_value(key));
+  if (has.IsNothing()) {
+    return ReturnPendingIfCaught(env, tc, "Exception while checking property");
+  }
+  *result = has.FromJust();
   return napi_ok;
 }
 
@@ -1105,7 +1138,12 @@ napi_status NAPI_CDECL napi_delete_property(napi_env env,
   }
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
-  *result = target.As<v8::Object>()->Delete(env->context(), napi_v8_unwrap_value(key)).FromMaybe(false);
+  v8::TryCatch tc(env->isolate);
+  auto deleted = target.As<v8::Object>()->Delete(env->context(), napi_v8_unwrap_value(key));
+  if (deleted.IsNothing()) {
+    return ReturnPendingIfCaught(env, tc, "Exception while deleting property");
+  }
+  *result = deleted.FromJust();
   return napi_ok;
 }
 
@@ -1122,9 +1160,12 @@ napi_status NAPI_CDECL napi_has_own_property(napi_env env,
   }
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
-  *result = target.As<v8::Object>()
-                ->HasOwnProperty(env->context(), key_value.As<v8::Name>())
-                .FromMaybe(false);
+  v8::TryCatch tc(env->isolate);
+  auto has = target.As<v8::Object>()->HasOwnProperty(env->context(), key_value.As<v8::Name>());
+  if (has.IsNothing()) {
+    return ReturnPendingIfCaught(env, tc, "Exception while checking own property");
+  }
+  *result = has.FromJust();
   return napi_ok;
 }
 
@@ -1134,9 +1175,10 @@ napi_status NAPI_CDECL napi_get_property_names(napi_env env,
   if (!CheckValue(env, object) || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
   if (!target->IsObject()) return napi_object_expected;
+  v8::TryCatch tc(env->isolate);
   v8::Local<v8::Array> names;
   if (!target.As<v8::Object>()->GetPropertyNames(env->context()).ToLocal(&names)) {
-    return napi_generic_failure;
+    return ReturnPendingIfCaught(env, tc, "Exception while getting property names");
   }
   *result = napi_v8_wrap_value(env, names);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
@@ -1170,10 +1212,11 @@ napi_status NAPI_CDECL napi_set_named_property(napi_env env,
            .ToLocal(&key)) {
     return napi_generic_failure;
   }
+  v8::TryCatch tc(env->isolate);
   if (!targetValue.As<v8::Object>()
            ->Set(context, key, napi_v8_unwrap_value(value))
            .FromMaybe(false)) {
-    return napi_generic_failure;
+    return ReturnPendingIfCaught(env, tc, "Exception while setting named property");
   }
   return napi_ok;
 }
@@ -1194,9 +1237,10 @@ napi_status NAPI_CDECL napi_get_named_property(napi_env env,
            .ToLocal(&key)) {
     return napi_generic_failure;
   }
+  v8::TryCatch tc(env->isolate);
   v8::Local<v8::Value> prop;
   if (!targetValue.As<v8::Object>()->Get(context, key).ToLocal(&prop)) {
-    return napi_generic_failure;
+    return ReturnPendingIfCaught(env, tc, "Exception while getting named property");
   }
   *result = napi_v8_wrap_value(env, prop);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;

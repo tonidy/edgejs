@@ -60,6 +60,7 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 
 - `test_general` (ported to gtest harness)
 - `test_exception` (ported to gtest harness)
+- `test_instance_data` (`test_ref_then_set` and `test_set_then_ref` ported)
 
 ### defer_phase2
 
