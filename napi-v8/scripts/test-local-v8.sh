@@ -46,4 +46,4 @@ cmake \
   -DNAPI_V8_V8_DEFINES="${NAPI_V8_V8_DEFINES}"
 
 cmake --build "${BUILD_DIR}" -j4
-ctest --test-dir "${BUILD_DIR}" --output-on-failure -R napi_v8_tier1_tests
+ctest --test-dir "${BUILD_DIR}" --output-on-failure

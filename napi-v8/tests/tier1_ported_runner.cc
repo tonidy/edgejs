@@ -9,6 +9,8 @@
 
 extern "C" napi_value Init_2_function_arguments(napi_env env, napi_value exports);
 extern "C" napi_value Init_3_callbacks(napi_env env, napi_value exports);
+extern "C" napi_value Init_4_object_factory(napi_env env, napi_value exports);
+extern "C" napi_value Init_5_function_factory(napi_env env, napi_value exports);
 
 namespace {
 
@@ -171,6 +173,80 @@ TEST_F(NapiV8Test, Ported3Callbacks) {
             .ToLocalChecked();
     EXPECT_TRUE(seen->StrictEquals(recv_v8));
   }
+
+  ASSERT_EQ(napi_v8_destroy_env(env), napi_ok);
+}
+
+TEST_F(NapiV8Test, Ported4ObjectFactory) {
+  v8::Isolate* isolate = runtime_->isolate();
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = v8::Context::New(isolate);
+  v8::Context::Scope context_scope(context);
+
+  napi_env env = nullptr;
+  ASSERT_EQ(napi_v8_create_env(context, 8, &env), napi_ok);
+  ASSERT_NE(env, nullptr);
+
+  napi_value exports = nullptr;
+  ASSERT_EQ(napi_create_object(env, &exports), napi_ok);
+  napi_value addon = Init_4_object_factory(env, exports);
+  ASSERT_NE(addon, nullptr);
+
+  napi_value arg_hello = nullptr;
+  napi_value arg_world = nullptr;
+  ASSERT_EQ(napi_create_string_utf8(env, "hello", NAPI_AUTO_LENGTH, &arg_hello), napi_ok);
+  ASSERT_EQ(napi_create_string_utf8(env, "world", NAPI_AUTO_LENGTH, &arg_world), napi_ok);
+
+  napi_value obj1 = nullptr;
+  napi_value obj2 = nullptr;
+  napi_value argv1[1] = {arg_hello};
+  napi_value argv2[1] = {arg_world};
+  ASSERT_EQ(napi_call_function(env, exports, addon, 1, argv1, &obj1), napi_ok);
+  ASSERT_EQ(napi_call_function(env, exports, addon, 1, argv2, &obj2), napi_ok);
+
+  napi_value msg1 = nullptr;
+  napi_value msg2 = nullptr;
+  ASSERT_EQ(napi_get_named_property(env, obj1, "msg", &msg1), napi_ok);
+  ASSERT_EQ(napi_get_named_property(env, obj2, "msg", &msg2), napi_ok);
+
+  char buf1[16];
+  char buf2[16];
+  ASSERT_EQ(napi_get_value_string_utf8(env, msg1, buf1, sizeof(buf1), nullptr), napi_ok);
+  ASSERT_EQ(napi_get_value_string_utf8(env, msg2, buf2, sizeof(buf2), nullptr), napi_ok);
+  EXPECT_EQ(std::string(buf1), "hello");
+  EXPECT_EQ(std::string(buf2), "world");
+
+  ASSERT_EQ(napi_v8_destroy_env(env), napi_ok);
+}
+
+TEST_F(NapiV8Test, Ported5FunctionFactory) {
+  v8::Isolate* isolate = runtime_->isolate();
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = v8::Context::New(isolate);
+  v8::Context::Scope context_scope(context);
+
+  napi_env env = nullptr;
+  ASSERT_EQ(napi_v8_create_env(context, 8, &env), napi_ok);
+  ASSERT_NE(env, nullptr);
+
+  napi_value exports = nullptr;
+  ASSERT_EQ(napi_create_object(env, &exports), napi_ok);
+  napi_value addon = Init_5_function_factory(env, exports);
+  ASSERT_NE(addon, nullptr);
+
+  napi_value fn = nullptr;
+  ASSERT_EQ(napi_call_function(env, exports, addon, 0, nullptr, &fn), napi_ok);
+  ASSERT_NE(fn, nullptr);
+
+  napi_value out = nullptr;
+  ASSERT_EQ(napi_call_function(env, exports, fn, 0, nullptr, &out), napi_ok);
+  ASSERT_NE(out, nullptr);
+
+  char buf[32];
+  ASSERT_EQ(napi_get_value_string_utf8(env, out, buf, sizeof(buf), nullptr), napi_ok);
+  EXPECT_EQ(std::string(buf), "hello world");
 
   ASSERT_EQ(napi_v8_destroy_env(env), napi_ok);
 }

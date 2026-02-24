@@ -1,2 +1,0 @@
-/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ar qc libnapi_v8.a CMakeFiles/napi_v8.dir/src/js_native_api_v8.cc.o CMakeFiles/napi_v8.dir/src/napi_v8_platform.cc.o
-/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ranlib libnapi_v8.a

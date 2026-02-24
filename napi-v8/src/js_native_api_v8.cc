@@ -14,6 +14,12 @@ struct CallbackPayload {
   void* data;
 };
 
+struct AccessorPayload {
+  napi_env env;
+  napi_callback cb;
+  void* data;
+};
+
 inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
 }
@@ -47,6 +53,9 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   cbinfo->env = env;
   cbinfo->data = payload->data;
   cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
+  if (!info.NewTarget().IsEmpty()) {
+    cbinfo->new_target = napi_v8_wrap_value(env, info.NewTarget());
+  }
   cbinfo->args.reserve(info.Length());
   for (int i = 0; i < info.Length(); ++i) {
     cbinfo->args.push_back(napi_v8_wrap_value(env, info[i]));
@@ -57,6 +66,45 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 
+  delete cbinfo;
+}
+
+void GetterTrampoline(v8::Local<v8::Name> property,
+                      const v8::PropertyCallbackInfo<v8::Value>& info) {
+  (void)property;
+  auto* payload =
+      static_cast<AccessorPayload*>(info.Data().As<v8::External>()->Value());
+  if (payload == nullptr || payload->env == nullptr || payload->cb == nullptr) {
+    return;
+  }
+  napi_env env = payload->env;
+  auto* cbinfo = new napi_callback_info__();
+  cbinfo->env = env;
+  cbinfo->data = payload->data;
+  cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
+  napi_value ret = payload->cb(env, cbinfo);
+  if (ret != nullptr) {
+    info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
+  }
+  delete cbinfo;
+}
+
+void SetterTrampoline(v8::Local<v8::Name> property,
+                      v8::Local<v8::Value> value,
+                      const v8::PropertyCallbackInfo<void>& info) {
+  (void)property;
+  auto* payload =
+      static_cast<AccessorPayload*>(info.Data().As<v8::External>()->Value());
+  if (payload == nullptr || payload->env == nullptr || payload->cb == nullptr) {
+    return;
+  }
+  napi_env env = payload->env;
+  auto* cbinfo = new napi_callback_info__();
+  cbinfo->env = env;
+  cbinfo->data = payload->data;
+  cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
+  cbinfo->args.push_back(napi_v8_wrap_value(env, value));
+  payload->cb(env, cbinfo);
   delete cbinfo;
 }
 
@@ -71,14 +119,31 @@ v8::Local<v8::Value> napi_value__::local() const {
   return value.Get(env->isolate);
 }
 
+napi_ref__::napi_ref__(napi_env env,
+                       v8::Local<v8::Value> value,
+                       uint32_t initial_refcount)
+    : env(env), value(env->isolate, value), refcount(initial_refcount) {}
+
+napi_ref__::~napi_ref__() = default;
+
 napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_version)
     : isolate(v8::Isolate::GetCurrent()),
       context_ref(isolate, context),
       module_api_version(module_api_version) {
+  v8::Local<v8::Private> wrapKey = v8::Private::ForApi(
+      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap"));
+  wrap_private_key.Reset(isolate, wrapKey);
+  v8::Local<v8::Private> wrapRefKey = v8::Private::ForApi(
+      isolate, v8::String::NewFromUtf8Literal(isolate, "__napi_wrap_ref"));
+  wrap_ref_private_key.Reset(isolate, wrapRefKey);
   napi_v8_clear_last_error(this);
 }
 
-napi_env__::~napi_env__() = default;
+napi_env__::~napi_env__() {
+  if (instance_data_finalize_cb != nullptr) {
+    instance_data_finalize_cb(this, instance_data, instance_data_finalize_hint);
+  }
+}
 
 v8::Local<v8::Context> napi_env__::context() const {
   return context_ref.Get(isolate);
@@ -156,6 +221,22 @@ napi_status NAPI_CDECL napi_create_double(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
+napi_status NAPI_CDECL napi_create_int32(napi_env env,
+                                         int32_t value,
+                                         napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  *result = napi_v8_wrap_value(env, v8::Int32::New(env->isolate, value));
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_uint32(napi_env env,
+                                          uint32_t value,
+                                          napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  *result = napi_v8_wrap_value(env, v8::Uint32::New(env->isolate, value));
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
 napi_status NAPI_CDECL napi_create_object(napi_env env, napi_value* result) {
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   *result = napi_v8_wrap_value(env, v8::Object::New(env->isolate));
@@ -202,6 +283,16 @@ napi_status NAPI_CDECL napi_get_value_double(napi_env env,
   return napi_ok;
 }
 
+napi_status NAPI_CDECL napi_get_value_uint32(napi_env env,
+                                             napi_value value,
+                                             uint32_t* result) {
+  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  if (!local->IsNumber()) return napi_number_expected;
+  *result = local->Uint32Value(env->context()).FromMaybe(0);
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL napi_get_cb_info(napi_env env,
                                         napi_callback_info cbinfo,
                                         size_t* argc,
@@ -222,6 +313,15 @@ napi_status NAPI_CDECL napi_get_cb_info(napi_env env,
   }
   if (this_arg != nullptr) *this_arg = cbinfo->this_arg;
   if (data != nullptr) *data = cbinfo->data;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_get_new_target(
+    napi_env env, napi_callback_info cbinfo, napi_value* result) {
+  if (!CheckEnv(env) || cbinfo == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  *result = cbinfo->new_target;
   return napi_ok;
 }
 
@@ -254,6 +354,112 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
   if (!name.IsEmpty()) fn->SetName(name);
 
   *result = napi_v8_wrap_value(env, fn);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_define_class(napi_env env,
+                                         const char* utf8name,
+                                         size_t length,
+                                         napi_callback constructor,
+                                         void* data,
+                                         size_t property_count,
+                                         const napi_property_descriptor* properties,
+                                         napi_value* result) {
+  if (!CheckEnv(env) || constructor == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+
+  napi_value ctorValue = nullptr;
+  napi_status status =
+      napi_create_function(env, utf8name, length, constructor, data, &ctorValue);
+  if (status != napi_ok) return status;
+
+  v8::Local<v8::Context> context = env->context();
+  v8::Local<v8::Function> ctor = napi_v8_unwrap_value(ctorValue).As<v8::Function>();
+  v8::Local<v8::Object> proto = ctor->Get(context, v8::String::NewFromUtf8Literal(env->isolate, "prototype"))
+                                     .ToLocalChecked()
+                                     .As<v8::Object>();
+
+  if (property_count > 0 && properties == nullptr) return napi_invalid_arg;
+  for (size_t i = 0; i < property_count; ++i) {
+    const napi_property_descriptor& desc = properties[i];
+    if (desc.utf8name == nullptr) return napi_name_expected;
+    v8::Local<v8::String> key;
+    if (!v8::String::NewFromUtf8(env->isolate, desc.utf8name, v8::NewStringType::kNormal)
+             .ToLocal(&key)) {
+      return napi_generic_failure;
+    }
+    v8::Local<v8::Object> target =
+        (desc.attributes & napi_static) ? ctor.As<v8::Object>() : proto;
+
+    if (desc.method != nullptr) {
+      napi_value fnValue = nullptr;
+      status = napi_create_function(
+          env, desc.utf8name, NAPI_AUTO_LENGTH, desc.method, desc.data, &fnValue);
+      if (status != napi_ok) return status;
+      v8::PropertyDescriptor pd(napi_v8_unwrap_value(fnValue));
+      pd.set_enumerable(false);
+      pd.set_configurable(false);
+      pd.set_writable(false);
+      if (!target->DefineProperty(context, key, pd).FromMaybe(false)) {
+        return napi_generic_failure;
+      }
+      continue;
+    }
+
+    if (desc.getter != nullptr || desc.setter != nullptr) {
+      auto* getterPayload = new (std::nothrow) AccessorPayload{env, desc.getter, desc.data};
+      auto* setterPayload = new (std::nothrow) AccessorPayload{env, desc.setter, desc.data};
+      if ((desc.getter != nullptr && getterPayload == nullptr) ||
+          (desc.setter != nullptr && setterPayload == nullptr)) {
+        return napi_generic_failure;
+      }
+      v8::Local<v8::FunctionTemplate> getterTpl;
+      v8::Local<v8::FunctionTemplate> setterTpl;
+      if (desc.getter != nullptr) {
+        getterTpl = v8::FunctionTemplate::New(
+            env->isolate, GetterTrampoline, v8::External::New(env->isolate, getterPayload));
+      }
+      if (desc.setter != nullptr) {
+        setterTpl = v8::FunctionTemplate::New(
+            env->isolate, SetterTrampoline, v8::External::New(env->isolate, setterPayload));
+      }
+      v8::PropertyDescriptor pd(
+          desc.getter != nullptr ? getterTpl->GetFunction(context).ToLocalChecked()
+                                 : v8::Local<v8::Value>(),
+          desc.setter != nullptr ? setterTpl->GetFunction(context).ToLocalChecked()
+                                 : v8::Local<v8::Value>());
+      pd.set_enumerable(false);
+      pd.set_configurable(false);
+      if (!target->DefineProperty(context, key, pd).FromMaybe(false)) {
+        return napi_generic_failure;
+      }
+      continue;
+    }
+  }
+
+  *result = ctorValue;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_new_instance(napi_env env,
+                                         napi_value constructor,
+                                         size_t argc,
+                                         const napi_value* argv,
+                                         napi_value* result) {
+  if (!CheckValue(env, constructor) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> ctorValue = napi_v8_unwrap_value(constructor);
+  if (!ctorValue->IsFunction()) return napi_function_expected;
+  v8::Local<v8::Function> ctor = ctorValue.As<v8::Function>();
+  std::vector<v8::Local<v8::Value>> args;
+  args.reserve(argc);
+  for (size_t i = 0; i < argc; ++i) args.push_back(napi_v8_unwrap_value(argv[i]));
+  v8::Local<v8::Value> out;
+  if (!ctor->NewInstance(env->context(), static_cast<int>(argc), args.data())
+           .ToLocal(&out)) {
+    return napi_generic_failure;
+  }
+  *result = napi_v8_wrap_value(env, out);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
@@ -422,6 +628,105 @@ napi_status NAPI_CDECL napi_strict_equals(napi_env env,
   return napi_ok;
 }
 
+napi_status NAPI_CDECL napi_create_reference(napi_env env,
+                                             napi_value value,
+                                             uint32_t initial_refcount,
+                                             napi_ref* result) {
+  if (!CheckValue(env, value) || result == nullptr) return napi_invalid_arg;
+  *result = new (std::nothrow)
+      napi_ref__(env, napi_v8_unwrap_value(value), initial_refcount);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_delete_reference(node_api_basic_env env, napi_ref ref) {
+  (void)env;
+  if (ref == nullptr) return napi_invalid_arg;
+  delete ref;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_reference_ref(napi_env env,
+                                          napi_ref ref,
+                                          uint32_t* result) {
+  if (!CheckEnv(env) || ref == nullptr) return napi_invalid_arg;
+  ref->refcount++;
+  if (result != nullptr) *result = ref->refcount;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_reference_unref(napi_env env,
+                                            napi_ref ref,
+                                            uint32_t* result) {
+  if (!CheckEnv(env) || ref == nullptr) return napi_invalid_arg;
+  if (ref->refcount > 0) ref->refcount--;
+  if (result != nullptr) *result = ref->refcount;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_get_reference_value(napi_env env,
+                                                napi_ref ref,
+                                                napi_value* result) {
+  if (!CheckEnv(env) || ref == nullptr || result == nullptr) return napi_invalid_arg;
+  *result = napi_v8_wrap_value(env, ref->value.Get(env->isolate));
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_wrap(napi_env env,
+                                 napi_value js_object,
+                                 void* native_object,
+                                 node_api_basic_finalize finalize_cb,
+                                 void* finalize_hint,
+                                 napi_ref* result) {
+  (void)finalize_hint;
+  if (!CheckValue(env, js_object)) return napi_invalid_arg;
+  v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
+  if (!value->IsObject()) return napi_object_expected;
+  v8::Local<v8::Object> object = value.As<v8::Object>();
+  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  if (!object->SetPrivate(env->context(), wrapKey, v8::External::New(env->isolate, native_object))
+           .FromMaybe(false)) {
+    return napi_generic_failure;
+  }
+  if (result != nullptr) {
+    napi_status s = napi_create_reference(env, js_object, 0, result);
+    if (s != napi_ok) return s;
+    v8::Local<v8::Private> wrapRefKey = env->wrap_ref_private_key.Get(env->isolate);
+    object
+        ->SetPrivate(env->context(), wrapRefKey, v8::External::New(env->isolate, *result))
+        .FromMaybe(false);
+  }
+  // Finalizers are not yet tied to GC in this initial implementation.
+  (void)finalize_cb;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_unwrap(napi_env env, napi_value js_object, void** result) {
+  if (!CheckValue(env, js_object) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> value = napi_v8_unwrap_value(js_object);
+  if (!value->IsObject()) return napi_object_expected;
+  v8::Local<v8::Object> object = value.As<v8::Object>();
+  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  v8::Local<v8::Value> wrapped;
+  if (!object->GetPrivate(env->context(), wrapKey).ToLocal(&wrapped) ||
+      !wrapped->IsExternal()) {
+    return napi_invalid_arg;
+  }
+  *result = wrapped.As<v8::External>()->Value();
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_remove_wrap(napi_env env, napi_value js_object, void** result) {
+  if (!CheckValue(env, js_object)) return napi_invalid_arg;
+  void* out = nullptr;
+  napi_status status = napi_unwrap(env, js_object, &out);
+  if (status != napi_ok) return status;
+  v8::Local<v8::Object> object = napi_v8_unwrap_value(js_object).As<v8::Object>();
+  v8::Local<v8::Private> wrapKey = env->wrap_private_key.Get(env->isolate);
+  object->DeletePrivate(env->context(), wrapKey).FromMaybe(false);
+  if (result != nullptr) *result = out;
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL napi_throw_error(napi_env env,
                                         const char* code,
                                         const char* msg) {
@@ -455,6 +760,26 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
   env->last_exception.Reset();
   *result = napi_v8_wrap_value(env, ex);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_set_instance_data(node_api_basic_env basic_env,
+                                              void* data,
+                                              napi_finalize finalize_cb,
+                                              void* finalize_hint) {
+  napi_env env = const_cast<napi_env>(basic_env);
+  if (!CheckEnv(env)) return napi_invalid_arg;
+  env->instance_data = data;
+  env->instance_data_finalize_cb = finalize_cb;
+  env->instance_data_finalize_hint = finalize_hint;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_get_instance_data(node_api_basic_env basic_env,
+                                              void** data) {
+  napi_env env = const_cast<napi_env>(basic_env);
+  if (!CheckEnv(env) || data == nullptr) return napi_invalid_arg;
+  *data = env->instance_data;
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_get_version(node_api_basic_env env, uint32_t* result) {

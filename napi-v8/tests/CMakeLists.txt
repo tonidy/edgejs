@@ -17,6 +17,7 @@ set(NAPI_V8_V8_EXTRA_LIBS
   CACHE STRING "Semicolon-separated extra V8 libraries (e.g. libplatform/libbase)"
 )
 set(NAPI_V8_GTEST_ROOT "${NAPI_V8_NODE_ROOT}/deps/googletest")
+include(GoogleTest)
 
 if(NAPI_V8_V8_MONOLITH_LIB)
   add_executable(napi_v8_tier1_tests
@@ -25,6 +26,8 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     tier1_ported_runner.cc
     ported/js-native-api/2_function_arguments/2_function_arguments.c
     ported/js-native-api/3_callbacks/3_callbacks.c
+    ported/js-native-api/4_object_factory/4_object_factory.c
+    ported/js-native-api/5_function_factory/5_function_factory.c
   )
 
   target_include_directories(napi_v8_tier1_tests
@@ -49,7 +52,11 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     BUILD_RPATH "${NAPI_V8_V8_LIB_DIR}"
     INSTALL_RPATH "${NAPI_V8_V8_LIB_DIR}"
   )
-  add_test(NAME napi_v8_tier1_tests COMMAND napi_v8_tier1_tests)
+  gtest_discover_tests(
+    napi_v8_tier1_tests
+    DISCOVERY_TIMEOUT 30
+    TEST_PREFIX "napi_v8."
+  )
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
 endif()

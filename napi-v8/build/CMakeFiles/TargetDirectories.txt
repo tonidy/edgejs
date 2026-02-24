@@ -1,7 +1,0 @@
-/Users/syrusakbary/Development/node-napi/napi-v8/build/CMakeFiles/napi_v8.dir
-/Users/syrusakbary/Development/node-napi/napi-v8/build/CMakeFiles/test.dir
-/Users/syrusakbary/Development/node-napi/napi-v8/build/CMakeFiles/edit_cache.dir
-/Users/syrusakbary/Development/node-napi/napi-v8/build/CMakeFiles/rebuild_cache.dir
-/Users/syrusakbary/Development/node-napi/napi-v8/build/tests/CMakeFiles/test.dir
-/Users/syrusakbary/Development/node-napi/napi-v8/build/tests/CMakeFiles/edit_cache.dir
-/Users/syrusakbary/Development/node-napi/napi-v8/build/tests/CMakeFiles/rebuild_cache.dir

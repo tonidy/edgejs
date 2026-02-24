@@ -23,7 +23,17 @@ struct napi_callback_info__ {
   napi_env env = nullptr;
   void* data = nullptr;
   napi_value this_arg = nullptr;
+  napi_value new_target = nullptr;
   std::vector<napi_value> args;
+};
+
+struct napi_ref__ {
+  napi_ref__(napi_env env, v8::Local<v8::Value> value, uint32_t initial_refcount);
+  ~napi_ref__();
+
+  napi_env env = nullptr;
+  v8::Global<v8::Value> value;
+  uint32_t refcount = 0;
 };
 
 struct napi_env__ {
@@ -37,7 +47,12 @@ struct napi_env__ {
   napi_extended_error_info last_error{};
   std::string last_error_message;
   v8::Global<v8::Value> last_exception;
+  v8::Global<v8::Private> wrap_private_key;
+  v8::Global<v8::Private> wrap_ref_private_key;
   int32_t module_api_version = 8;
+  void* instance_data = nullptr;
+  napi_finalize instance_data_finalize_cb = nullptr;
+  void* instance_data_finalize_hint = nullptr;
 };
 
 napi_status napi_v8_set_last_error(napi_env env,
