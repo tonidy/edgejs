@@ -298,6 +298,14 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_53_node_init_order.cc
     ported/node-api/test_init_order/test_init_order.cc
   )
+  add_fixture_test(napi_v8_test_54_node_make_callback
+    runners/test_54_node_make_callback.cc
+    ported/node-api/test_make_callback/binding.c
+  )
+  add_fixture_test(napi_v8_test_55_node_make_callback_recurse
+    runners/test_55_node_make_callback_recurse.cc
+    ported/node-api/test_make_callback_recurse/binding.c
+  )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_42_node_async PRIVATE "${NAPI_V8_UV_LIB}")
