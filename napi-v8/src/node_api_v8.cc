@@ -100,6 +100,13 @@ void FinalizeBufferRecord(napi_buffer_record* record) {
   }
 }
 
+void FinalizeBufferRecordMicrotask(void* data) {
+  auto* record = static_cast<napi_buffer_record*>(data);
+  if (record == nullptr) return;
+  FinalizeBufferRecord(record);
+  delete record;
+}
+
 void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
   napi_buffer_record* record = info.GetParameter();
   if (record == nullptr) return;
@@ -109,10 +116,12 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
     v8::Local<v8::Context> context = env->context();
     v8::Context::Scope cs(context);
     RemoveBufferRecord(env, record);
+    env->isolate->EnqueueMicrotask(FinalizeBufferRecordMicrotask, record);
+  } else {
     FinalizeBufferRecord(record);
+    delete record;
   }
   record->holder.Reset();
-  delete record;
 }
 
 bool IsOurBufferObject(napi_env env, v8::Local<v8::Object> object) {

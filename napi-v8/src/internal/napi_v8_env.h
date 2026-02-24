@@ -20,6 +20,8 @@ struct napi_value__ {
 };
 
 struct napi_callback_info__ {
+  ~napi_callback_info__();
+
   napi_env env = nullptr;
   void* data = nullptr;
   napi_value this_arg = nullptr;
@@ -34,6 +36,7 @@ struct napi_ref__ {
   napi_env env = nullptr;
   v8::Global<v8::Value> value;
   uint32_t refcount = 0;
+  bool can_be_weak = false;
 };
 
 struct napi_env__ {

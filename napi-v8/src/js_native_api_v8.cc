@@ -54,6 +54,16 @@ struct WrapFinalizerRecord {
 
 namespace {
 
+inline bool CanBeHeldWeakly(v8::Local<v8::Value> value) {
+  return value->IsObject() || value->IsSymbol();
+}
+
+void ReferenceWeakCallback(const v8::WeakCallbackInfo<napi_ref__>& info) {
+  napi_ref__* ref = info.GetParameter();
+  if (ref == nullptr) return;
+  ref->value.Reset();
+}
+
 void RemoveWrapFinalizerRecord(napi_env env, WrapFinalizerRecord* record) {
   if (env == nullptr || record == nullptr) return;
   auto& records = env->wrap_finalizers;
@@ -70,6 +80,13 @@ void InvokeWrapFinalizer(WrapFinalizerRecord* record) {
   record->finalize_cb(record->env, record->native_object, record->finalize_hint);
 }
 
+void InvokeWrapFinalizerMicrotask(void* data) {
+  auto* record = static_cast<WrapFinalizerRecord*>(data);
+  if (record == nullptr) return;
+  InvokeWrapFinalizer(record);
+  delete record;
+}
+
 void WrapWeakCallback(const v8::WeakCallbackInfo<WrapFinalizerRecord>& info) {
   WrapFinalizerRecord* record = info.GetParameter();
   if (record == nullptr) return;
@@ -77,9 +94,13 @@ void WrapWeakCallback(const v8::WeakCallbackInfo<WrapFinalizerRecord>& info) {
   if (env != nullptr) {
     RemoveWrapFinalizerRecord(env, record);
   }
-  InvokeWrapFinalizer(record);
   record->handle.Reset();
-  delete record;
+  if (env != nullptr && env->isolate != nullptr) {
+    env->isolate->EnqueueMicrotask(InvokeWrapFinalizerMicrotask, record);
+  } else {
+    InvokeWrapFinalizer(record);
+    delete record;
+  }
 }
 
 struct CallbackPayload {
@@ -94,6 +115,15 @@ struct AccessorPayload {
   napi_callback setter_cb;
   void* data;
 };
+
+inline bool CallbackInfoOwnsValue(const napi_callback_info__* cbinfo, napi_value value) {
+  if (cbinfo == nullptr || value == nullptr) return false;
+  if (cbinfo->this_arg == value || cbinfo->new_target == value) return true;
+  for (auto* arg : cbinfo->args) {
+    if (arg == value) return true;
+  }
+  return false;
+}
 
 
 inline bool CheckEnv(napi_env env) {
@@ -219,6 +249,9 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
   }
 
+  if (!pending_exception && ret != nullptr && !CallbackInfoOwnsValue(cbinfo, ret)) {
+    delete ret;
+  }
   delete cbinfo;
 }
 
@@ -236,11 +269,15 @@ void GetterTrampoline(v8::Local<v8::Name> property,
   cbinfo->data = payload->data;
   cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
   napi_value ret = payload->getter_cb(env, cbinfo);
+  bool pending_exception = !env->last_exception.IsEmpty();
   if (!env->last_exception.IsEmpty()) {
     info.GetIsolate()->ThrowException(env->last_exception.Get(env->isolate));
     env->last_exception.Reset();
   } else if (ret != nullptr) {
     info.GetReturnValue().Set(napi_v8_unwrap_value(ret));
+  }
+  if (!pending_exception && ret != nullptr && !CallbackInfoOwnsValue(cbinfo, ret)) {
+    delete ret;
   }
   delete cbinfo;
 }
@@ -275,6 +312,15 @@ napi_value__::napi_value__(napi_env env, v8::Local<v8::Value> local)
 
 napi_value__::~napi_value__() = default;
 
+napi_callback_info__::~napi_callback_info__() {
+  for (auto* arg : args) {
+    delete arg;
+  }
+  args.clear();
+  delete this_arg;
+  delete new_target;
+}
+
 v8::Local<v8::Value> napi_value__::local() const {
   return value.Get(env->isolate);
 }
@@ -282,9 +328,15 @@ v8::Local<v8::Value> napi_value__::local() const {
 napi_ref__::napi_ref__(napi_env env,
                        v8::Local<v8::Value> value,
                        uint32_t initial_refcount)
-    : env(env), value(env->isolate, value), refcount(initial_refcount) {}
+    : env(env), value(env->isolate, value), refcount(initial_refcount), can_be_weak(CanBeHeldWeakly(value)) {
+  if (refcount == 0 && can_be_weak) {
+    this->value.SetWeak(this, ReferenceWeakCallback, v8::WeakCallbackType::kParameter);
+  }
+}
 
-napi_ref__::~napi_ref__() = default;
+napi_ref__::~napi_ref__() {
+  value.Reset();
+}
 
 napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_version)
     : isolate(v8::Isolate::GetCurrent()),
@@ -960,10 +1012,22 @@ napi_status NAPI_CDECL napi_get_value_int64(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
   v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  if (local->IsInt32()) {
+    *result = local.As<v8::Int32>()->Value();
+    return napi_v8_clear_last_error(env);
+  }
   if (!local->IsNumber()) {
     return napi_v8_set_last_error(env, napi_number_expected, "A number was expected");
   }
-  *result = local->IntegerValue(env->context()).FromMaybe(0);
+  // Match Node's behavior: non-finite converts to 0, and finite values
+  // use V8 IntegerValue conversion (including out-of-range sentinel values).
+  double double_value = local.As<v8::Number>()->Value();
+  if (std::isfinite(double_value)) {
+    v8::Local<v8::Context> empty_context;
+    *result = local->IntegerValue(empty_context).FromJust();
+  } else {
+    *result = 0;
+  }
   return napi_v8_clear_last_error(env);
 }
 
@@ -2168,6 +2232,16 @@ napi_status NAPI_CDECL napi_create_reference(napi_env env,
 napi_status NAPI_CDECL napi_delete_reference(node_api_basic_env env, napi_ref ref) {
   (void)env;
   if (ref == nullptr) return napi_invalid_arg;
+  // If this weak reference is being deleted while a GC pass is active, V8 may
+  // still have a queued weak callback for it. Clearing/resetting the handle and
+  // keeping the bookkeeping object alive avoids a use-after-free.
+  if (ref->can_be_weak && ref->refcount == 0) {
+    if (!ref->value.IsEmpty()) {
+      ref->value.ClearWeak();
+      ref->value.Reset();
+    }
+    return napi_ok;
+  }
   delete ref;
   return napi_ok;
 }
@@ -2176,7 +2250,14 @@ napi_status NAPI_CDECL napi_reference_ref(napi_env env,
                                           napi_ref ref,
                                           uint32_t* result) {
   if (!CheckEnv(env) || ref == nullptr) return napi_invalid_arg;
+  if (ref->value.IsEmpty()) {
+    if (result != nullptr) *result = 0;
+    return napi_ok;
+  }
   ref->refcount++;
+  if (ref->refcount == 1 && ref->can_be_weak) {
+    ref->value.ClearWeak();
+  }
   if (result != nullptr) *result = ref->refcount;
   return napi_ok;
 }
@@ -2185,7 +2266,12 @@ napi_status NAPI_CDECL napi_reference_unref(napi_env env,
                                             napi_ref ref,
                                             uint32_t* result) {
   if (!CheckEnv(env) || ref == nullptr) return napi_invalid_arg;
-  if (ref->refcount > 0) ref->refcount--;
+  if (!ref->value.IsEmpty() && ref->refcount > 0) {
+    ref->refcount--;
+    if (ref->refcount == 0 && ref->can_be_weak) {
+      ref->value.SetWeak(ref, ReferenceWeakCallback, v8::WeakCallbackType::kParameter);
+    }
+  }
   if (result != nullptr) *result = ref->refcount;
   return napi_ok;
 }
@@ -2194,6 +2280,10 @@ napi_status NAPI_CDECL napi_get_reference_value(napi_env env,
                                                 napi_ref ref,
                                                 napi_value* result) {
   if (!CheckEnv(env) || ref == nullptr || result == nullptr) return napi_invalid_arg;
+  if (ref->value.IsEmpty()) {
+    *result = nullptr;
+    return napi_ok;
+  }
   *result = napi_v8_wrap_value(env, ref->value.Get(env->isolate));
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
