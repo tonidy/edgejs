@@ -205,6 +205,15 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     ported/js-native-api/test_dataview/test_dataview.c
   )
   target_compile_definitions(napi_v8_test_31_dataview PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
+  add_fixture_test(napi_v8_test_32_sharedarraybuffer
+    runners/test_32_sharedarraybuffer.cc
+    ported/js-native-api/test_sharedarraybuffer/test_sharedarraybuffer.c
+  )
+  target_compile_definitions(napi_v8_test_32_sharedarraybuffer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
+  add_fixture_test(napi_v8_test_33_typedarray
+    runners/test_33_typedarray.cc
+    ported/js-native-api/test_typedarray/test_typedarray.c
+  )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_28_node_instance_data PRIVATE "${NAPI_V8_UV_LIB}")

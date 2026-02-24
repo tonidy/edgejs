@@ -13,8 +13,20 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 
 - `2_function_arguments` (ported to gtest harness)
 - `3_callbacks` (ported to gtest harness)
+- `4_object_factory` (ported to gtest harness)
+- `5_function_factory` (ported to gtest harness)
+- `6_object_wrap` (ported to gtest harness)
+- `7_factory_wrap` (ported to gtest harness)
+- `8_passing_wrapped` (ported to gtest harness)
+- `test_array` (ported to gtest harness)
+- `test_constructor` (ported to gtest harness)
+- `test_error` (ported to gtest harness)
+- `test_exception` (ported to gtest harness)
+- `test_function` (ported to gtest harness)
+- `test_number` (ported to gtest harness)
 - `test_reference` (ported to gtest harness)
 - `test_string` (ported to gtest harness)
+- `test_symbol` (ported to gtest harness)
 - `test_conversions` (ported to gtest harness)
 - `test_properties` (ported to gtest harness)
 - `test_general` (ported to gtest harness)
@@ -22,21 +34,12 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_bigint` (ported to gtest harness)
 - `test_date` (ported to gtest harness)
 - `test_dataview` (ported to gtest harness)
+- `test_sharedarraybuffer` (ported to gtest harness)
+- `test_typedarray` (ported to gtest harness)
 
 ### implement_now
 
-- `4_object_factory`
-- `5_function_factory`
-- `6_object_wrap`
-- `7_factory_wrap`
-- `8_passing_wrapped`
-- `test_array`
-- `test_constructor`
-- `test_error`
-- `test_exception`
-- `test_function`
-- `test_number`
-- `test_symbol`
+- (none currently)
 
 ### defer_phase2
 
@@ -47,8 +50,6 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_new_target`
 - `test_promise`
 - `test_reference_double_free`
-- `test_sharedarraybuffer`
-- `test_typedarray`
 
 ## `node-api` (`node/test/node-api`)
 

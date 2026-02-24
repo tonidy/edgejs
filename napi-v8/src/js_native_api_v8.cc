@@ -89,6 +89,55 @@ inline v8::PropertyAttribute ToV8PropertyAttributes(napi_property_attributes att
   return static_cast<v8::PropertyAttribute>(v8_attrs);
 }
 
+inline const char* TypedArrayConstructorName(napi_typedarray_type type) {
+  switch (type) {
+    case napi_int8_array: return "Int8Array";
+    case napi_uint8_array: return "Uint8Array";
+    case napi_uint8_clamped_array: return "Uint8ClampedArray";
+    case napi_int16_array: return "Int16Array";
+    case napi_uint16_array: return "Uint16Array";
+    case napi_int32_array: return "Int32Array";
+    case napi_uint32_array: return "Uint32Array";
+    case napi_float16_array: return "Float16Array";
+    case napi_float32_array: return "Float32Array";
+    case napi_float64_array: return "Float64Array";
+    case napi_bigint64_array: return "BigInt64Array";
+    case napi_biguint64_array: return "BigUint64Array";
+    default: return nullptr;
+  }
+}
+
+inline bool GetTypedArrayType(v8::Local<v8::Value> value, napi_typedarray_type* out_type) {
+  if (value->IsInt8Array()) {
+    *out_type = napi_int8_array;
+  } else if (value->IsUint8Array()) {
+    *out_type = napi_uint8_array;
+  } else if (value->IsUint8ClampedArray()) {
+    *out_type = napi_uint8_clamped_array;
+  } else if (value->IsInt16Array()) {
+    *out_type = napi_int16_array;
+  } else if (value->IsUint16Array()) {
+    *out_type = napi_uint16_array;
+  } else if (value->IsInt32Array()) {
+    *out_type = napi_int32_array;
+  } else if (value->IsUint32Array()) {
+    *out_type = napi_uint32_array;
+  } else if (value->IsFloat16Array()) {
+    *out_type = napi_float16_array;
+  } else if (value->IsFloat32Array()) {
+    *out_type = napi_float32_array;
+  } else if (value->IsFloat64Array()) {
+    *out_type = napi_float64_array;
+  } else if (value->IsBigInt64Array()) {
+    *out_type = napi_bigint64_array;
+  } else if (value->IsBigUint64Array()) {
+    *out_type = napi_biguint64_array;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   auto* payload =
       static_cast<CallbackPayload*>(info.Data().As<v8::External>()->Value());
@@ -417,6 +466,134 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   v8::Local<v8::Uint8Array> view = v8::Uint8Array::New(ab, 0, length);
   *result = napi_v8_wrap_value(env, view);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_arraybuffer(napi_env env,
+                                               size_t byte_length,
+                                               void** data,
+                                               napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, byte_length);
+  if (data != nullptr) *data = ab->Data();
+  *result = napi_v8_wrap_value(env, ab);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_external_arraybuffer(
+    napi_env env,
+    void* external_data,
+    size_t byte_length,
+    node_api_basic_finalize finalize_cb,
+    void* finalize_hint,
+    napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+
+  v8::Local<v8::ArrayBuffer> out;
+  if (external_data == nullptr && byte_length == 0) {
+    out = v8::ArrayBuffer::New(env->isolate, 0);
+    out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
+  } else {
+    if (external_data == nullptr) return napi_invalid_arg;
+    out = v8::ArrayBuffer::New(env->isolate, byte_length);
+    if (byte_length > 0) {
+      std::memcpy(out->Data(), external_data, byte_length);
+    }
+    if (finalize_cb != nullptr) {
+      finalize_cb(env, external_data, finalize_hint);
+    }
+  }
+
+  *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_is_typedarray(napi_env env, napi_value value, bool* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) return napi_invalid_arg;
+  *result = napi_v8_unwrap_value(value)->IsTypedArray();
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_typedarray(napi_env env,
+                                              napi_typedarray_type type,
+                                              size_t length,
+                                              napi_value arraybuffer,
+                                              size_t byte_offset,
+                                              napi_value* result) {
+  if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) return InvalidArg(env);
+  v8::Local<v8::Value> local = napi_v8_unwrap_value(arraybuffer);
+  if (!local->IsArrayBuffer()) return napi_arraybuffer_expected;
+
+  const char* ctor_name = TypedArrayConstructorName(type);
+  if (ctor_name == nullptr) return InvalidArg(env);
+
+  v8::TryCatch tc(env->isolate);
+  v8::Local<v8::String> key;
+  if (!v8::String::NewFromUtf8(env->isolate, ctor_name, v8::NewStringType::kNormal).ToLocal(&key)) {
+    return napi_generic_failure;
+  }
+  v8::Local<v8::Value> ctor_value;
+  if (!env->context()->Global()->Get(env->context(), key).ToLocal(&ctor_value) ||
+      !ctor_value->IsFunction()) {
+    return napi_generic_failure;
+  }
+  v8::Local<v8::Value> args[3] = {
+      local,
+      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(byte_offset)),
+      v8::Integer::NewFromUnsigned(env->isolate, static_cast<uint32_t>(length)),
+  };
+  v8::Local<v8::Object> view;
+  if (!ctor_value.As<v8::Function>()->NewInstance(env->context(), 3, args).ToLocal(&view)) {
+    return ReturnPendingIfCaught(env, tc, "Failed to create TypedArray");
+  }
+  *result = napi_v8_wrap_value(env, view);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_get_typedarray_info(napi_env env,
+                                                napi_value typedarray,
+                                                napi_typedarray_type* type,
+                                                size_t* length,
+                                                void** data,
+                                                napi_value* arraybuffer,
+                                                size_t* byte_offset) {
+  if (!CheckEnv(env) || typedarray == nullptr) return InvalidArg(env);
+  v8::Local<v8::Value> local = napi_v8_unwrap_value(typedarray);
+  if (!local->IsTypedArray()) return napi_invalid_arg;
+  v8::Local<v8::TypedArray> ta = local.As<v8::TypedArray>();
+
+  if (type != nullptr && !GetTypedArrayType(local, type)) return napi_generic_failure;
+  if (length != nullptr) *length = ta->Length();
+  if (byte_offset != nullptr) *byte_offset = ta->ByteOffset();
+  if (data != nullptr) {
+    size_t offset = ta->ByteOffset();
+    void* buffer_data = ta->Buffer()->Data();
+    *data = (buffer_data == nullptr) ? nullptr : static_cast<void*>(static_cast<uint8_t*>(buffer_data) + offset);
+  }
+  if (arraybuffer != nullptr) {
+    *arraybuffer = napi_v8_wrap_value(env, ta->Buffer());
+    if (*arraybuffer == nullptr) return napi_generic_failure;
+  }
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_detach_arraybuffer(napi_env env, napi_value arraybuffer) {
+  if (!CheckEnv(env) || arraybuffer == nullptr) return InvalidArg(env);
+  v8::Local<v8::Value> value = napi_v8_unwrap_value(arraybuffer);
+  if (!value->IsArrayBuffer()) return napi_arraybuffer_expected;
+  if (value.As<v8::ArrayBuffer>()->Detach(v8::Local<v8::Value>()).FromMaybe(false)) {
+    return napi_ok;
+  }
+  return napi_generic_failure;
+}
+
+napi_status NAPI_CDECL napi_is_detached_arraybuffer(napi_env env,
+                                                    napi_value value,
+                                                    bool* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) return InvalidArg(env);
+  v8::Local<v8::Value> local = napi_v8_unwrap_value(value);
+  if (!local->IsArrayBuffer()) return napi_arraybuffer_expected;
+  *result = local.As<v8::ArrayBuffer>()->WasDetached();
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_create_array_with_length(napi_env env,
@@ -825,6 +1002,29 @@ napi_status NAPI_CDECL napi_is_arraybuffer(napi_env env, napi_value value, bool*
   return napi_v8_clear_last_error(env);
 }
 
+napi_status NAPI_CDECL napi_get_arraybuffer_info(napi_env env,
+                                                 napi_value arraybuffer,
+                                                 void** data,
+                                                 size_t* byte_length) {
+  if (!CheckEnv(env) || arraybuffer == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::Local<v8::Value> value = napi_v8_unwrap_value(arraybuffer);
+  if (value->IsArrayBuffer()) {
+    v8::Local<v8::ArrayBuffer> ab = value.As<v8::ArrayBuffer>();
+    if (data != nullptr) *data = ab->Data();
+    if (byte_length != nullptr) *byte_length = ab->ByteLength();
+    return napi_v8_clear_last_error(env);
+  }
+  if (value->IsSharedArrayBuffer()) {
+    v8::Local<v8::SharedArrayBuffer> sab = value.As<v8::SharedArrayBuffer>();
+    if (data != nullptr) *data = sab->Data();
+    if (byte_length != nullptr) *byte_length = sab->ByteLength();
+    return napi_v8_clear_last_error(env);
+  }
+  return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+}
+
 napi_status NAPI_CDECL node_api_is_sharedarraybuffer(node_api_basic_env env,
                                                      napi_value value,
                                                      bool* result) {
@@ -834,6 +1034,23 @@ napi_status NAPI_CDECL node_api_is_sharedarraybuffer(node_api_basic_env env,
   }
   *result = napi_v8_unwrap_value(value)->IsSharedArrayBuffer();
   return napi_v8_clear_last_error(napiEnv);
+}
+
+napi_status NAPI_CDECL node_api_create_sharedarraybuffer(napi_env env,
+                                                         size_t byte_length,
+                                                         void** data,
+                                                         napi_value* result) {
+  if (!CheckEnv(env) || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
+  v8::Local<v8::SharedArrayBuffer> sab =
+      v8::SharedArrayBuffer::New(env->isolate, byte_length);
+  if (data != nullptr) *data = sab->Data();
+  *result = napi_v8_wrap_value(env, sab);
+  if (*result == nullptr) {
+    return napi_v8_set_last_error(env, napi_generic_failure, "Failed to create SharedArrayBuffer");
+  }
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_create_dataview(napi_env env,
