@@ -9,6 +9,8 @@
 
 #include "js_native_api.h"
 
+typedef void(NAPI_CDECL* napi_cleanup_hook)(void* arg);
+
 struct napi_value__ {
   explicit napi_value__(napi_env env, v8::Local<v8::Value> local);
   ~napi_value__();
@@ -37,6 +39,11 @@ struct napi_ref__ {
   v8::Global<v8::Value> value;
   uint32_t refcount = 0;
   bool can_be_weak = false;
+};
+
+struct napi_env_cleanup_hook__ {
+  napi_cleanup_hook hook = nullptr;
+  void* arg = nullptr;
 };
 
 struct napi_env__ {

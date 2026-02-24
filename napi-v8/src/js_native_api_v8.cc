@@ -43,6 +43,22 @@ struct napi_escapable_handle_scope__ {
   bool escaped = false;
 };
 
+struct napi_async_context__ {
+  napi_env env = nullptr;
+  v8::Global<v8::Object> resource;
+};
+
+struct napi_buffer_record__ {
+  napi_env env = nullptr;
+  v8::Global<v8::Object> holder;
+  std::shared_ptr<v8::BackingStore> backing_store;
+  void* external_data = nullptr;
+  node_api_basic_finalize finalize_cb = nullptr;
+  void* finalize_hint = nullptr;
+  bool finalized = false;
+};
+using napi_buffer_record = napi_buffer_record__;
+
 struct WrapFinalizerRecord {
   napi_env env = nullptr;
   void* native_object = nullptr;
@@ -128,6 +144,75 @@ inline bool CallbackInfoOwnsValue(const napi_callback_info__* cbinfo, napi_value
 
 inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
+}
+
+void RemoveBufferRecord(napi_env env, napi_buffer_record* record) {
+  if (!CheckEnv(env) || record == nullptr) return;
+  auto& records = env->buffer_records;
+  for (auto it = records.begin(); it != records.end(); ++it) {
+    if (*it == record) {
+      records.erase(it);
+      return;
+    }
+  }
+}
+
+void FinalizeBufferRecord(napi_buffer_record* record) {
+  if (record == nullptr || record->finalized) return;
+  record->finalized = true;
+  if (record->finalize_cb != nullptr) {
+    record->finalize_cb(record->env, record->external_data, record->finalize_hint);
+  }
+}
+
+void FinalizeBufferRecordMicrotask(void* data) {
+  auto* record = static_cast<napi_buffer_record*>(data);
+  if (record == nullptr) return;
+  FinalizeBufferRecord(record);
+  delete record;
+}
+
+void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
+  napi_buffer_record* record = info.GetParameter();
+  if (record == nullptr) return;
+  napi_env env = record->env;
+  if (CheckEnv(env)) {
+    v8::HandleScope hs(env->isolate);
+    v8::Local<v8::Context> context = env->context();
+    v8::Context::Scope cs(context);
+    RemoveBufferRecord(env, record);
+    env->isolate->EnqueueMicrotask(FinalizeBufferRecordMicrotask, record);
+  } else {
+    FinalizeBufferRecord(record);
+    delete record;
+  }
+  record->holder.Reset();
+}
+
+bool IsOurBufferObject(napi_env env, v8::Local<v8::Object> object) {
+  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  return object->HasPrivate(env->context(), key).FromMaybe(false);
+}
+
+napi_status GetBufferRecord(napi_env env, napi_value value, napi_buffer_record** out) {
+  if (!CheckEnv(env) || value == nullptr || out == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+  if (!raw->IsObject()) return napi_invalid_arg;
+  v8::Local<v8::Object> object = raw.As<v8::Object>();
+  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  v8::MaybeLocal<v8::Value> maybe = object->GetPrivate(env->context(), key);
+  v8::Local<v8::Value> external;
+  if (!maybe.ToLocal(&external) || !external->IsExternal()) return napi_invalid_arg;
+  *out = static_cast<napi_buffer_record*>(external.As<v8::External>()->Value());
+  return (*out == nullptr) ? napi_invalid_arg : napi_ok;
+}
+
+v8::Local<v8::Object> CreateBufferObject(napi_env env,
+                                         std::shared_ptr<v8::BackingStore> backing_store,
+                                         size_t offset,
+                                         size_t length) {
+  v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, backing_store);
+  return v8::Uint8Array::New(ab, offset, length);
 }
 
 inline bool CheckValue(napi_env env, napi_value value) {
@@ -414,6 +499,33 @@ napi_value napi_v8_wrap_value(napi_env env, v8::Local<v8::Value> value) {
 
 v8::Local<v8::Value> napi_v8_unwrap_value(napi_value value) {
   return value->local();
+}
+
+void napi_v8_finalize_buffer_records(napi_env env) {
+  if (!CheckEnv(env)) return;
+  for (void* raw : env->buffer_records) {
+    auto* record = static_cast<napi_buffer_record*>(raw);
+    if (record != nullptr) {
+      FinalizeBufferRecord(record);
+      record->holder.Reset();
+      delete record;
+    }
+  }
+  env->buffer_records.clear();
+}
+
+void napi_v8_run_env_cleanup_hooks(napi_env env) {
+  if (!CheckEnv(env)) return;
+  for (auto it = env->env_cleanup_hooks.rbegin(); it != env->env_cleanup_hooks.rend(); ++it) {
+    auto* entry = static_cast<napi_env_cleanup_hook__*>(*it);
+    if (entry != nullptr && entry->hook != nullptr) {
+      entry->hook(entry->arg);
+    }
+  }
+  for (void* raw : env->env_cleanup_hooks) {
+    delete static_cast<napi_env_cleanup_hook__*>(raw);
+  }
+  env->env_cleanup_hooks.clear();
 }
 
 extern "C" {
@@ -2616,6 +2728,190 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
     return napi_generic_failure;
   }
   *result = napi_v8_wrap_value(env, out);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_async_init(node_api_basic_env env,
+                                       napi_value async_resource,
+                                       napi_value async_resource_name,
+                                       napi_async_context* result) {
+  auto* napiEnv = const_cast<napi_env>(env);
+  if (!CheckEnv(napiEnv) || async_resource_name == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  v8::Local<v8::Context> context = napiEnv->context();
+  v8::Context::Scope context_scope(context);
+
+  auto* asyncContext = new (std::nothrow) napi_async_context__();
+  if (asyncContext == nullptr) return napi_generic_failure;
+  asyncContext->env = napiEnv;
+
+  v8::Local<v8::Object> resource_obj;
+  if (async_resource != nullptr) {
+    v8::Local<v8::Value> candidate = napi_v8_unwrap_value(async_resource);
+    if (candidate->IsObject()) {
+      resource_obj = candidate.As<v8::Object>();
+    }
+  }
+  if (resource_obj.IsEmpty()) {
+    resource_obj = v8::Object::New(napiEnv->isolate);
+  }
+  asyncContext->resource.Reset(napiEnv->isolate, resource_obj);
+  *result = asyncContext;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_async_destroy(node_api_basic_env env, napi_async_context async_context) {
+  auto* napiEnv = const_cast<napi_env>(env);
+  if (!CheckEnv(napiEnv) || async_context == nullptr) return napi_invalid_arg;
+  delete async_context;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {
+  if (!CheckEnv(env) || err == nullptr) return napi_invalid_arg;
+  env->last_exception.Reset(env->isolate, napi_v8_unwrap_value(err));
+  env->isolate->ThrowException(napi_v8_unwrap_value(err));
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_buffer(napi_env env,
+                                          size_t length,
+                                          void** data,
+                                          napi_value* result) {
+  if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  auto backing = v8::ArrayBuffer::NewBackingStore(env->isolate, length);
+  if (!backing) return napi_generic_failure;
+  *data = backing->Data();
+
+  auto* record = new (std::nothrow) napi_buffer_record__();
+  if (record == nullptr) return napi_generic_failure;
+  record->env = env;
+  record->backing_store = std::move(backing);
+
+  v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
+  record->holder.Reset(env->isolate, buffer_obj);
+  record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
+  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  buffer_obj
+      ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
+      .FromJust();
+  env->buffer_records.push_back(record);
+
+  *result = napi_v8_wrap_value(env, buffer_obj);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_buffer_copy(napi_env env,
+                                               size_t length,
+                                               const void* data,
+                                               void** result_data,
+                                               napi_value* result) {
+  void* out = nullptr;
+  napi_status status = napi_create_buffer(env, length, &out, result);
+  if (status != napi_ok) return status;
+  if (length > 0 && data != nullptr) {
+    std::memcpy(out, data, length);
+  }
+  if (result_data != nullptr) *result_data = out;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
+                                                   size_t length,
+                                                   void* data,
+                                                   node_api_basic_finalize finalize_cb,
+                                                   void* finalize_hint,
+                                                   napi_value* result) {
+  if (!CheckEnv(env) || data == nullptr || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  auto backing = v8::ArrayBuffer::NewBackingStore(env->isolate, length);
+  if (!backing) return napi_generic_failure;
+  if (length > 0) {
+    std::memcpy(backing->Data(), data, length);
+  }
+
+  auto* record = new (std::nothrow) napi_buffer_record__();
+  if (record == nullptr) return napi_generic_failure;
+  record->env = env;
+  record->backing_store = std::move(backing);
+  record->external_data = data;
+  record->finalize_cb = finalize_cb;
+  record->finalize_hint = finalize_hint;
+
+  v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
+  record->holder.Reset(env->isolate, buffer_obj);
+  record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
+  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  buffer_obj
+      ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
+      .FromJust();
+  env->buffer_records.push_back(record);
+
+  *result = napi_v8_wrap_value(env, buffer_obj);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool* result) {
+  if (!CheckEnv(env) || value == nullptr || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+  if (!raw->IsObject()) {
+    *result = false;
+    return napi_ok;
+  }
+  *result = IsOurBufferObject(env, raw.As<v8::Object>());
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_get_buffer_info(napi_env env,
+                                            napi_value value,
+                                            void** data,
+                                            size_t* length) {
+  if (!CheckEnv(env) || value == nullptr) return napi_invalid_arg;
+  napi_buffer_record* record = nullptr;
+  napi_status status = GetBufferRecord(env, value, &record);
+  if (status != napi_ok) return napi_invalid_arg;
+  if (data != nullptr) *data = record->backing_store->Data();
+  if (length != nullptr) *length = record->backing_store->ByteLength();
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL node_api_create_buffer_from_arraybuffer(
+    napi_env env,
+    napi_value arraybuffer,
+    size_t byte_offset,
+    size_t byte_length,
+    napi_value* result) {
+  if (!CheckEnv(env) || arraybuffer == nullptr || result == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(arraybuffer);
+  if (!raw->IsArrayBuffer()) return napi_invalid_arg;
+  v8::Local<v8::ArrayBuffer> ab = raw.As<v8::ArrayBuffer>();
+  size_t ab_length = ab->ByteLength();
+  if (byte_offset > ab_length || byte_length > (ab_length - byte_offset)) {
+    return napi_invalid_arg;
+  }
+
+  auto* record = new (std::nothrow) napi_buffer_record__();
+  if (record == nullptr) return napi_generic_failure;
+  record->env = env;
+  record->backing_store = ab->GetBackingStore();
+
+  v8::Local<v8::Object> buffer_obj =
+      CreateBufferObject(env, record->backing_store, byte_offset, byte_length);
+  record->holder.Reset(env->isolate, buffer_obj);
+  record->holder.SetWeak(record, BufferWeakCallback, v8::WeakCallbackType::kParameter);
+  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
+  buffer_obj
+      ->SetPrivate(env->context(), key, v8::External::New(env->isolate, record))
+      .FromJust();
+  env->buffer_records.push_back(record);
+
+  *result = napi_v8_wrap_value(env, buffer_obj);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
