@@ -1,6 +1,7 @@
 'use strict';
 
 const binding = globalThis.__unode_fs;
+const encodingBinding = globalThis.__unode_encoding || null;
 if (!binding) {
   throw new Error('fs builtin requires __unode_fs binding');
 }
@@ -9,6 +10,9 @@ if (typeof globalThis.TextEncoder === 'undefined') {
   globalThis.TextEncoder = function TextEncoder() {};
   globalThis.TextEncoder.prototype.encode = function encode(s) {
     const str = String(s);
+    if (encodingBinding && typeof encodingBinding.encodeUtf8 === 'function') {
+      return encodingBinding.encodeUtf8(str);
+    }
     const out = [];
     for (let i = 0; i < str.length; i++) {
       let c = str.charCodeAt(i);
@@ -47,6 +51,10 @@ function invalidArgTypeHelper(input) {
 }
 
 function decodeUtf8FromBytes(view) {
+  if (encodingBinding && typeof encodingBinding.decodeUtf8 === 'function') {
+    const u8 = view.buffer ? new Uint8Array(view.buffer, view.byteOffset || 0, view.byteLength) : new Uint8Array(view);
+    return encodingBinding.decodeUtf8(u8);
+  }
   if (typeof TextDecoder !== 'undefined') {
     return new TextDecoder().decode(view);
   }

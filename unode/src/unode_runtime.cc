@@ -16,6 +16,7 @@ extern char** environ;
 #endif
 
 #include "unode_fs.h"
+#include "unode_encoding.h"
 #include "unode_module_loader.h"
 #include "unode_os.h"
 
@@ -346,6 +347,7 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
   }
   UnodeInstallFsBinding(env);
   UnodeInstallOsBinding(env);
+  UnodeInstallEncodingBinding(env);
   status = UnodeInstallModuleLoader(env, entry_script_path);
   if (status != napi_ok) {
     if (error_out != nullptr) {

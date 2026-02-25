@@ -39,6 +39,14 @@ add_library(unode_node_api STATIC
   src/unofficial_napi_testing_until_gc.cc
 )
 
+add_library(unode_simdutf STATIC
+  "${NAPI_V8_NODE_ROOT}/deps/v8/third_party/simdutf/simdutf.cpp"
+)
+target_include_directories(unode_simdutf
+  PUBLIC
+    "${NAPI_V8_NODE_ROOT}/deps/v8/third_party/simdutf"
+)
+
 target_include_directories(unode_node_api
   PRIVATE
     "${NAPI_V8_ROOT}/include"
@@ -56,6 +64,7 @@ add_library(unode_runtime STATIC
   src/unode_module_loader.cc
   src/unode_fs.cc
   src/unode_os.cc
+  src/unode_encoding.cc
 )
 target_include_directories(unode_runtime
   PUBLIC
@@ -68,6 +77,7 @@ target_link_libraries(unode_runtime
     napi_v8
     unode_node_api
   PRIVATE
+    unode_simdutf
     uv_a
 )
 

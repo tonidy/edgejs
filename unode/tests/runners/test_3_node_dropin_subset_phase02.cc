@@ -211,6 +211,14 @@ TEST_F(Test3NodeDropinSubsetPhase02, ConsoleTableCompatTest) {
   EXPECT_TRUE(error.empty()) << "error=" << error;
 }
 
+TEST_F(Test3NodeDropinSubsetPhase02, BufferBase64HardeningCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-buffer-base64-hardening.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
 TEST_F(Test3NodeDropinSubsetPhase02, OsCompatTest) {
   EnvScope s(runtime_.get());
   std::string error;
