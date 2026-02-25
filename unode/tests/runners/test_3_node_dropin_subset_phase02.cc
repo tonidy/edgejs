@@ -15,16 +15,19 @@ int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* er
 
 // Run a Node test script from the node repo (raw drop-in). Uses UNODE_FALLBACK_BUILTINS_DIR
 // so require('assert'), require('path'), etc. resolve to unode/tests/node-compat/builtins.
+// NODE_TEST_DIR points to node/test so common/fixtures.js can resolve fixtures under node/test/fixtures.
 int RunRawNodeTestScript(napi_env env, const char* node_test_relative_path, std::string* error_out) {
 #ifdef NAPI_V8_NODE_ROOT_PATH
   const std::string node_root(NAPI_V8_NODE_ROOT_PATH);
   const std::string unode_root(NAPI_V8_ROOT_PATH);
   const std::string script_path = node_root + "/test/parallel/" + node_test_relative_path;
   const std::string fallback_builtins = unode_root + "/tests/node-compat/builtins";
-  const int prev = setenv("UNODE_FALLBACK_BUILTINS_DIR", fallback_builtins.c_str(), 1);
-  (void)prev;
+  const std::string node_test_dir = node_root + "/test";
+  setenv("UNODE_FALLBACK_BUILTINS_DIR", fallback_builtins.c_str(), 1);
+  setenv("NODE_TEST_DIR", node_test_dir.c_str(), 1);
   const int exit_code = UnodeRunScriptFile(env, script_path.c_str(), error_out);
   unsetenv("UNODE_FALLBACK_BUILTINS_DIR");
+  unsetenv("NODE_TEST_DIR");
   return exit_code;
 #else
   (void)env;

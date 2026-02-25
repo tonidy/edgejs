@@ -354,11 +354,39 @@ napi_value CreateResolvedPathString(napi_env env, const fs::path& resolved_path)
   return out;
 }
 
+// When running a raw Node test (entry under node/test/parallel/), redirect
+// require('../common') and require('../common/fixtures') to unode's minimal
+// common shims so Node's heavy common/index.js is not loaded.
+static bool ApplyNodeTestCommonRedirect(ModuleLoaderState* state, fs::path* resolved_path) {
+  if (state == nullptr || state->entry_dir.empty()) return false;
+  const char* fallback = std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
+  if (fallback == nullptr || fallback[0] == '\0') return false;
+
+  fs::path entry_dir = fs::path(state->entry_dir).lexically_normal();
+  if (entry_dir.filename() != "parallel") return false;
+  if (entry_dir.parent_path().filename() != "test") return false;
+
+  fs::path node_test_root = entry_dir.parent_path().parent_path();
+  fs::path node_common_dir = node_test_root / "common";
+
+  fs::path normalized = fs::absolute(*resolved_path).lexically_normal();
+  fs::path rel = normalized.lexically_relative(node_common_dir);
+  if (rel.empty() || rel.string().find("..") == 0) return false;
+
+  fs::path unode_common_dir = fs::path(fallback).parent_path() / "common";
+  if (!PathExistsDirectory(unode_common_dir)) {
+    return false;
+  }
+  *resolved_path = (unode_common_dir / rel).lexically_normal();
+  return true;
+}
+
 napi_value ResolveSpecifierForContext(napi_env env, RequireContext* context, const std::string& specifier, bool throw_on_error) {
   fs::path resolved_path;
   if (ResolveBuiltinPath(specifier, context->base_dir, &resolved_path) ||
       ResolveModulePath(specifier, context->base_dir, &resolved_path) ||
       ResolveNodeModules(specifier, context->base_dir, &resolved_path)) {
+    ApplyNodeTestCommonRedirect(context->state, &resolved_path);
     return CreateResolvedPathString(env, resolved_path);
   }
   if (throw_on_error) {
@@ -488,6 +516,7 @@ bool ParseJsonModule(napi_env env, const fs::path& resolved_path, napi_value mod
         if (napi_coerce_to_string(env, exc, &exc_msg) == napi_ok && exc_msg != nullptr) {
           const std::string msg_str = ValueToUtf8(env, exc_msg);
           std::string path_for_msg = resolved_path.string();
+          // Compat tests run from node-compat/ so paths contain "node-compat"; regex expects "test".
           const size_t node_compat = path_for_msg.find("node-compat");
           if (node_compat != std::string::npos) {
             path_for_msg.replace(node_compat, 11, "test");
