@@ -136,6 +136,114 @@ std::string GetAndClearPendingException(napi_env env) {
   return std::string(buffer.data(), copied);
 }
 
+std::string NapiValueToUtf8(napi_env env, napi_value value) {
+  napi_value string_value = nullptr;
+  if (napi_coerce_to_string(env, value, &string_value) != napi_ok || string_value == nullptr) {
+    return "";
+  }
+  size_t length = 0;
+  if (napi_get_value_string_utf8(env, string_value, nullptr, 0, &length) != napi_ok) {
+    return "";
+  }
+  std::string out(length + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, string_value, out.data(), out.size(), &copied) != napi_ok) {
+    return "";
+  }
+  out.resize(copied);
+  return out;
+}
+
+void MaybeInvokeWriteCallback(napi_env env, napi_value maybe_fn) {
+  if (maybe_fn == nullptr) return;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, maybe_fn, &type) != napi_ok || type != napi_function) {
+    return;
+  }
+  napi_value global = nullptr;
+  napi_value null_value = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_null(env, &null_value) != napi_ok || null_value == nullptr) {
+    return;
+  }
+  napi_value argv[1] = {null_value};
+  napi_value ignored = nullptr;
+  napi_call_function(env, global, maybe_fn, 1, argv, &ignored);
+}
+
+napi_value ProcessStdoutWriteCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok && argc >= 1 && argv[0] != nullptr) {
+    const std::string out = NapiValueToUtf8(env, argv[0]);
+    std::cout << out;
+    std::cout.flush();
+  }
+  if (argc >= 2) {
+    MaybeInvokeWriteCallback(env, argv[1]);
+  }
+  napi_value result = nullptr;
+  napi_get_boolean(env, true, &result);
+  return result;
+}
+
+napi_value ProcessStderrWriteCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok && argc >= 1 && argv[0] != nullptr) {
+    const std::string out = NapiValueToUtf8(env, argv[0]);
+    std::cerr << out;
+    std::cerr.flush();
+  }
+  if (argc >= 2) {
+    MaybeInvokeWriteCallback(env, argv[1]);
+  }
+  napi_value result = nullptr;
+  napi_get_boolean(env, true, &result);
+  return result;
+}
+
+napi_status InstallProcessStream(napi_env env,
+                                 napi_value process_obj,
+                                 const char* name,
+                                 int32_t fd,
+                                 napi_callback cb) {
+  napi_value stream_obj = nullptr;
+  if (napi_create_object(env, &stream_obj) != napi_ok || stream_obj == nullptr) {
+    return napi_generic_failure;
+  }
+  napi_value fd_value = nullptr;
+  if (napi_create_int32(env, fd, &fd_value) != napi_ok || fd_value == nullptr) {
+    return napi_generic_failure;
+  }
+  if (napi_set_named_property(env, stream_obj, "fd", fd_value) != napi_ok) {
+    return napi_generic_failure;
+  }
+  napi_value true_value = nullptr;
+  if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr) {
+    return napi_generic_failure;
+  }
+  if (napi_set_named_property(env, stream_obj, "writable", true_value) != napi_ok) {
+    return napi_generic_failure;
+  }
+  napi_value false_value = nullptr;
+  if (napi_get_boolean(env, false, &false_value) != napi_ok || false_value == nullptr) {
+    return napi_generic_failure;
+  }
+  if (napi_set_named_property(env, stream_obj, "isTTY", false_value) != napi_ok) {
+    return napi_generic_failure;
+  }
+  napi_value write_fn = nullptr;
+  if (napi_create_function(env, "write", NAPI_AUTO_LENGTH, cb, nullptr, &write_fn) != napi_ok ||
+      write_fn == nullptr) {
+    return napi_generic_failure;
+  }
+  if (napi_set_named_property(env, stream_obj, "write", write_fn) != napi_ok) {
+    return napi_generic_failure;
+  }
+  return napi_set_named_property(env, process_obj, name, stream_obj);
+}
+
 napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
   size_t argc = 8;
   napi_value args[8] = {nullptr};
@@ -182,14 +290,7 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
     return 1;
   }
 
-  napi_status status = UnodeInstallConsole(env);
-  if (status != napi_ok) {
-    if (error_out != nullptr) {
-      *error_out = "UnodeInstallConsole failed: " + StatusToString(status);
-    }
-    return 1;
-  }
-  status = UnodeInstallProcessObject(env);
+  napi_status status = UnodeInstallProcessObject(env);
   if (status != napi_ok) {
     if (error_out != nullptr) {
       *error_out = "UnodeInstallProcessObject failed: " + StatusToString(status);
@@ -201,6 +302,51 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
   if (status != napi_ok) {
     if (error_out != nullptr) {
       *error_out = "UnodeInstallModuleLoader failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+  status = UnodeInstallConsole(env);
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "UnodeInstallConsole failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+
+  static const char kConsoleBootstrap[] =
+      "(function(){"
+      "if (typeof process !== 'object' || !process) return;"
+      "if (typeof process.nextTick !== 'function') {"
+      "  process.nextTick = function(fn){"
+      "    var args = Array.prototype.slice.call(arguments, 1);"
+      "    if (typeof queueMicrotask === 'function') queueMicrotask(function(){ fn.apply(null, args); });"
+      "    else if (typeof fn === 'function') fn.apply(null, args);"
+      "  };"
+      "}"
+      "if (typeof process.emitWarning !== 'function') {"
+      "  process.emitWarning = function(msg){"
+      "    var text = 'Warning: ' + String(msg);"
+      "    process.nextTick(function(){ if (process.stderr && typeof process.stderr.write === 'function') process.stderr.write(text + '\\n'); });"
+      "  };"
+      "}"
+      "if (typeof process.platform !== 'string') process.platform = 'darwin';"
+      "if (typeof process.exit !== 'function') process.exit = function(){};"
+      "})();";
+  napi_value bootstrap_script = nullptr;
+  status = napi_create_string_utf8(env, kConsoleBootstrap, NAPI_AUTO_LENGTH, &bootstrap_script);
+  if (status != napi_ok || bootstrap_script == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "Bootstrap script creation failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+  {
+    napi_value ignored = nullptr;
+    status = napi_run_script(env, bootstrap_script, &ignored);
+  }
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "Bootstrap script failed: " + StatusToString(status);
     }
     return 1;
   }
@@ -311,36 +457,53 @@ napi_status UnodeInstallConsole(napi_env env) {
   if (env == nullptr) {
     return napi_invalid_arg;
   }
+  napi_value script = nullptr;
+  static const char kInstallConsole[] =
+      "(function(){ globalThis.console = require('console'); })();";
+  napi_status status = napi_create_string_utf8(env, kInstallConsole, NAPI_AUTO_LENGTH, &script);
+  if (status != napi_ok || script == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  napi_value ignored = nullptr;
+  status = napi_run_script(env, script, &ignored);
+  if (status == napi_ok) {
+    return napi_ok;
+  }
+
+  // Fallback for scripts whose base directory has no JS console builtin.
+  bool has_pending = false;
+  if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+    napi_value exc = nullptr;
+    napi_get_and_clear_last_exception(env, &exc);
+  }
 
   napi_value global = nullptr;
-  napi_status status = napi_get_global(env, &global);
+  status = napi_get_global(env, &global);
   if (status != napi_ok || global == nullptr) {
     return (status == napi_ok) ? napi_generic_failure : status;
   }
-
   napi_value console_obj = nullptr;
-  bool has_console = false;
-  status = napi_has_named_property(env, global, "console", &has_console);
-  if (status != napi_ok) return status;
-  if (has_console) {
-    status = napi_get_named_property(env, global, "console", &console_obj);
-    if (status != napi_ok || console_obj == nullptr) {
-      return (status == napi_ok) ? napi_generic_failure : status;
-    }
-  } else {
-    status = napi_create_object(env, &console_obj);
-    if (status != napi_ok || console_obj == nullptr) {
-      return (status == napi_ok) ? napi_generic_failure : status;
-    }
+  if (napi_create_object(env, &console_obj) != napi_ok || console_obj == nullptr) {
+    return napi_generic_failure;
   }
   napi_value log_fn = nullptr;
-  status = napi_create_function(env, "log", NAPI_AUTO_LENGTH, ConsoleLogCallback, nullptr, &log_fn);
-  if (status != napi_ok || log_fn == nullptr) {
-    return (status == napi_ok) ? napi_generic_failure : status;
+  if (napi_create_function(env, "log", NAPI_AUTO_LENGTH, ConsoleLogCallback, nullptr, &log_fn) != napi_ok ||
+      log_fn == nullptr) {
+    return napi_generic_failure;
   }
-  status = napi_set_named_property(env, console_obj, "log", log_fn);
-  if (status != napi_ok) {
-    return status;
+  if (napi_set_named_property(env, console_obj, "log", log_fn) != napi_ok ||
+      napi_set_named_property(env, console_obj, "info", log_fn) != napi_ok ||
+      napi_set_named_property(env, console_obj, "debug", log_fn) != napi_ok) {
+    return napi_generic_failure;
+  }
+  napi_value err_fn = nullptr;
+  if (napi_create_function(env, "error", NAPI_AUTO_LENGTH, ConsoleLogCallback, nullptr, &err_fn) != napi_ok ||
+      err_fn == nullptr) {
+    return napi_generic_failure;
+  }
+  if (napi_set_named_property(env, console_obj, "error", err_fn) != napi_ok ||
+      napi_set_named_property(env, console_obj, "warn", err_fn) != napi_ok) {
+    return napi_generic_failure;
   }
   return napi_set_named_property(env, global, "console", console_obj);
 }
@@ -434,6 +597,14 @@ napi_status UnodeInstallProcessObject(napi_env env) {
     return (status == napi_ok) ? napi_generic_failure : status;
   }
   status = napi_set_named_property(env, process_obj, "on", on_fn);
+  if (status != napi_ok) {
+    return status;
+  }
+  status = InstallProcessStream(env, process_obj, "stdout", 1, ProcessStdoutWriteCallback);
+  if (status != napi_ok) {
+    return status;
+  }
+  status = InstallProcessStream(env, process_obj, "stderr", 2, ProcessStderrWriteCallback);
   if (status != napi_ok) {
     return status;
   }

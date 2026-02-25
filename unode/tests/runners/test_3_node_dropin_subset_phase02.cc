@@ -155,6 +155,62 @@ TEST_F(Test3NodeDropinSubsetPhase02, FsPhaseCSubsetTest) {
   EXPECT_TRUE(error.empty()) << "error=" << error;
 }
 
+TEST_F(Test3NodeDropinSubsetPhase02, ConsoleCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-console.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, ConsoleAssignUndefinedCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-console-assign-undefined.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, ConsoleClearCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-console-clear.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, ConsoleGroupCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-console-group.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, ConsoleMethodsCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-console-methods.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, ConsoleInstanceCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-console-instance.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, ConsoleTableCompatTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-console-table.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
 #ifdef NAPI_V8_NODE_ROOT_PATH
 TEST_F(Test3NodeDropinSubsetPhase02, RawRequireCacheFromNodeTest) {
   EnvScope s(runtime_.get());

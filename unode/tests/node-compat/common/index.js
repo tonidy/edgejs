@@ -83,6 +83,10 @@ function mustNotMutateObjectDeep(obj) {
 }
 
 const isWindows = typeof process !== 'undefined' && process.platform === 'win32';
+const isMainThread = true;
+const isDumbTerminal = typeof process !== 'undefined' &&
+  process.env &&
+  process.env.TERM === 'dumb';
 
 // True if the process can create symlinks (e.g. not in a sandbox). Raw tests may skip symlink tests if false.
 function canCreateSymLink() {
@@ -97,5 +101,7 @@ module.exports = {
   invalidArgTypeHelper,
   mustNotMutateObjectDeep,
   isWindows,
+  isMainThread,
+  isDumbTerminal,
   canCreateSymLink,
 };

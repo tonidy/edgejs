@@ -35,6 +35,15 @@ function notStrictEqual(actual, expected, message) {
   }
 }
 
+function match(actual, regexp, message) {
+  if (!(regexp instanceof RegExp)) {
+    throw new AssertionError('assert.match expects a RegExp');
+  }
+  if (!regexp.test(String(actual))) {
+    throw new AssertionError(message || ('Expected "' + String(actual) + '" to match ' + String(regexp)));
+  }
+}
+
 function ifError(err) {
   if (err) {
     throw err;
@@ -48,6 +57,9 @@ function fail(message) {
 function matchesExpected(err, expected) {
   if (!expected) return true;
   if (typeof expected === 'function') {
+    if (expected.prototype && (expected === Error || expected.prototype instanceof Error)) {
+      return err instanceof expected;
+    }
     return expected(err) === true;
   }
   if (typeof expected !== 'object') {
@@ -117,5 +129,6 @@ assert.ifError = ifError;
 assert.fail = fail;
 assert.throws = throws;
 assert.rejects = rejects;
+assert.match = match;
 
 module.exports = assert;

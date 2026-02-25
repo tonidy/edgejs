@@ -9,4 +9,16 @@ function _initPaths() {
 
 module.exports = {
   _initPaths,
+  builtinModules: [
+    'assert',
+    'buffer',
+    'console',
+    'fs',
+    'module',
+    'path',
+    'stream',
+    'url',
+    'util',
+    'worker_threads',
+  ],
 };
