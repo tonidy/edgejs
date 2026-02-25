@@ -1,8 +1,11 @@
 'use strict';
-function pathToFileURL(p) {
-  const path = require('path');
-  const joined = path.join ? path.join(p) : String(p);
-  const href = 'file://' + (joined.indexOf('/') === 0 ? joined : '/' + joined);
-  return { href: href };
+
+const path = require('path');
+const primordials = require('internal/util/primordials');
+const { internalBinding } = require('internal/test/binding_runtime');
+globalThis.primordials = Object.assign({}, globalThis.primordials || {}, primordials);
+if (typeof globalThis.internalBinding !== 'function') {
+  globalThis.internalBinding = internalBinding;
 }
-module.exports = { pathToFileURL };
+
+module.exports = require(path.resolve(__dirname, '../../../node/lib/url.js'));

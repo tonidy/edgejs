@@ -190,6 +190,46 @@ class ERR_UNHANDLED_ERROR extends Error {
 
 const kEnhanceStackBeforeInspector = Symbol('kEnhanceStackBeforeInspector');
 
+class ERR_INVALID_URI extends URIError {
+  constructor() {
+    super('URI malformed');
+    this.code = 'ERR_INVALID_URI';
+  }
+}
+
+class ERR_INVALID_URL extends TypeError {
+  constructor(input, base = undefined) {
+    const b = base !== undefined ? ` with base ${String(base)}` : '';
+    super(`Invalid URL: ${String(input)}${b}`);
+    this.code = 'ERR_INVALID_URL';
+    this.input = input;
+    if (base !== undefined) this.base = base;
+  }
+}
+
+class ERR_INVALID_FILE_URL_PATH extends TypeError {
+  constructor(reason, input) {
+    const text = reason ? `File URL path ${reason}` : 'File URL path is invalid';
+    super(text);
+    this.code = 'ERR_INVALID_FILE_URL_PATH';
+    if (input !== undefined) this.input = input;
+  }
+}
+
+class ERR_INVALID_FILE_URL_HOST extends TypeError {
+  constructor(platform) {
+    super(`File URL host must be "localhost" or empty on ${platform}`);
+    this.code = 'ERR_INVALID_FILE_URL_HOST';
+  }
+}
+
+class ERR_INVALID_URL_SCHEME extends TypeError {
+  constructor(expected) {
+    super(`The URL must be of scheme ${expected}`);
+    this.code = 'ERR_INVALID_URL_SCHEME';
+  }
+}
+
 function hideStackFrames(fn) {
   return fn;
 }
@@ -218,6 +258,11 @@ module.exports = {
     ERR_MISSING_ARGS,
     ERR_SYSTEM_ERROR,
     ERR_UNHANDLED_ERROR,
+    ERR_INVALID_URI,
+    ERR_INVALID_URL,
+    ERR_INVALID_FILE_URL_PATH,
+    ERR_INVALID_FILE_URL_HOST,
+    ERR_INVALID_URL_SCHEME,
   },
   kEnhanceStackBeforeInspector,
 };

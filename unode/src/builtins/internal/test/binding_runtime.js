@@ -1,7 +1,5 @@
 'use strict';
 
-// Stub for Node's internal/test/binding used by raw Node tests (e.g. test-fs-copyfile.js).
-// Libuv errno on Unix: UV_ERR(x) = -(x). ENOENT=2, EEXIST=17.
 const UV_ENOENT = -2;
 const UV_EEXIST = -17;
 const kHasBackingStore = new WeakSet();
@@ -52,14 +50,23 @@ const primordials = {
 const kUntransferable = Symbol('untransferable_object_private_symbol');
 
 function internalBinding(name) {
-  if (name === 'uv') {
+  if (name === 'uv') return { UV_ENOENT, UV_EEXIST };
+  if (name === 'os') return globalThis.__unode_os || {};
+  if (name === 'buffer') return globalThis.__unode_buffer || {};
+  if (name === 'url') return globalThis.__unode_url || {};
+  if (name === 'url_pattern') {
     return {
-      UV_ENOENT,
-      UV_EEXIST,
+      URLPattern: typeof globalThis.URLPattern === 'function' ? globalThis.URLPattern : undefined,
     };
   }
-  if (name === 'os') {
-    return globalThis.__unode_os || {};
+  if (name === 'encoding_binding') {
+    return {
+      toASCII(input) {
+        const b = globalThis.__unode_url || {};
+        if (typeof b.domainToASCII === 'function') return b.domainToASCII(String(input));
+        return String(input || '').toLowerCase();
+      },
+    };
   }
   if (name === 'debug') {
     return {
@@ -68,9 +75,6 @@ function internalBinding(name) {
       },
     };
   }
-  if (name === 'buffer') {
-    return globalThis.__unode_buffer || {};
-  }
   if (name === 'util') {
     return {
       constants: {
@@ -78,9 +82,9 @@ function internalBinding(name) {
         ONLY_ENUMERABLE: 1,
       },
       getOwnNonIndexProperties(obj) {
-        return Object.getOwnPropertyNames(obj).filter((name) => {
-          const index = Number(name);
-          return !Number.isInteger(index) || String(index) !== name;
+        return Object.getOwnPropertyNames(obj).filter((n) => {
+          const index = Number(n);
+          return !Number.isInteger(index) || String(index) !== n;
         });
       },
       isInsideNodeModules() {
@@ -90,9 +94,7 @@ function internalBinding(name) {
         untransferable_object_private_symbol: kUntransferable,
       },
       arrayBufferViewHasBuffer(view) {
-        if (view == null || typeof view !== 'object') {
-          return false;
-        }
+        if (view == null || typeof view !== 'object') return false;
         let byteLength = 0;
         try {
           byteLength = view.byteLength;
@@ -105,25 +107,6 @@ function internalBinding(name) {
         kHasBackingStore.add(view);
         return false;
       },
-    };
-  }
-  if (name === 'encoding_binding') {
-    return {
-      toASCII(input) {
-        const b = globalThis.__unode_url || {};
-        if (typeof b.domainToASCII === 'function') {
-          return b.domainToASCII(String(input));
-        }
-        return String(input || '').toLowerCase();
-      },
-    };
-  }
-  if (name === 'url') {
-    return globalThis.__unode_url || {};
-  }
-  if (name === 'url_pattern') {
-    return {
-      URLPattern: typeof globalThis.URLPattern === 'function' ? globalThis.URLPattern : undefined,
     };
   }
   return {};

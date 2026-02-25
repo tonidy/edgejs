@@ -42,6 +42,14 @@ add_library(unode_node_api STATIC
 add_library(unode_simdutf STATIC
   "${NAPI_V8_NODE_ROOT}/deps/v8/third_party/simdutf/simdutf.cpp"
 )
+add_library(unode_ada STATIC
+  "${NAPI_V8_NODE_ROOT}/deps/ada/ada.cpp"
+)
+target_include_directories(unode_ada
+  PUBLIC
+    "${NAPI_V8_NODE_ROOT}/deps/ada"
+)
+
 target_include_directories(unode_simdutf
   PUBLIC
     "${NAPI_V8_NODE_ROOT}/deps/v8/third_party/simdutf"
@@ -66,6 +74,7 @@ add_library(unode_runtime STATIC
   src/unode_buffer.cc
   src/unode_os.cc
   src/unode_encoding.cc
+  src/unode_url.cc
 )
 target_include_directories(unode_runtime
   PUBLIC
@@ -79,6 +88,7 @@ target_link_libraries(unode_runtime
     unode_node_api
   PRIVATE
     unode_simdutf
+    unode_ada
     uv_a
 )
 

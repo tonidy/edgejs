@@ -10,7 +10,7 @@ AssertionError.prototype = Object.create(Error.prototype);
 AssertionError.prototype.constructor = AssertionError;
 
 function strictEqual(actual, expected, message) {
-  if (actual !== expected) {
+  if (!Object.is(actual, expected)) {
     throw new AssertionError(message || ('Expected strict equality. actual=' + actual + ' expected=' + expected));
   }
 }
@@ -57,7 +57,7 @@ function ok(value, message) {
 }
 
 function notStrictEqual(actual, expected, message) {
-  if (actual === expected) {
+  if (Object.is(actual, expected)) {
     throw new AssertionError(message || ('Expected strict inequality. actual=' + actual + ' expected=' + expected));
   }
 }

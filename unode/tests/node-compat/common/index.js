@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const childProcess = require('child_process');
 try { require('internal/event_target'); } catch {}
 
 const mustCallChecks = [];
@@ -143,6 +144,18 @@ function skipIf32Bits() {
   }
 }
 
+function spawnPromisified(cmd, args, options) {
+  return new Promise((resolve) => {
+    const child = childProcess.spawn(cmd, args, options);
+    let stdout = '';
+    let stderr = '';
+    if (child.stdout) child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+    if (child.stderr) child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
+    child.on('error', (err) => resolve({ code: 1, signal: null, stdout, stderr: String(err) }));
+  });
+}
+
 module.exports = {
   mustCall,
   mustCallAtLeast,
@@ -164,4 +177,5 @@ module.exports = {
   printSkipMessage,
   skip,
   skipIf32Bits,
+  spawnPromisified,
 };

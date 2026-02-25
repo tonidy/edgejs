@@ -1,7 +1,7 @@
 'use strict';
 
 const path = require('path');
-const { internalBinding, primordials } = require('internal/test/binding');
+const { internalBinding, primordials } = require('internal/test/binding_runtime');
 
 if (typeof globalThis.internalBinding !== 'function') {
   globalThis.internalBinding = internalBinding;

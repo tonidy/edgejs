@@ -18,6 +18,7 @@ module.exports = {
     'fs',
     'module',
     'path',
+    'querystring',
     'stream',
     'url',
     'util',

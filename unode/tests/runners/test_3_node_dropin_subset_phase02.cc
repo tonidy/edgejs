@@ -622,6 +622,27 @@ DEFINE_RAW_NODE_TEST(RawEventsStaticGeteventlistenersFromNodeTest, "test-events-
 DEFINE_RAW_NODE_TEST(RawEventsUncaughtExceptionStackFromNodeTest, "test-events-uncaught-exception-stack.js")
 DEFINE_RAW_NODE_TEST(RawEventTargetFromNodeTest, "test-event-target.js")
 
+// Raw Node querystring tests
+DEFINE_RAW_NODE_TEST(RawQuerystringFromNodeTest, "test-querystring.js")
+DEFINE_RAW_NODE_TEST(RawQuerystringMulticharSeparatorFromNodeTest, "test-querystring-multichar-separator.js")
+DEFINE_RAW_NODE_TEST(RawQuerystringMaxKeysNonFiniteFromNodeTest, "test-querystring-maxKeys-non-finite.js")
+DEFINE_RAW_NODE_TEST(RawQuerystringEscapeFromNodeTest, "test-querystring-escape.js")
+
+// Raw Node url tests
+DEFINE_RAW_NODE_TEST(RawUrlDomainAsciiUnicodeFromNodeTest, "test-url-domain-ascii-unicode.js")
+DEFINE_RAW_NODE_TEST(RawUrlFileurltopathFromNodeTest, "test-url-fileurltopath.js")
+DEFINE_RAW_NODE_TEST(RawUrlFormatInvalidInputFromNodeTest, "test-url-format-invalid-input.js")
+DEFINE_RAW_NODE_TEST(RawUrlFormatWhatwgFromNodeTest, "test-url-format-whatwg.js")
+DEFINE_RAW_NODE_TEST(RawUrlFormatFromNodeTest, "test-url-format.js")
+DEFINE_RAW_NODE_TEST(RawUrlInvalidFileUrlPathInputFromNodeTest, "test-url-invalid-file-url-path-input.js")
+DEFINE_RAW_NODE_TEST(RawUrlIsUrlInternalFromNodeTest, "test-url-is-url-internal.js")
+DEFINE_RAW_NODE_TEST(RawUrlParseFormatFromNodeTest, "test-url-parse-format.js")
+DEFINE_RAW_NODE_TEST(RawUrlParseInvalidInputFromNodeTest, "test-url-parse-invalid-input.js")
+DEFINE_RAW_NODE_TEST(RawUrlParseQueryFromNodeTest, "test-url-parse-query.js")
+DEFINE_RAW_NODE_TEST(RawUrlPathtofileurlFromNodeTest, "test-url-pathtofileurl.js")
+DEFINE_RAW_NODE_TEST(RawUrlRelativeFromNodeTest, "test-url-relative.js")
+DEFINE_RAW_NODE_TEST(RawUrlUrltooptionsFromNodeTest, "test-url-urltooptions.js")
+
 #undef DEFINE_RAW_NODE_TEST
 
 TEST_F(Test3NodeDropinSubsetPhase02, RawPathFromNodeTest) {
