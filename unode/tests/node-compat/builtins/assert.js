@@ -62,6 +62,12 @@ function notStrictEqual(actual, expected, message) {
   }
 }
 
+function notDeepStrictEqual(actual, expected, message) {
+  if (isDeepStrictEqual(actual, expected)) {
+    throw new AssertionError(message || 'Expected values to be different');
+  }
+}
+
 function match(actual, regexp, message) {
   if (!(regexp instanceof RegExp)) {
     throw new AssertionError('assert.match expects a RegExp');
@@ -164,6 +170,7 @@ assert.strictEqual = strictEqual;
 assert.deepStrictEqual = deepStrictEqual;
 assert.ok = ok;
 assert.notStrictEqual = notStrictEqual;
+assert.notDeepStrictEqual = notDeepStrictEqual;
 assert.ifError = ifError;
 assert.fail = fail;
 assert.throws = throws;

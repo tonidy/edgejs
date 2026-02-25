@@ -500,6 +500,85 @@ TEST_F(Test3NodeDropinSubsetPhase02, RawOsConstantsSignalsFromNodeTest) {
   EXPECT_TRUE(error.empty()) << "error=" << error;
 }
 
+#define DEFINE_RAW_NODE_TEST(test_name, script_name)            \
+  TEST_F(Test3NodeDropinSubsetPhase02, test_name) {             \
+    EnvScope s(runtime_.get());                                 \
+    std::string error;                                          \
+    const int exit_code = RunRawNodeTestScript(s.env, script_name, &error); \
+    EXPECT_EQ(exit_code, 0) << "error=" << error;               \
+    EXPECT_TRUE(error.empty()) << "error=" << error;            \
+  }
+
+DEFINE_RAW_NODE_TEST(RawBufferAllocFromNodeTest, "test-buffer-alloc.js")
+DEFINE_RAW_NODE_TEST(RawBufferArraybufferFromNodeTest, "test-buffer-arraybuffer.js")
+DEFINE_RAW_NODE_TEST(RawBufferAsciiFromNodeTest, "test-buffer-ascii.js")
+DEFINE_RAW_NODE_TEST(RawBufferBackingArraybufferFromNodeTest, "test-buffer-backing-arraybuffer.js")
+DEFINE_RAW_NODE_TEST(RawBufferBadhexFromNodeTest, "test-buffer-badhex.js")
+DEFINE_RAW_NODE_TEST(RawBufferBigint64FromNodeTest, "test-buffer-bigint64.js")
+DEFINE_RAW_NODE_TEST(RawBufferBytelengthFromNodeTest, "test-buffer-bytelength.js")
+DEFINE_RAW_NODE_TEST(RawBufferCompareOffsetFromNodeTest, "test-buffer-compare-offset.js")
+DEFINE_RAW_NODE_TEST(RawBufferCompareFromNodeTest, "test-buffer-compare.js")
+DEFINE_RAW_NODE_TEST(RawBufferConcatFromNodeTest, "test-buffer-concat.js")
+DEFINE_RAW_NODE_TEST(RawBufferConstantsFromNodeTest, "test-buffer-constants.js")
+DEFINE_RAW_NODE_TEST(RawBufferConstructorDeprecationErrorFromNodeTest, "test-buffer-constructor-deprecation-error.js")
+DEFINE_RAW_NODE_TEST(RawBufferConstructorNodeModulesPathsFromNodeTest, "test-buffer-constructor-node-modules-paths.js")
+DEFINE_RAW_NODE_TEST(RawBufferConstructorNodeModulesFromNodeTest, "test-buffer-constructor-node-modules.js")
+DEFINE_RAW_NODE_TEST(RawBufferConstructorOutsideNodeModulesFromNodeTest, "test-buffer-constructor-outside-node-modules.js")
+DEFINE_RAW_NODE_TEST(RawBufferCopyFromNodeTest, "test-buffer-copy.js")
+DEFINE_RAW_NODE_TEST(RawBufferEqualsFromNodeTest, "test-buffer-equals.js")
+DEFINE_RAW_NODE_TEST(RawBufferFailedAllocTypedArraysFromNodeTest, "test-buffer-failed-alloc-typed-arrays.js")
+DEFINE_RAW_NODE_TEST(RawBufferFakesFromNodeTest, "test-buffer-fakes.js")
+DEFINE_RAW_NODE_TEST(RawBufferFillFromNodeTest, "test-buffer-fill.js")
+DEFINE_RAW_NODE_TEST(RawBufferFromFromNodeTest, "test-buffer-from.js")
+DEFINE_RAW_NODE_TEST(RawBufferGenericMethodsFromNodeTest, "test-buffer-generic-methods.js")
+DEFINE_RAW_NODE_TEST(RawBufferIncludesFromNodeTest, "test-buffer-includes.js")
+DEFINE_RAW_NODE_TEST(RawBufferIndexofFromNodeTest, "test-buffer-indexof.js")
+DEFINE_RAW_NODE_TEST(RawBufferInheritanceFromNodeTest, "test-buffer-inheritance.js")
+DEFINE_RAW_NODE_TEST(RawBufferInspectFromNodeTest, "test-buffer-inspect.js")
+DEFINE_RAW_NODE_TEST(RawBufferIsasciiFromNodeTest, "test-buffer-isascii.js")
+DEFINE_RAW_NODE_TEST(RawBufferIsencodingFromNodeTest, "test-buffer-isencoding.js")
+DEFINE_RAW_NODE_TEST(RawBufferIsutf8FromNodeTest, "test-buffer-isutf8.js")
+DEFINE_RAW_NODE_TEST(RawBufferIteratorFromNodeTest, "test-buffer-iterator.js")
+DEFINE_RAW_NODE_TEST(RawBufferNewFromNodeTest, "test-buffer-new.js")
+DEFINE_RAW_NODE_TEST(RawBufferNoNegativeAllocationFromNodeTest, "test-buffer-no-negative-allocation.js")
+DEFINE_RAW_NODE_TEST(RawBufferNopendingdepMapFromNodeTest, "test-buffer-nopendingdep-map.js")
+DEFINE_RAW_NODE_TEST(RawBufferOfNoDeprecationFromNodeTest, "test-buffer-of-no-deprecation.js")
+DEFINE_RAW_NODE_TEST(RawBufferOverMaxLengthFromNodeTest, "test-buffer-over-max-length.js")
+DEFINE_RAW_NODE_TEST(RawBufferParentPropertyFromNodeTest, "test-buffer-parent-property.js")
+DEFINE_RAW_NODE_TEST(RawBufferPendingDeprecationFromNodeTest, "test-buffer-pending-deprecation.js")
+DEFINE_RAW_NODE_TEST(RawBufferPoolUntransferableFromNodeTest, "test-buffer-pool-untransferable.js")
+DEFINE_RAW_NODE_TEST(RawBufferPrototypeInspectFromNodeTest, "test-buffer-prototype-inspect.js")
+DEFINE_RAW_NODE_TEST(RawBufferReadFromNodeTest, "test-buffer-read.js")
+DEFINE_RAW_NODE_TEST(RawBufferReaddoubleFromNodeTest, "test-buffer-readdouble.js")
+DEFINE_RAW_NODE_TEST(RawBufferReadfloatFromNodeTest, "test-buffer-readfloat.js")
+DEFINE_RAW_NODE_TEST(RawBufferReadintFromNodeTest, "test-buffer-readint.js")
+DEFINE_RAW_NODE_TEST(RawBufferReaduintFromNodeTest, "test-buffer-readuint.js")
+DEFINE_RAW_NODE_TEST(RawBufferResizableFromNodeTest, "test-buffer-resizable.js")
+DEFINE_RAW_NODE_TEST(RawBufferSafeUnsafeFromNodeTest, "test-buffer-safe-unsafe.js")
+DEFINE_RAW_NODE_TEST(RawBufferSetInspectMaxBytesFromNodeTest, "test-buffer-set-inspect-max-bytes.js")
+DEFINE_RAW_NODE_TEST(RawBufferSharedarraybufferFromNodeTest, "test-buffer-sharedarraybuffer.js")
+DEFINE_RAW_NODE_TEST(RawBufferSliceFromNodeTest, "test-buffer-slice.js")
+DEFINE_RAW_NODE_TEST(RawBufferSlowFromNodeTest, "test-buffer-slow.js")
+DEFINE_RAW_NODE_TEST(RawBufferTojsonFromNodeTest, "test-buffer-tojson.js")
+DEFINE_RAW_NODE_TEST(RawBufferTostring4gbFromNodeTest, "test-buffer-tostring-4gb.js")
+DEFINE_RAW_NODE_TEST(RawBufferTostringRangeFromNodeTest, "test-buffer-tostring-range.js")
+DEFINE_RAW_NODE_TEST(RawBufferTostringRangeerrorFromNodeTest, "test-buffer-tostring-rangeerror.js")
+DEFINE_RAW_NODE_TEST(RawBufferTostringFromNodeTest, "test-buffer-tostring.js")
+DEFINE_RAW_NODE_TEST(RawBufferWriteFastFromNodeTest, "test-buffer-write-fast.js")
+DEFINE_RAW_NODE_TEST(RawBufferWriteFromNodeTest, "test-buffer-write.js")
+DEFINE_RAW_NODE_TEST(RawBufferWritedoubleFromNodeTest, "test-buffer-writedouble.js")
+DEFINE_RAW_NODE_TEST(RawBufferWritefloatFromNodeTest, "test-buffer-writefloat.js")
+DEFINE_RAW_NODE_TEST(RawBufferWriteintFromNodeTest, "test-buffer-writeint.js")
+DEFINE_RAW_NODE_TEST(RawBufferWriteuintFromNodeTest, "test-buffer-writeuint.js")
+DEFINE_RAW_NODE_TEST(RawBufferZeroFillCliFromNodeTest, "test-buffer-zero-fill-cli.js")
+DEFINE_RAW_NODE_TEST(RawBufferZeroFillResetFromNodeTest, "test-buffer-zero-fill-reset.js")
+DEFINE_RAW_NODE_TEST(RawBufferZeroFillFromNodeTest, "test-buffer-zero-fill.js")
+DEFINE_RAW_NODE_TEST(RawBufferAllocUnsafeIsInitializedWithZeroFillFlagFromNodeTest, "test-buffer-alloc-unsafe-is-initialized-with-zero-fill-flag.js")
+DEFINE_RAW_NODE_TEST(RawBufferAllocUnsafeIsUninitializedFromNodeTest, "test-buffer-alloc-unsafe-is-uninitialized.js")
+DEFINE_RAW_NODE_TEST(RawBufferSwapFromNodeTest, "test-buffer-swap.js")
+
+#undef DEFINE_RAW_NODE_TEST
+
 TEST_F(Test3NodeDropinSubsetPhase02, RawPathFromNodeTest) {
   EnvScope s(runtime_.get());
   std::string error;

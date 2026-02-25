@@ -60,6 +60,30 @@ function expectWarning(/* nameOrMap, expected, code */) {
   // No-op for raw tests that only need the API to exist.
 }
 
+function expectsError(expected) {
+  return function matcher(err) {
+    if (!err || typeof err !== 'object') return false;
+    if (expected && Object.prototype.hasOwnProperty.call(expected, 'name') &&
+        err.name !== expected.name) {
+      return false;
+    }
+    if (expected && Object.prototype.hasOwnProperty.call(expected, 'code') &&
+        err.code !== expected.code) {
+      return false;
+    }
+    if (expected && Object.prototype.hasOwnProperty.call(expected, 'message')) {
+      const exp = expected.message;
+      const msg = String(err.message || '');
+      if (exp instanceof RegExp) {
+        if (!exp.test(msg)) return false;
+      } else if (msg !== String(exp)) {
+        return false;
+      }
+    }
+    return true;
+  };
+}
+
 // Node test harness: simplify ERR_INVALID_ARG_TYPE message for assert.throws.
 function invalidArgTypeHelper(input) {
   if (input == null) {
@@ -102,11 +126,18 @@ function skip(msg) {
   process.exit(0);
 }
 
+function skipIf32Bits() {
+  if (process.arch === 'ia32' || process.arch === 'arm') {
+    skip('skipped on 32-bit platforms');
+  }
+}
+
 module.exports = {
   mustCall,
   mustSucceed,
   mustNotCall,
   expectWarning,
+  expectsError,
   invalidArgTypeHelper,
   mustNotMutateObjectDeep,
   isWindows,
@@ -118,4 +149,5 @@ module.exports = {
   isDumbTerminal,
   canCreateSymLink,
   skip,
+  skipIf32Bits,
 };
