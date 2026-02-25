@@ -756,6 +756,195 @@ napi_value BindingClose(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+// Get pointer and byte length from a Buffer or TypedArray (e.g. Uint8Array).
+// Returns true on success; *data and *byte_length are set.
+static bool BufferFromValue(napi_env env, napi_value value, void** data,
+                            size_t* byte_length) {
+  if (value == nullptr || data == nullptr || byte_length == nullptr) {
+    return false;
+  }
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) != napi_ok) return false;
+  if (is_buffer) {
+    size_t len = 0;
+    if (napi_get_buffer_info(env, value, data, &len) != napi_ok) return false;
+    *byte_length = len;
+    return true;
+  }
+  bool is_ta = false;
+  if (napi_is_typedarray(env, value, &is_ta) != napi_ok || !is_ta) {
+    return false;
+  }
+  napi_typedarray_type type = napi_uint8_array;
+  size_t element_length = 0;
+  void* ptr = nullptr;
+  size_t byte_offset = 0;
+  if (napi_get_typedarray_info(env, value, &type, &element_length, &ptr,
+                               nullptr, &byte_offset) != napi_ok) {
+    return false;
+  }
+  static const size_t kBytesPerElement[] = {
+      1, 1, 2, 2, 4, 4, 4, 8, 8, 8, 8, 8, 8, 2, 2, 4, 4, 8, 8,
+  };
+  const size_t kNumTypes = sizeof(kBytesPerElement) / sizeof(kBytesPerElement[0]);
+  const size_t el_size = (static_cast<size_t>(type) < kNumTypes)
+                             ? kBytesPerElement[static_cast<size_t>(type)]
+                             : 1;
+  *data = ptr;
+  *byte_length = element_length * el_size;
+  return true;
+}
+
+napi_value BindingReadSync(napi_env env, napi_callback_info info) {
+  size_t argc = 5;
+  napi_value argv[5] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 2) {
+    return nullptr;
+  }
+  int32_t fd = 0;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) return nullptr;
+  void* buf_data = nullptr;
+  size_t buf_byte_length = 0;
+  if (!BufferFromValue(env, argv[1], &buf_data, &buf_byte_length)) {
+    return nullptr;
+  }
+  size_t offset = 0;
+  size_t length = buf_byte_length;
+  int64_t position = -1;
+  if (argc >= 3 && argv[2] != nullptr) {
+    if (napi_get_value_uint32(env, argv[2], reinterpret_cast<uint32_t*>(&offset)) != napi_ok) {
+      return nullptr;
+    }
+  }
+  if (argc >= 4 && argv[3] != nullptr) {
+    if (napi_get_value_uint32(env, argv[3], reinterpret_cast<uint32_t*>(&length)) != napi_ok) {
+      return nullptr;
+    }
+  }
+  if (argc >= 5 && argv[4] != nullptr) {
+    double pos_d = 0;
+    if (napi_get_value_double(env, argv[4], &pos_d) != napi_ok) return nullptr;
+    position = static_cast<int64_t>(pos_d);
+  }
+  if (offset > buf_byte_length || length > buf_byte_length - offset) {
+    return nullptr;
+  }
+  if (length == 0) {
+    napi_value zero = nullptr;
+    if (napi_create_int32(env, 0, &zero) != napi_ok) return nullptr;
+    return zero;
+  }
+  uv_buf_t uv_buf =
+      uv_buf_init(static_cast<char*>(buf_data) + offset, static_cast<unsigned int>(length));
+  uv_fs_t req;
+  int r = uv_fs_read(nullptr, &req, fd, &uv_buf, 1, position, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (r < 0) {
+    ThrowUVException(env, r, "read", nullptr);
+    return nullptr;
+  }
+  napi_value result = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(r), &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
+napi_value BindingWriteSync(napi_env env, napi_callback_info info) {
+  size_t argc = 5;
+  napi_value argv[5] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 2) {
+    return nullptr;
+  }
+  int32_t fd = 0;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) return nullptr;
+  void* buf_data = nullptr;
+  size_t buf_byte_length = 0;
+  if (!BufferFromValue(env, argv[1], &buf_data, &buf_byte_length)) {
+    return nullptr;
+  }
+  int64_t offset_i = 0;
+  int64_t length_i = static_cast<int64_t>(buf_byte_length);
+  int64_t position = -1;
+  if (argc >= 3 && argv[2] != nullptr) {
+    if (napi_get_value_int64(env, argv[2], &offset_i) != napi_ok) return nullptr;
+  }
+  if (argc >= 4 && argv[3] != nullptr) {
+    if (napi_get_value_int64(env, argv[3], &length_i) != napi_ok) return nullptr;
+  }
+  if (argc >= 5 && argv[4] != nullptr) {
+    if (napi_get_value_int64(env, argv[4], &position) != napi_ok) return nullptr;
+  }
+  if (offset_i < 0 || length_i < 0 ||
+      static_cast<size_t>(offset_i) > buf_byte_length ||
+      static_cast<size_t>(length_i) > buf_byte_length - static_cast<size_t>(offset_i)) {
+    return nullptr;
+  }
+  size_t offset = static_cast<size_t>(offset_i);
+  size_t length = static_cast<size_t>(length_i);
+  if (length == 0) {
+    napi_value zero = nullptr;
+    if (napi_create_int32(env, 0, &zero) != napi_ok) return nullptr;
+    return zero;
+  }
+  uv_buf_t uv_buf = uv_buf_init(static_cast<char*>(buf_data) + offset,
+                                 static_cast<unsigned int>(length));
+  uv_fs_t req;
+  int r = uv_fs_write(nullptr, &req, fd, &uv_buf, 1, position, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (r < 0) {
+    ThrowUVException(env, r, "write", nullptr);
+    return nullptr;
+  }
+  napi_value result = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(r), &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
+napi_value BindingWriteSyncString(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 2) {
+    return nullptr;
+  }
+  int32_t fd = 0;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) return nullptr;
+  size_t data_len = 0;
+  if (napi_get_value_string_utf8(env, argv[1], nullptr, 0, &data_len) != napi_ok) {
+    return nullptr;
+  }
+  std::string data(data_len + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, argv[1], data.data(), data.size(), &copied) != napi_ok) {
+    return nullptr;
+  }
+  data.resize(copied);
+  if (data.empty()) {
+    napi_value zero = nullptr;
+    if (napi_create_int32(env, 0, &zero) != napi_ok) return nullptr;
+    return zero;
+  }
+  uv_buf_t uv_buf = uv_buf_init(const_cast<char*>(data.data()),
+                                static_cast<unsigned int>(data.size()));
+  uv_fs_t req;
+  int r = uv_fs_write(nullptr, &req, fd, &uv_buf, 1, -1, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (r < 0) {
+    ThrowUVException(env, r, "write", nullptr);
+    return nullptr;
+  }
+  napi_value result = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(r), &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
 void SetMethod(napi_env env, napi_value obj, const char* name,
                napi_callback cb) {
   napi_value fn = nullptr;
@@ -794,6 +983,9 @@ void UnodeInstallFsBinding(napi_env env) {
   SetMethod(env, binding, "fstat", BindingFstat);
   SetMethod(env, binding, "open", BindingOpen);
   SetMethod(env, binding, "close", BindingClose);
+  SetMethod(env, binding, "readSync", BindingReadSync);
+  SetMethod(env, binding, "writeSync", BindingWriteSync);
+  SetMethod(env, binding, "writeSyncString", BindingWriteSyncString);
 
   SetInt32Constant(env, binding, "O_RDONLY", UV_FS_O_RDONLY);
   SetInt32Constant(env, binding, "O_WRONLY", UV_FS_O_WRONLY);

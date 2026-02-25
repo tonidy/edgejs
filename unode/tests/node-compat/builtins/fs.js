@@ -267,7 +267,7 @@ function lstatSync(path, options) {
 
 function fstatSync(fd, options) {
   if (typeof fd !== 'number' || Number.isNaN(fd)) {
-    const err = new TypeError('The "fd" argument must be a number. Received ' + (typeof fd === 'symbol' ? 'Symbol' : String(fd)));
+    const err = new TypeError('The "fd" argument must be of type number. Received ' + (typeof fd === 'symbol' ? 'Symbol' : String(fd)));
     err.code = 'ERR_INVALID_ARG_TYPE';
     throw err;
   }
@@ -320,6 +320,150 @@ function closeSync(fd) {
   binding.close(fd);
 }
 
+function isArrayBufferView(value) {
+  return value != null && typeof value === 'object' && value.buffer instanceof ArrayBuffer && typeof value.byteLength === 'number';
+}
+
+function read(fd, buffer, offsetOrOptions, length, position, callback) {
+  if (typeof fd !== 'number' || Number.isNaN(fd)) {
+    const err = new TypeError('The "fd" argument must be of type number. Received ' + String(fd));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  let offset = 0;
+  let pos = null;
+  if (arguments.length === 3) {
+    callback = offsetOrOptions;
+    if (typeof buffer === 'object' && buffer !== null && ('buffer' in buffer || 'offset' in buffer)) {
+      const opts = buffer;
+      buffer = opts.buffer;
+      offset = opts.offset ?? 0;
+      length = opts.length ?? (buffer ? buffer.byteLength - offset : 0);
+      pos = opts.position ?? null;
+    } else {
+      length = buffer && buffer.byteLength !== undefined ? buffer.byteLength : 0;
+    }
+  } else if (arguments.length === 4 && typeof length === 'function') {
+    callback = length;
+    if (typeof offsetOrOptions === 'object' && offsetOrOptions !== null) {
+      const opts = offsetOrOptions;
+      buffer = opts.buffer;
+      offset = opts.offset ?? 0;
+      length = opts.length ?? (buffer ? buffer.byteLength - offset : 0);
+      pos = opts.position ?? null;
+    } else {
+      offset = Number(offsetOrOptions) | 0;
+      length = buffer ? buffer.byteLength - offset : 0;
+    }
+  } else if (typeof position === 'function') {
+    callback = position;
+    offset = Number(offsetOrOptions) | 0;
+    length = length | 0;
+    pos = undefined;
+  } else {
+    callback = arguments[5];
+    offset = Number(offsetOrOptions) | 0;
+    length = length | 0;
+    pos = position;
+  }
+  if (typeof callback !== 'function') {
+    const err = new TypeError('The "callback" argument must be a function. Received ' + String(callback));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (buffer == null || (typeof buffer !== 'string' && (!buffer || (buffer.buffer === undefined && buffer.byteLength === undefined)))) {
+    const received = buffer === null ? 'null' : (buffer === undefined ? 'undefined' : 'an instance of Object');
+    const err = new TypeError('The "buffer" argument must be an instance of Buffer or ArrayBufferView. Received ' + received);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (length === undefined) length = buffer.byteLength - offset;
+  const positionVal = pos == null ? -1 : Number(pos);
+  setImmediateOrSync(() => {
+    try {
+      const bytesRead = binding.readSync(fd, buffer, offset, length, positionVal);
+      callback(null, bytesRead, buffer);
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
+function readSync(fd, buffer, offsetOrOptions, length, position) {
+  if (typeof fd !== 'number' || Number.isNaN(fd)) {
+    const err = new TypeError('The "fd" argument must be of type number. Received ' + String(fd));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (!isArrayBufferView(buffer) && !(typeof buffer === 'object' && buffer !== null && typeof buffer.byteLength === 'number')) {
+    const received = buffer === null ? 'null' : (buffer === undefined ? 'undefined' : 'an instance of Object');
+    const err = new TypeError('The "buffer" argument must be an instance of Buffer, TypedArray, or DataView. Received ' + received);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  let offset = offsetOrOptions;
+  if (arguments.length <= 3 || typeof offsetOrOptions === 'object') {
+    const opts = offsetOrOptions != null ? offsetOrOptions : {};
+    offset = opts.offset ?? 0;
+    length = opts.length ?? (buffer.byteLength - offset);
+    position = opts.position ?? null;
+  }
+  if (offset === undefined) offset = 0;
+  if (length === undefined) length = buffer.byteLength - offset;
+  if (position === undefined) position = null;
+  offset = Number(offset) | 0;
+  length = length | 0;
+  if (length === 0) return 0;
+  if (buffer.byteLength === 0) {
+    const err = new TypeError('buffer is empty and cannot be read');
+    err.code = 'ERR_INVALID_ARG_VALUE';
+    throw err;
+  }
+  if (offset < 0 || offset >= buffer.byteLength || length <= 0 || offset + length > buffer.byteLength) {
+    const err = new RangeError('Attempt to access memory outside buffer bounds');
+    err.code = 'ERR_BUFFER_OUT_OF_BOUNDS';
+    throw err;
+  }
+  const pos = position == null ? -1 : Number(position);
+  return binding.readSync(fd, buffer, offset, length, pos);
+}
+
+function writeSync(fd, buffer, offsetOrOptions, length, position) {
+  if (typeof fd !== 'number' || Number.isNaN(fd)) {
+    const err = new TypeError('The "fd" argument must be of type number. Received ' + String(fd));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (typeof buffer === 'string') {
+    return binding.writeSyncString(fd, buffer);
+  }
+  if (!isArrayBufferView(buffer) && !(typeof buffer === 'object' && buffer !== null && typeof buffer.byteLength === 'number')) {
+    const err = new TypeError('The "buffer" argument must be an instance of Buffer or ArrayBufferView or string. Received ' + String(buffer));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  let offset = offsetOrOptions;
+  if (arguments.length <= 3 || typeof offsetOrOptions === 'object') {
+    const opts = offsetOrOptions != null ? offsetOrOptions : {};
+    offset = opts.offset ?? 0;
+    length = opts.length ?? (buffer.byteLength - offset);
+    position = opts.position ?? null;
+  }
+  if (offset === undefined) offset = 0;
+  if (length === undefined) length = buffer.byteLength - offset;
+  if (position === undefined) position = null;
+  offset = Number(offset) | 0;
+  length = length | 0;
+  if (length === 0) return 0;
+  if (offset < 0 || offset >= buffer.byteLength || length <= 0 || offset + length > buffer.byteLength) {
+    const err = new RangeError('Attempt to access memory outside buffer bounds');
+    err.code = 'ERR_BUFFER_OUT_OF_BOUNDS';
+    throw err;
+  }
+  const pos = position == null ? -1 : Number(position);
+  return binding.writeSync(fd, buffer, offset, length, pos);
+}
+
 const setImmediateOrSync = globalThis.setImmediate || function (fn) { fn(); };
 
 function makeCallback(cb) {
@@ -360,7 +504,7 @@ function lstat(path, options, callback) {
 function fstat(fd, options, callback) {
   if (typeof options === 'function') { callback = options; options = {}; }
   if (typeof fd !== 'number') {
-    const err = new TypeError('The "fd" argument must be a number. Received ' + String(fd));
+    const err = new TypeError('The "fd" argument must be of type number. Received ' + String(fd));
     err.code = 'ERR_INVALID_ARG_TYPE';
     throw err;
   }
@@ -446,6 +590,31 @@ function rmSync(path, options) {
   binding.rmSync(path, opts.maxRetries, opts.recursive, opts.retryDelay);
 }
 
+function readdir(path, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  callback = makeCallback(callback);
+  const p = getValidatedPath(path);
+  setImmediateOrSync(() => {
+    try {
+      const withFileTypes = Boolean(options && options.withFileTypes);
+      const result = binding.readdir(p, withFileTypes);
+      if (withFileTypes && Array.isArray(result) && result.length === 2) {
+        const names = result[0];
+        const types = result[1];
+        const out = [];
+        for (let i = 0; i < names.length; i++) {
+          out.push(new Dirent(names[i], types[i], path));
+        }
+        callback(null, out);
+      } else {
+        callback(null, result);
+      }
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
 function readdirSync(path, options) {
   options = getOptions(options, {});
   path = getValidatedPath(path);
@@ -474,11 +643,18 @@ realpathSync.native = realpathSync;
 
 const constants = binding;
 
+function Dir() {
+  const err = new Error('Dir requires a path');
+  err.code = 'ERR_MISSING_ARGS';
+  throw err;
+}
+
 module.exports = {
   readFileSync,
   writeFileSync,
   mkdirSync,
   rmSync,
+  readdir,
   readdirSync,
   realpathSync,
   statSync,
@@ -492,9 +668,13 @@ module.exports = {
   accessSync,
   openSync,
   closeSync,
+  readSync,
+  writeSync,
+  read,
   open,
   close,
   constants,
   Dirent,
   Stats,
+  Dir,
 };

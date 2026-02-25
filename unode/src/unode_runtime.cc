@@ -251,6 +251,19 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
       "    this.href = String(u);"
       "    this.pathname = (u && u.pathname) ? u.pathname : '';"
       "  };"
+      "}"
+      "if (typeof globalThis.Buffer === 'undefined') {"
+      "  function __encodeUtf8(s){var u=[],i=0,c;while(i<s.length){c=s.charCodeAt(i++);"
+      "    if(c<128)u.push(c);else if(c<2048){u.push(192|(c>>>6));u.push(128|(c&63));}"
+      "    else if(c<55296||c>57343){u.push(224|(c>>>12));u.push(128|((c>>>6)&63));u.push(128|(c&63));}"
+      "    else{c=65536+((c&1023)<<10)|(s.charCodeAt(i++)&1023);"
+      "      u.push(240|(c>>>18));u.push(128|((c>>>12)&63));u.push(128|((c>>>6)&63));u.push(128|(c&63));}}"
+      "  return new Uint8Array(u);}"
+      "  globalThis.Buffer={from:function(x){if(typeof x==='string')return __encodeUtf8(x);"
+      "  if(x&&typeof x.length==='number')return new Uint8Array(x);return new Uint8Array(0);},"
+      "  alloc:function(n){return new Uint8Array(n);},allocUnsafe:function(n){return new Uint8Array(n);},"
+      "  byteLength:function(x){if(typeof x==='string')return __encodeUtf8(x).byteLength;"
+      "  return x&&x.byteLength!==undefined?x.byteLength:0;}};"
       "}";
   napi_value prelude = nullptr;
   status = napi_create_string_utf8(env, kPrelude, NAPI_AUTO_LENGTH, &prelude);
