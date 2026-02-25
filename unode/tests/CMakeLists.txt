@@ -15,6 +15,7 @@ if(UNODE_V8_MONOLITH_LIB)
       "${NAPI_V8_GTEST_ROOT}/include"
       "${UNODE_ROOT}/tests/ported/js-native-api"
       "${UNODE_ROOT}/tests/runners"
+      "${UNODE_ROOT}/src"
       "${NAPI_V8_ROOT}/include"
       "${NAPI_V8_V8_INCLUDE_DIR}"
   )
@@ -27,6 +28,7 @@ if(UNODE_V8_MONOLITH_LIB)
         "${NAPI_V8_GTEST_ROOT}/include"
         "${UNODE_ROOT}/tests/ported/js-native-api"
         "${UNODE_ROOT}/tests/runners"
+        "${UNODE_ROOT}/src"
         "${NAPI_V8_ROOT}/include"
         "${NAPI_V8_V8_INCLUDE_DIR}"
         "${NAPI_V8_UV_INCLUDE_DIR}"
@@ -36,6 +38,7 @@ if(UNODE_V8_MONOLITH_LIB)
         unode_gtest
         napi_v8
         unode_node_api
+        unode_runtime
         "${UNODE_V8_MONOLITH_LIB}"
     )
     target_compile_definitions(${target_name}
@@ -60,6 +63,10 @@ if(UNODE_V8_MONOLITH_LIB)
       TEST_PREFIX "unode.${target_name}."
     )
   endfunction()
+
+  add_unode_node_api_test(unode_test_0_runtime_phase01
+    "${UNODE_ROOT}/tests/runners/test_0_runtime_phase01.cc"
+  )
 
   add_unode_node_api_test(unode_test_20_node_general
     "${UNODE_ROOT}/tests/runners/test_20_node_general.cc"

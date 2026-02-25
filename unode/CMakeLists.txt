@@ -54,5 +54,19 @@ if(UNODE_UV_LIB)
   target_link_libraries(unode_node_api PRIVATE "${UNODE_UV_LIB}")
 endif()
 
+add_library(unode_runtime STATIC
+  src/unode_runtime.cc
+)
+target_include_directories(unode_runtime
+  PUBLIC
+    "${UNODE_ROOT}/src"
+  PRIVATE
+    "${NAPI_V8_ROOT}/include"
+)
+target_link_libraries(unode_runtime
+  PUBLIC
+    napi_v8
+)
+
 enable_testing()
 add_subdirectory(tests)
