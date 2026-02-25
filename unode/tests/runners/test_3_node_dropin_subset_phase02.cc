@@ -87,4 +87,12 @@ TEST_F(Test3NodeDropinSubsetPhase02, RawModuleCacheFromNodeTest) {
   EXPECT_EQ(exit_code, 0) << "error=" << error;
   EXPECT_TRUE(error.empty()) << "error=" << error;
 }
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawRequireDotFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-require-dot.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 #endif

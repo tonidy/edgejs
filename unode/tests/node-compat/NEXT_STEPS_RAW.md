@@ -4,6 +4,19 @@ Goal: run Node’s test files **unchanged** (no copies, no edits) with unode, so
 
 ---
 
+## Raw tests currently run
+
+When `NAPI_V8_NODE_ROOT_PATH` is set, the phase02 test runner runs these Node tests **raw** (unchanged from `node/test/parallel/`):
+
+- **test-require-cache.js**
+- **test-require-json.js**
+- **test-module-cache.js**
+- **test-require-dot.js**
+
+They use: redirect of `node/test/common/` to unode's minimal `common/` (index, fixtures, tmpdir), `NODE_TEST_DIR` for fixtures, `UNODE_FALLBACK_BUILTINS_DIR` for builtins (assert, path, fs, module). The runner is the CI gate for raw Node tests.
+
+---
+
 ## 1. Run tests from the Node test directory
 
 **Current:** Tests live under `unode/tests/node-compat/` and are run via a path like `.../node-compat/parallel/test-require-cache.js`. That forces our own `common/` and `builtins/` and the "node-compat" → "test" path hack in JSON errors.
@@ -108,6 +121,8 @@ Goal: run Node’s test files **unchanged** (no copies, no edits) with unode, so
 
 **Target:** A single gate that runs a chosen set of Node tests in “raw” mode (same files as Node, no copy).
 
+**Current:** The phase02 test binary runs raw Node tests when NAPI_V8_NODE_ROOT_PATH is set: RawRequireCacheFromNodeTest, RawRequireJsonFromNodeTest, RawModuleCacheFromNodeTest, RawRequireDotFromNodeTest (see Raw tests currently run above). This is the CI gate for raw tests.
+
 **Actions:**
 
 - Add a script or CTest target that:
@@ -120,10 +135,10 @@ Goal: run Node’s test files **unchanged** (no copies, no edits) with unode, so
 
 ## Suggested order
 
-1. **Runner from node/test** – Run unode with `node/test/parallel/test-require-cache.js` (and test-require-json.js) and fix resolution so `../common` and `../fixtures` resolve under `node/test/`. Remove the JSON error path hack once paths are correct.
-2. **process and builtins** – Ensure `process`/`process.env` exist; complete builtins (or use Node’s) for `assert`, `path`, then `fs`, then `module` as needed by the next tests.
-3. **common/tmpdir and fs** – Wire Node’s `common/tmpdir` (or equivalent) and `fs` so tests like `test-module-cache.js` run raw.
-4. **NODE_PATH and module** – Add `module._initPaths()` and NODE_PATH support so `test-require-dot.js` and similar tests run raw.
-5. **Document and gate** – List the tests that run raw and add the runner to CI.
+1. **Runner from node/test** – Run unode with `node/test/parallel/test-require-cache.js` (and test-require-json.js) and fix resolution so `../common` and `../fixtures` resolve under `node/test/`. Remove the JSON error path hack once paths are correct. **Done.**
+2. **process and builtins** – Ensure `process`/`process.env` exist; complete builtins (or use Node’s) for `assert`, `path`, then `fs`, then `module` as needed by the next tests. **Done.**
+3. **common/tmpdir and fs** – Wire Node’s `common/tmpdir` (or equivalent) and `fs` so tests like `test-module-cache.js` run raw. **Done** (minimal common/tmpdir.js shim + fs builtin).
+4. **NODE_PATH and module** – Add `module._initPaths()` and NODE_PATH support so `test-require-dot.js` and similar tests run raw. **Done** for current tests (builtins/module.js with _initPaths() no-op; test-require-dot.js passes). Optional later: sync process.env.NODE_PATH to loader via setenv.
+5. **Document and gate** – List the tests that run raw and add the runner to CI. **Done** (see Raw tests currently run above; gate is phase02 runner when NAPI_V8_NODE_ROOT_PATH is set).
 
 This gets you to “tests run exactly as in Node” (same files, same require graph, same behavior) without maintaining a separate copy under `unode/tests/node-compat/` for those tests.
