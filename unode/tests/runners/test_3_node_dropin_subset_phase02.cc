@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 
 #include "test_env.h"
@@ -18,14 +19,57 @@ int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* er
 // NODE_TEST_DIR points to node/test so common/fixtures.js can resolve fixtures under node/test/fixtures.
 int RunRawNodeTestScript(napi_env env, const char* node_test_relative_path, std::string* error_out) {
 #ifdef NAPI_V8_NODE_ROOT_PATH
+  namespace fs = std::filesystem;
   const std::string node_root(NAPI_V8_NODE_ROOT_PATH);
   const std::string unode_root(NAPI_V8_ROOT_PATH);
-  const std::string script_path = node_root + "/test/parallel/" + node_test_relative_path;
-  const std::string fallback_builtins = unode_root + "/tests/node-compat/builtins";
-  const std::string node_test_dir = node_root + "/test";
+  fs::path node_root_path(node_root);
+  if (!node_root_path.is_absolute()) {
+    // Resolve relative node_root (e.g. "node") by walking up from cwd until we find
+    // node_root/test/parallel/<script> so __filename exists (works from build/ or build/tests/).
+    fs::path search = fs::current_path();
+    bool found = false;
+    for (; !search.empty() && search != search.parent_path(); search = search.parent_path()) {
+      fs::path candidate = (search / node_root_path / "test" / "parallel" / node_test_relative_path).lexically_normal();
+      if (fs::exists(candidate)) {
+        node_root_path = (search / node_root_path).lexically_normal();
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      node_root_path = fs::absolute(fs::current_path().parent_path() / node_root_path).lexically_normal();
+    }
+  } else {
+    node_root_path = node_root_path.lexically_normal();
+  }
+  const fs::path script_path = node_root_path / "test" / "parallel" / node_test_relative_path;
+  const std::string script_path_absolute = fs::absolute(script_path).string();
+  // Resolve unode root so fallback_builtins exists (works from build/ or build/tests/).
+  fs::path unode_root_path(unode_root);
+  if (!unode_root_path.is_absolute()) {
+    fs::path search = fs::current_path();
+    const fs::path builtins_relative = unode_root_path / "tests" / "node-compat" / "builtins";
+    bool found = false;
+    for (; !search.empty() && search != search.parent_path(); search = search.parent_path()) {
+      fs::path candidate = (search / builtins_relative).lexically_normal();
+      if (fs::exists(candidate)) {
+        unode_root_path = fs::absolute(search / unode_root_path);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      unode_root_path = fs::absolute(fs::current_path().parent_path() / unode_root_path);
+    }
+  } else {
+    unode_root_path = fs::absolute(unode_root_path);
+  }
+  const std::string fallback_builtins =
+      (unode_root_path / "tests" / "node-compat" / "builtins").string();
+  const std::string node_test_dir = (node_root_path / "test").string();
   setenv("UNODE_FALLBACK_BUILTINS_DIR", fallback_builtins.c_str(), 1);
   setenv("NODE_TEST_DIR", node_test_dir.c_str(), 1);
-  const int exit_code = UnodeRunScriptFile(env, script_path.c_str(), error_out);
+  const int exit_code = UnodeRunScriptFile(env, script_path_absolute.c_str(), error_out);
   unsetenv("UNODE_FALLBACK_BUILTINS_DIR");
   unsetenv("NODE_TEST_DIR");
   return exit_code;
@@ -92,6 +136,22 @@ TEST_F(Test3NodeDropinSubsetPhase02, RawRequireDotFromNodeTest) {
   EnvScope s(runtime_.get());
   std::string error;
   const int exit_code = RunRawNodeTestScript(s.env, "test-require-dot.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawFsExistsFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-fs-exists.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawFsStatFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-fs-stat.js", &error);
   EXPECT_EQ(exit_code, 0) << "error=" << error;
   EXPECT_TRUE(error.empty()) << "error=" << error;
 }

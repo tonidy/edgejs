@@ -223,6 +223,17 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
       id.rfind(".", 0) == 0) {
     return false;
   }
+  const char* fallback = std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
+  // When UNODE_FALLBACK_BUILTINS_DIR is set (e.g. raw Node tests), try it first
+  // so we always load unode's builtins (fs, assert, path) instead of node's or stubs.
+  if (fallback != nullptr && fallback[0] != '\0') {
+    fs::path candidate = fs::absolute(fs::path(fallback)) / (id + ".js");
+    fs::path resolved;
+    if (ResolveAsFile(candidate, &resolved)) {
+      *out = resolved.lexically_normal();
+      return true;
+    }
+  }
   const fs::path builtins_dir = fs::path(base_dir) / ".." / "builtins";
   fs::path candidate = fs::absolute(builtins_dir / (id + ".js")).lexically_normal();
   fs::path resolved;
@@ -230,9 +241,8 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
     *out = resolved.lexically_normal();
     return true;
   }
-  const char* fallback = std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
   if (fallback != nullptr && fallback[0] != '\0') {
-    candidate = fs::path(fallback) / (id + ".js");
+    candidate = fs::absolute(fs::path(fallback)) / (id + ".js");
     if (ResolveAsFile(candidate, &resolved)) {
       *out = resolved.lexically_normal();
       return true;
@@ -366,8 +376,9 @@ static bool ApplyNodeTestCommonRedirect(ModuleLoaderState* state, fs::path* reso
   if (entry_dir.filename() != "parallel") return false;
   if (entry_dir.parent_path().filename() != "test") return false;
 
-  fs::path node_test_root = entry_dir.parent_path().parent_path();
-  fs::path node_common_dir = node_test_root / "common";
+  // Redirect node/test/common/* to unode's minimal common (not node/common).
+  fs::path node_test_dir = entry_dir.parent_path();
+  fs::path node_common_dir = node_test_dir / "common";
 
   fs::path normalized = fs::absolute(*resolved_path).lexically_normal();
   fs::path rel = normalized.lexically_relative(node_common_dir);
@@ -762,6 +773,14 @@ napi_status UnodeInstallModuleLoader(napi_env env, const char* entry_script_path
   }
 
   auto& state = g_loader_states[env];
+  for (auto& kv : state.module_cache) {
+    napi_delete_reference(env, kv.second);
+  }
+  state.module_cache.clear();
+  if (state.cache_object_ref != nullptr) {
+    napi_delete_reference(env, state.cache_object_ref);
+    state.cache_object_ref = nullptr;
+  }
   state.entry_dir = entry_path.parent_path().string();
 
   auto* root_context = new RequireContext{&state, state.entry_dir};

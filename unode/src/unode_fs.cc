@@ -552,6 +552,210 @@ napi_value BindingRealpath(napi_env env, napi_callback_info info) {
   return out;
 }
 
+// Node FsStatsOffset order: dev, mode, nlink, uid, gid, rdev, blksize, ino, size,
+// blocks, atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec,
+// birthtime_sec, birthtime_nsec (18 elements).
+constexpr size_t kStatArrayLength = 18;
+
+void StatToArray(const uv_stat_t* s, double* out) {
+  out[0] = static_cast<double>(s->st_dev);
+  out[1] = static_cast<double>(s->st_mode);
+  out[2] = static_cast<double>(s->st_nlink);
+  out[3] = static_cast<double>(s->st_uid);
+  out[4] = static_cast<double>(s->st_gid);
+  out[5] = static_cast<double>(s->st_rdev);
+  out[6] = static_cast<double>(s->st_blksize);
+  out[7] = static_cast<double>(s->st_ino);
+  out[8] = static_cast<double>(s->st_size);
+  out[9] = static_cast<double>(s->st_blocks);
+  out[10] = static_cast<double>(s->st_atim.tv_sec);
+  out[11] = static_cast<double>(s->st_atim.tv_nsec);
+  out[12] = static_cast<double>(s->st_mtim.tv_sec);
+  out[13] = static_cast<double>(s->st_mtim.tv_nsec);
+  out[14] = static_cast<double>(s->st_ctim.tv_sec);
+  out[15] = static_cast<double>(s->st_ctim.tv_nsec);
+  out[16] = static_cast<double>(s->st_birthtim.tv_sec);
+  out[17] = static_cast<double>(s->st_birthtim.tv_nsec);
+}
+
+napi_value StatArrayToNapi(napi_env env, const double* arr) {
+  napi_value result = nullptr;
+  if (napi_create_array_with_length(env, kStatArrayLength, &result) !=
+      napi_ok ||
+      result == nullptr) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < kStatArrayLength; i++) {
+    napi_value v = nullptr;
+    if (napi_create_double(env, arr[i], &v) != napi_ok) continue;
+    if (napi_set_element(env, result, static_cast<uint32_t>(i), v) != napi_ok)
+      continue;
+  }
+  return result;
+}
+
+napi_value BindingStat(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1) {
+    return nullptr;
+  }
+  std::string path = PathFromValue(env, argv[0]);
+  if (path.empty()) return nullptr;
+
+  uv_fs_t req;
+  int err = uv_fs_stat(nullptr, &req, path.c_str(), nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "stat", path.c_str());
+    return nullptr;
+  }
+  double arr[kStatArrayLength];
+  StatToArray(&req.statbuf, arr);
+  return StatArrayToNapi(env, arr);
+}
+
+napi_value BindingLstat(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1) {
+    return nullptr;
+  }
+  std::string path = PathFromValue(env, argv[0]);
+  if (path.empty()) return nullptr;
+
+  uv_fs_t req;
+  int err = uv_fs_lstat(nullptr, &req, path.c_str(), nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "lstat", path.c_str());
+    return nullptr;
+  }
+  double arr[kStatArrayLength];
+  StatToArray(&req.statbuf, arr);
+  return StatArrayToNapi(env, arr);
+}
+
+napi_value BindingFstat(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1) {
+    return nullptr;
+  }
+  int32_t fd = 0;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) {
+    return nullptr;
+  }
+
+  uv_fs_t req;
+  int err = uv_fs_fstat(nullptr, &req, fd, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "fstat", nullptr);
+    return nullptr;
+  }
+  double arr[kStatArrayLength];
+  StatToArray(&req.statbuf, arr);
+  return StatArrayToNapi(env, arr);
+}
+
+napi_value BindingExistsSync(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1) {
+    return nullptr;
+  }
+  std::string path = PathFromValue(env, argv[0]);
+  if (path.empty()) {
+    napi_value false_val = nullptr;
+    if (napi_get_boolean(env, false, &false_val) == napi_ok) return false_val;
+    return nullptr;
+  }
+  uv_fs_t req;
+  int err = uv_fs_access(nullptr, &req, path.c_str(), 0, nullptr);
+  uv_fs_req_cleanup(&req);
+  napi_value result = nullptr;
+  if (napi_get_boolean(env, err == 0, &result) != napi_ok) return nullptr;
+  return result;
+}
+
+napi_value BindingAccessSync(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1) {
+    return nullptr;
+  }
+  std::string path = PathFromValue(env, argv[0]);
+  if (path.empty()) return nullptr;
+  int32_t mode = 0;
+  if (argc >= 2 && napi_get_value_int32(env, argv[1], &mode) != napi_ok) {
+    return nullptr;
+  }
+  uv_fs_t req;
+  int err = uv_fs_access(nullptr, &req, path.c_str(), mode, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "access", path.c_str());
+    return nullptr;
+  }
+  return nullptr;
+}
+
+napi_value BindingOpen(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1) {
+    return nullptr;
+  }
+  std::string path = PathFromValue(env, argv[0]);
+  if (path.empty()) return nullptr;
+  int32_t flags = UV_FS_O_RDONLY;
+  int32_t mode = 0666;
+  if (argc >= 2 && napi_get_value_int32(env, argv[1], &flags) != napi_ok) {
+    return nullptr;
+  }
+  if (argc >= 3 && napi_get_value_int32(env, argv[2], &mode) != napi_ok) {
+    return nullptr;
+  }
+  uv_fs_t req;
+  uv_file file = uv_fs_open(nullptr, &req, path.c_str(), flags, mode, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (file < 0) {
+    ThrowUVException(env, static_cast<int>(file), "open", path.c_str());
+    return nullptr;
+  }
+  napi_value out = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(file), &out) != napi_ok) {
+    return nullptr;
+  }
+  return out;
+}
+
+napi_value BindingClose(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1) {
+    return nullptr;
+  }
+  int32_t fd = 0;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) return nullptr;
+  uv_fs_t req;
+  int err = uv_fs_close(nullptr, &req, fd, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "close", nullptr);
+    return nullptr;
+  }
+  return nullptr;
+}
+
 void SetMethod(napi_env env, napi_value obj, const char* name,
                napi_callback cb) {
   napi_value fn = nullptr;
@@ -583,6 +787,13 @@ void UnodeInstallFsBinding(napi_env env) {
   SetMethod(env, binding, "rmSync", BindingRmSync);
   SetMethod(env, binding, "readdir", BindingReaddir);
   SetMethod(env, binding, "realpath", BindingRealpath);
+  SetMethod(env, binding, "existsSync", BindingExistsSync);
+  SetMethod(env, binding, "accessSync", BindingAccessSync);
+  SetMethod(env, binding, "stat", BindingStat);
+  SetMethod(env, binding, "lstat", BindingLstat);
+  SetMethod(env, binding, "fstat", BindingFstat);
+  SetMethod(env, binding, "open", BindingOpen);
+  SetMethod(env, binding, "close", BindingClose);
 
   SetInt32Constant(env, binding, "O_RDONLY", UV_FS_O_RDONLY);
   SetInt32Constant(env, binding, "O_WRONLY", UV_FS_O_WRONLY);
@@ -601,6 +812,27 @@ void UnodeInstallFsBinding(napi_env env) {
   SetInt32Constant(env, binding, "UV_DIRENT_SOCKET", UV_DIRENT_SOCKET);
   SetInt32Constant(env, binding, "UV_DIRENT_CHAR", UV_DIRENT_CHAR);
   SetInt32Constant(env, binding, "UV_DIRENT_BLOCK", UV_DIRENT_BLOCK);
+
+#if defined(_WIN32)
+  SetInt32Constant(env, binding, "F_OK", 0);
+  SetInt32Constant(env, binding, "R_OK", 4);
+  SetInt32Constant(env, binding, "W_OK", 2);
+  SetInt32Constant(env, binding, "X_OK", 1);
+#else
+  SetInt32Constant(env, binding, "F_OK", F_OK);
+  SetInt32Constant(env, binding, "R_OK", R_OK);
+  SetInt32Constant(env, binding, "W_OK", W_OK);
+  SetInt32Constant(env, binding, "X_OK", X_OK);
+#endif
+  // File type constants (portable; match Node's Stats.is* checks)
+  SetInt32Constant(env, binding, "S_IFMT", 0170000);
+  SetInt32Constant(env, binding, "S_IFREG", 0100000);
+  SetInt32Constant(env, binding, "S_IFDIR", 0040000);
+  SetInt32Constant(env, binding, "S_IFBLK", 0060000);
+  SetInt32Constant(env, binding, "S_IFCHR", 0020000);
+  SetInt32Constant(env, binding, "S_IFLNK", 0120000);
+  SetInt32Constant(env, binding, "S_IFIFO", 0010000);
+  SetInt32Constant(env, binding, "S_IFSOCK", 0140000);
 
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) {

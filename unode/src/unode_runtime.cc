@@ -7,10 +7,37 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <stdlib.h>
+extern char** _environ;
+#else
+extern char** environ;
+#endif
+
 #include "unode_fs.h"
 #include "unode_module_loader.h"
 
 namespace {
+
+void CopyProcessEnvironmentToObject(napi_env env, napi_value env_obj) {
+  char** env_iter =
+#if defined(_WIN32)
+      _environ;
+#else
+      environ;
+#endif
+  for (; env_iter != nullptr && *env_iter != nullptr; ++env_iter) {
+    std::string entry(*env_iter);
+    size_t eq = entry.find('=');
+    if (eq == std::string::npos) continue;
+    std::string key = entry.substr(0, eq);
+    std::string val = entry.substr(eq + 1);
+    napi_value v = nullptr;
+    if (napi_create_string_utf8(env, val.c_str(), NAPI_AUTO_LENGTH, &v) == napi_ok && v != nullptr) {
+      napi_set_named_property(env, env_obj, key.c_str(), v);
+    }
+  }
+}
 
 std::string ReadTextFile(const char* path) {
   if (path == nullptr || path[0] == '\0') {
@@ -190,7 +217,9 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
       "  globalThis.AbortSignal = { abort: function() { return { aborted: true }; } };"
       "}"
       "if (typeof globalThis.setImmediate === 'undefined') {"
-      "  globalThis.setImmediate = function(f) { if (typeof f === 'function') f(); };"
+      "  globalThis.setImmediate = function(f) {"
+      "    if (typeof f === 'function') globalThis.queueMicrotask(f);"
+      "  };"
       "}"
       "if (typeof globalThis.clearImmediate === 'undefined') {"
       "  globalThis.clearImmediate = function() {};"
@@ -215,6 +244,13 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
       "}"
       "if (typeof globalThis.fetch === 'undefined') {"
       "  globalThis.fetch = function() { return Promise.reject(new Error('fetch not implemented')); };"
+      "}"
+      "if (typeof globalThis.URL === 'undefined') {"
+      "  globalThis.URL = function URL(u) {"
+      "    if (!(this instanceof URL)) return new URL(u);"
+      "    this.href = String(u);"
+      "    this.pathname = (u && u.pathname) ? u.pathname : '';"
+      "  };"
       "}";
   napi_value prelude = nullptr;
   status = napi_create_string_utf8(env, kPrelude, NAPI_AUTO_LENGTH, &prelude);
@@ -346,6 +382,7 @@ napi_status UnodeInstallProcessObject(napi_env env) {
   if (status != napi_ok) {
     return status;
   }
+  CopyProcessEnvironmentToObject(env, env_obj);
   napi_value argv_arr = nullptr;
   status = napi_create_array_with_length(env, 0, &argv_arr);
   if (status != napi_ok || argv_arr == nullptr) {

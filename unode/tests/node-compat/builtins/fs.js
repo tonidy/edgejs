@@ -5,18 +5,26 @@ if (!binding) {
   throw new Error('fs builtin requires __unode_fs binding');
 }
 
+function pathTypeError(path) {
+  const err = new TypeError('path must be a string, Buffer, or URL. Received ' + (path === null ? 'null' : typeof path));
+  err.code = 'ERR_INVALID_ARG_TYPE';
+  return err;
+}
+
 function getValidatedPath(path) {
   if (path == null) {
-    throw new Error('path must be a string, Buffer, or URL');
+    throw pathTypeError(path);
   }
   if (typeof path === 'object' && path && path.href !== undefined) {
     path = path.pathname || path.href;
+  } else if (typeof path === 'object' && path) {
+    throw pathTypeError(path);
   }
   if (typeof path !== 'string' && typeof path === 'object' && path && path.toString) {
     path = path.toString();
   }
   if (typeof path !== 'string') {
-    throw new Error('path must be a string, Buffer, or URL');
+    throw pathTypeError(path);
   }
   if (path.includes('\u0000')) {
     throw new Error('path must be a string without null bytes');
@@ -155,6 +163,247 @@ class Dirent {
   }
 }
 
+// Stats: binding returns 18-element array [dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec, birthtime_sec, birthtime_nsec]
+const kMsPerSec = 1000;
+const kNsecPerMs = 1000000;
+function msFromTimeSpec(sec, nsec) {
+  return sec * kMsPerSec + nsec / kNsecPerMs;
+}
+
+function Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
+  this.dev = dev;
+  this.mode = mode;
+  this.nlink = nlink;
+  this.uid = uid;
+  this.gid = gid;
+  this.rdev = rdev;
+  this.blksize = blksize;
+  this.ino = ino;
+  this.size = size;
+  this.blocks = blocks;
+  this.atimeMs = atimeMs;
+  this.mtimeMs = mtimeMs;
+  this.ctimeMs = ctimeMs;
+  this.birthtimeMs = birthtimeMs;
+}
+
+Stats.prototype._checkModeProperty = function (property) {
+  return (this.mode & binding.S_IFMT) === property;
+};
+Stats.prototype.isDirectory = function () { return this._checkModeProperty(binding.S_IFDIR); };
+Stats.prototype.isFile = function () { return this._checkModeProperty(binding.S_IFREG); };
+Stats.prototype.isBlockDevice = function () { return this._checkModeProperty(binding.S_IFBLK); };
+Stats.prototype.isCharacterDevice = function () { return this._checkModeProperty(binding.S_IFCHR); };
+Stats.prototype.isSymbolicLink = function () { return this._checkModeProperty(binding.S_IFLNK); };
+Stats.prototype.isFIFO = function () { return this._checkModeProperty(binding.S_IFIFO); };
+Stats.prototype.isSocket = function () { return this._checkModeProperty(binding.S_IFSOCK); };
+
+function dateFromMs(ms) {
+  return new Date(Math.round(Number(ms)));
+}
+function makeTimeGetter(msProp, storeProp) {
+  return function () {
+    if (Object.prototype.hasOwnProperty.call(this, storeProp)) return this[storeProp];
+    return dateFromMs(this[msProp]);
+  };
+}
+function makeTimeSetter(storeProp) {
+  return function (v) { this[storeProp] = v; };
+}
+Object.defineProperty(Stats.prototype, 'atime', {
+  enumerable: true,
+  get: makeTimeGetter('atimeMs', '_atimeValue'),
+  set: makeTimeSetter('_atimeValue')
+});
+Object.defineProperty(Stats.prototype, 'mtime', {
+  enumerable: true,
+  get: makeTimeGetter('mtimeMs', '_mtimeValue'),
+  set: makeTimeSetter('_mtimeValue')
+});
+Object.defineProperty(Stats.prototype, 'ctime', {
+  enumerable: true,
+  get: makeTimeGetter('ctimeMs', '_ctimeValue'),
+  set: makeTimeSetter('_ctimeValue')
+});
+Object.defineProperty(Stats.prototype, 'birthtime', {
+  enumerable: true,
+  get: makeTimeGetter('birthtimeMs', '_birthtimeValue'),
+  set: makeTimeSetter('_birthtimeValue')
+});
+
+function getStatsFromBinding(arr) {
+  return new Stats(
+    arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7], arr[8], arr[9],
+    msFromTimeSpec(arr[10], arr[11]),
+    msFromTimeSpec(arr[12], arr[13]),
+    msFromTimeSpec(arr[14], arr[15]),
+    msFromTimeSpec(arr[16], arr[17])
+  );
+}
+
+function statSync(path, options) {
+  const opts = getOptions(options, { throwIfNoEntry: true });
+  path = getValidatedPath(path);
+  try {
+    const arr = binding.stat(path);
+    return getStatsFromBinding(arr);
+  } catch (e) {
+    if (opts.throwIfNoEntry === false && e.code === 'ENOENT') return undefined;
+    throw e;
+  }
+}
+
+function lstatSync(path, options) {
+  const opts = getOptions(options, { throwIfNoEntry: true });
+  path = getValidatedPath(path);
+  try {
+    const arr = binding.lstat(path);
+    return getStatsFromBinding(arr);
+  } catch (e) {
+    if (opts.throwIfNoEntry === false && e.code === 'ENOENT') return undefined;
+    throw e;
+  }
+}
+
+function fstatSync(fd, options) {
+  if (typeof fd !== 'number' || Number.isNaN(fd)) {
+    const err = new TypeError('The "fd" argument must be a number. Received ' + (typeof fd === 'symbol' ? 'Symbol' : String(fd)));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  const arr = binding.fstat(fd);
+  if (arr == null) return undefined;
+  return getStatsFromBinding(arr);
+}
+
+function existsSync(path) {
+  try {
+    path = getValidatedPath(path);
+  } catch {
+    return false;
+  }
+  return binding.existsSync(path);
+}
+
+function exists(path, callback) {
+  if (typeof callback !== 'function') {
+    const err = new TypeError('Callback must be a function. Received ' + String(callback));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  const setImmediate = globalThis.setImmediate || function (fn) { fn(); };
+  setImmediate(() => {
+    try {
+      path = getValidatedPath(path);
+      const ok = binding.existsSync(path);
+      callback(ok);
+    } catch {
+      callback(false);
+    }
+  });
+}
+
+function accessSync(path, mode) {
+  const m = mode === undefined ? binding.F_OK : mode;
+  path = getValidatedPath(path);
+  binding.accessSync(path, m);
+}
+
+function openSync(path, flags, mode) {
+  path = getValidatedPath(path);
+  const f = flags == null ? binding.O_RDONLY : (typeof flags === 'string' ? stringToFlags(flags) : flags);
+  const m = mode === undefined || mode === null ? 0o666 : parseFileMode(mode, 'mode', 0o666);
+  return binding.open(path, f, m);
+}
+
+function closeSync(fd) {
+  binding.close(fd);
+}
+
+const setImmediateOrSync = globalThis.setImmediate || function (fn) { fn(); };
+
+function makeCallback(cb) {
+  if (typeof cb !== 'function') return () => {};
+  return function (err) {
+    if (arguments.length > 1) cb(err, arguments[1]); else cb(err);
+  };
+}
+
+function stat(path, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  callback = makeCallback(callback);
+  const p = getValidatedPath(path);
+  setImmediateOrSync(() => {
+    try {
+      const arr = binding.stat(p);
+      callback(null, getStatsFromBinding(arr));
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
+function lstat(path, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  callback = makeCallback(callback);
+  const p = getValidatedPath(path);
+  setImmediateOrSync(() => {
+    try {
+      const arr = binding.lstat(p);
+      callback(null, getStatsFromBinding(arr));
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
+function fstat(fd, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  if (typeof fd !== 'number') {
+    const err = new TypeError('The "fd" argument must be a number. Received ' + String(fd));
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  callback = makeCallback(callback);
+  setImmediateOrSync(() => {
+    try {
+      const arr = binding.fstat(fd);
+      callback(null, getStatsFromBinding(arr));
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
+function open(path, flags, mode, callback) {
+  if (arguments.length < 3) { callback = flags; flags = 'r'; mode = 0o666; }
+  else if (typeof mode === 'function') { callback = mode; mode = 0o666; }
+  callback = makeCallback(callback);
+  setImmediateOrSync(() => {
+    try {
+      const p = getValidatedPath(path);
+      const f = flags == null ? binding.O_RDONLY : (typeof flags === 'string' ? stringToFlags(flags) : flags);
+      const m = mode === undefined || mode === null ? 0o666 : parseFileMode(mode, 'mode', 0o666);
+      const fd = binding.open(p, f, m);
+      callback(null, fd);
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
+function close(fd, callback) {
+  const cb = typeof callback === 'function' ? callback : () => {};
+  setImmediateOrSync(() => {
+    try {
+      binding.close(fd);
+      cb();
+    } catch (e) {
+      cb(e);
+    }
+  });
+}
+
 function readFileSync(path, options) {
   options = getOptions(options, { flag: 'r', encoding: 'utf8' });
   if (options.encoding === 'utf8' || options.encoding === 'utf-8' || options.encoding === undefined) {
@@ -232,6 +481,20 @@ module.exports = {
   rmSync,
   readdirSync,
   realpathSync,
+  statSync,
+  lstatSync,
+  fstatSync,
+  stat,
+  lstat,
+  fstat,
+  existsSync,
+  exists,
+  accessSync,
+  openSync,
+  closeSync,
+  open,
+  close,
   constants,
   Dirent,
+  Stats,
 };

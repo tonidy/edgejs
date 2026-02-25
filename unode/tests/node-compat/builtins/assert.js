@@ -33,6 +33,16 @@ function notStrictEqual(actual, expected, message) {
   }
 }
 
+function ifError(err) {
+  if (err) {
+    throw err;
+  }
+}
+
+function fail(message) {
+  throw new AssertionError(message || 'Failed');
+}
+
 function matchesExpected(err, expected) {
   if (!expected) return true;
   if (typeof expected === 'function') {
@@ -73,11 +83,17 @@ function throws(fn, expected) {
   }
 }
 
-module.exports = {
-  AssertionError,
-  strictEqual,
-  deepStrictEqual,
-  ok,
-  notStrictEqual,
-  throws,
-};
+// Node's assert is callable: assert(value, msg) === assert.ok(value, msg)
+function assert(value, message) {
+  return ok(value, message);
+}
+assert.AssertionError = AssertionError;
+assert.strictEqual = strictEqual;
+assert.deepStrictEqual = deepStrictEqual;
+assert.ok = ok;
+assert.notStrictEqual = notStrictEqual;
+assert.ifError = ifError;
+assert.fail = fail;
+assert.throws = throws;
+
+module.exports = assert;

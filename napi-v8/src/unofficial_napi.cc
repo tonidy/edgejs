@@ -43,7 +43,10 @@ napi_status AcquireRuntime(v8::Isolate** isolate_out) {
   if (isolate_out == nullptr) return napi_invalid_arg;
   std::lock_guard<std::mutex> lock(g_runtime_mu);
 
-  if (g_runtime.refcount == 0) {
+  // Only initialize V8 and create the isolate once per process (when refcount
+  // was 0 and we don't have an isolate yet). Re-initializing causes V8 fatal
+  // "Wrong initialization order" when a second test runs after the first released.
+  if (g_runtime.refcount == 0 && g_runtime.isolate == nullptr) {
     v8::V8::InitializeICUDefaultLocation("");
     v8::V8::InitializeExternalStartupData("");
     g_runtime.platform = v8::platform::NewDefaultPlatform();
