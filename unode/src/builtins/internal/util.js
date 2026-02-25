@@ -5,13 +5,14 @@ const kEmptyObject = Object.freeze({ __proto__: null });
 const customInspectSymbol = Symbol.for('nodejs.util.inspect.custom');
 const kIsEncodingSymbol = Symbol('kIsEncodingSymbol');
 const encodingsMap = Object.freeze({
+  ascii: 0,
   utf8: 1,
-  utf16le: 2,
-  latin1: 3,
-  ascii: 4,
-  base64: 5,
-  base64url: 6,
-  hex: 7,
+  base64: 2,
+  base64url: 3,
+  utf16le: 4,
+  hex: 5,
+  buffer: 6,
+  latin1: 7,
 });
 
 function getLazy(initializer) {

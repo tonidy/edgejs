@@ -643,6 +643,11 @@ DEFINE_RAW_NODE_TEST(RawUrlPathtofileurlFromNodeTest, "test-url-pathtofileurl.js
 DEFINE_RAW_NODE_TEST(RawUrlRelativeFromNodeTest, "test-url-relative.js")
 DEFINE_RAW_NODE_TEST(RawUrlUrltooptionsFromNodeTest, "test-url-urltooptions.js")
 
+// Raw Node string_decoder tests
+DEFINE_RAW_NODE_TEST(RawStringDecoderFromNodeTest, "test-string-decoder.js")
+DEFINE_RAW_NODE_TEST(RawStringDecoderEndFromNodeTest, "test-string-decoder-end.js")
+DEFINE_RAW_NODE_TEST(RawStringDecoderFuzzFromNodeTest, "test-string-decoder-fuzz.js")
+
 #undef DEFINE_RAW_NODE_TEST
 
 TEST_F(Test3NodeDropinSubsetPhase02, RawPathFromNodeTest) {

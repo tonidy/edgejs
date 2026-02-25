@@ -74,6 +74,7 @@ add_library(unode_runtime STATIC
   src/unode_buffer.cc
   src/unode_os.cc
   src/unode_encoding.cc
+  src/unode_string_decoder.cc
   src/unode_url.cc
 )
 target_include_directories(unode_runtime

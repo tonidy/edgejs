@@ -42,17 +42,29 @@ const primordials = {
   TypedArrayPrototypeGetByteOffset: (ta) => ta.byteOffset,
   TypedArrayPrototypeGetLength: (ta) => ta.length,
   TypedArrayPrototypeSet: uncurryThis(Uint8Array.prototype.set),
+  TypedArrayPrototypeSubarray: uncurryThis(Uint8Array.prototype.subarray),
   TypedArrayPrototypeSlice: uncurryThis(Uint8Array.prototype.slice),
   Uint8Array,
   Uint8ArrayPrototype: Uint8Array.prototype,
 };
 
 const kUntransferable = Symbol('untransferable_object_private_symbol');
+function getNativeInternalBinding() {
+  const ib = globalThis.internalBinding;
+  if (typeof ib === 'function' && ib !== internalBinding) return ib;
+  return null;
+}
 
 function internalBinding(name) {
   if (name === 'uv') return { UV_ENOENT, UV_EEXIST };
   if (name === 'os') return globalThis.__unode_os || {};
   if (name === 'buffer') return globalThis.__unode_buffer || {};
+  if (name === 'string_decoder') {
+    if (globalThis.__unode_string_decoder) return globalThis.__unode_string_decoder;
+    const nativeInternalBinding = getNativeInternalBinding();
+    if (nativeInternalBinding) return nativeInternalBinding(name);
+    return {};
+  }
   if (name === 'url') return globalThis.__unode_url || {};
   if (name === 'url_pattern') {
     return {
@@ -109,6 +121,8 @@ function internalBinding(name) {
       },
     };
   }
+  const nativeInternalBinding = getNativeInternalBinding();
+  if (nativeInternalBinding) return nativeInternalBinding(name);
   return {};
 }
 

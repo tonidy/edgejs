@@ -156,6 +156,15 @@ function spawnPromisified(cmd, args, options) {
   });
 }
 
+function getArrayBufferViews(buffer) {
+  const views = [];
+  const ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+  views.push(new Uint8Array(ab));
+  views.push(new Uint16Array(ab, 0, Math.floor(ab.byteLength / 2)));
+  views.push(new DataView(ab));
+  return views;
+}
+
 module.exports = {
   mustCall,
   mustCallAtLeast,
@@ -178,4 +187,5 @@ module.exports = {
   skip,
   skipIf32Bits,
   spawnPromisified,
+  getArrayBufferViews,
 };

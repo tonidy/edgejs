@@ -20,6 +20,7 @@ module.exports = {
     'path',
     'querystring',
     'stream',
+    'string_decoder',
     'url',
     'util',
     'worker_threads',

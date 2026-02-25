@@ -20,6 +20,7 @@ extern char** environ;
 #include "unode_encoding.h"
 #include "unode_module_loader.h"
 #include "unode_os.h"
+#include "unode_string_decoder.h"
 #include "unode_url.h"
 
 namespace {
@@ -351,6 +352,7 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
   UnodeInstallBufferBinding(env);
   UnodeInstallOsBinding(env);
   UnodeInstallEncodingBinding(env);
+  UnodeInstallStringDecoderBinding(env);
   UnodeInstallUrlBinding(env);
   status = UnodeInstallModuleLoader(env, entry_script_path);
   if (status != napi_ok) {

@@ -9,19 +9,18 @@
 #include <string>
 #include <vector>
 
+#include "unode_encoding_ids.h"
 #include "simdutf.h"
 
 namespace {
-
-enum EncodingVal : int32_t {
-  kEncUtf8 = 1,
-  kEncUtf16Le = 2,
-  kEncLatin1 = 3,
-  kEncAscii = 4,
-  kEncBase64 = 5,
-  kEncBase64Url = 6,
-  kEncHex = 7,
-};
+using unode::encoding_ids::kEncAscii;
+using unode::encoding_ids::kEncBase64;
+using unode::encoding_ids::kEncBase64Url;
+using unode::encoding_ids::kEncBuffer;
+using unode::encoding_ids::kEncHex;
+using unode::encoding_ids::kEncLatin1;
+using unode::encoding_ids::kEncUtf16Le;
+using unode::encoding_ids::kEncUtf8;
 
 std::string GetUtf8String(napi_env env, napi_value value);
 
@@ -711,14 +710,22 @@ napi_value SliceByEncoding(napi_env env, napi_callback_info info, int32_t enc) {
     }
     return MakeStringUtf8(env, out);
   }
-  if (enc == kEncAscii || enc == kEncLatin1) {
+  if (enc == kEncAscii) {
     std::string out(n, '\0');
     for (size_t i = 0; i < n; i++) {
-      uint8_t c = p[i];
-      if (enc == kEncAscii) c &= 0x7f;
+      uint8_t c = p[i] & 0x7f;
       out[i] = static_cast<char>(c);
     }
     return MakeStringUtf8(env, out);
+  }
+  if (enc == kEncLatin1) {
+    std::vector<char16_t> u16(n);
+    for (size_t i = 0; i < n; i++) {
+      u16[i] = static_cast<char16_t>(p[i]);
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf16(env, u16.data(), u16.size(), &out);
+    return out;
   }
   if (enc == kEncUtf16Le) {
     const size_t pairs = n / 2;
@@ -731,11 +738,8 @@ napi_value SliceByEncoding(napi_env env, napi_callback_info info, int32_t enc) {
     return out;
   }
 
-  const size_t u16_len = simdutf::utf16_length_from_utf8(reinterpret_cast<const char*>(p), n);
-  std::vector<char16_t> u16(u16_len);
-  const size_t written = simdutf::convert_utf8_to_utf16(reinterpret_cast<const char*>(p), n, u16.data());
   napi_value out = nullptr;
-  napi_create_string_utf16(env, u16.data(), written, &out);
+  napi_create_string_utf8(env, reinterpret_cast<const char*>(p), n, &out);
   return out;
 }
 
