@@ -1,11 +1,13 @@
 'use strict';
 
+const path = require('path');
+
+const fixturesDir = path.join(__dirname, '..', 'fixtures');
+
+function fixturesPath(...args) {
+  return path.join(fixturesDir, ...args);
+}
+
 module.exports = {
-  path: function path() {
-    const parts = [];
-    for (let i = 0; i < arguments.length; i += 1) {
-      parts.push(arguments[i]);
-    }
-    return __dirname + '/../fixtures/' + parts.join('/');
-  },
+  path: fixturesPath,
 };

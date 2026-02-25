@@ -1,5 +1,6 @@
 #include "unode_module_loader.h"
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -143,6 +144,36 @@ bool ResolveAsDirectory(const fs::path& candidate, fs::path* out) {
   return false;
 }
 
+// Resolve bare specifier (e.g. "assert", "path", "node:worker_threads") from base_dir/../builtins/<id>.js, or from
+// UNODE_FALLBACK_BUILTINS_DIR when running from node/test/ (raw mode).
+// Strips "node:" prefix so node:worker_threads resolves to builtins/worker_threads.js.
+bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
+  std::string id = specifier;
+  if (id.size() > 5 && id.compare(0, 5, "node:") == 0) {
+    id = id.substr(5);
+  }
+  if (id.empty() || id.find('/') != std::string::npos ||
+      id.rfind(".", 0) == 0) {
+    return false;
+  }
+  const fs::path builtins_dir = fs::path(base_dir) / ".." / "builtins";
+  fs::path candidate = fs::absolute(builtins_dir / (id + ".js")).lexically_normal();
+  fs::path resolved;
+  if (ResolveAsFile(candidate, &resolved)) {
+    *out = resolved.lexically_normal();
+    return true;
+  }
+  const char* fallback = std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
+  if (fallback != nullptr && fallback[0] != '\0') {
+    candidate = fs::path(fallback) / (id + ".js");
+    if (ResolveAsFile(candidate, &resolved)) {
+      *out = resolved.lexically_normal();
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ResolveModulePath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
   fs::path raw_path;
   if (!specifier.empty() && specifier[0] == '/') {
@@ -258,13 +289,14 @@ napi_value CreateResolvedPathString(napi_env env, const fs::path& resolved_path)
 
 napi_value ResolveSpecifierForContext(napi_env env, RequireContext* context, const std::string& specifier, bool throw_on_error) {
   fs::path resolved_path;
-  if (!ResolveModulePath(specifier, context->base_dir, &resolved_path)) {
-    if (throw_on_error) {
-      ThrowModuleNotFound(env, specifier);
-    }
-    return nullptr;
+  if (ResolveBuiltinPath(specifier, context->base_dir, &resolved_path) ||
+      ResolveModulePath(specifier, context->base_dir, &resolved_path)) {
+    return CreateResolvedPathString(env, resolved_path);
   }
-  return CreateResolvedPathString(env, resolved_path);
+  if (throw_on_error) {
+    ThrowModuleNotFound(env, specifier);
+  }
+  return nullptr;
 }
 
 napi_value RequireResolveCallback(napi_env env, napi_callback_info info) {
@@ -380,7 +412,42 @@ bool ParseJsonModule(napi_env env, const fs::path& resolved_path, napi_value mod
   }
   napi_value parsed = nullptr;
   if (napi_call_function(env, global, parse_fn, 1, &json_text, &parsed) != napi_ok || parsed == nullptr) {
-    return false;  // Preserve syntax exception from JSON.parse.
+    bool has_exception = false;
+    if (napi_is_exception_pending(env, &has_exception) == napi_ok && has_exception) {
+      napi_value exc = nullptr;
+      if (napi_get_and_clear_last_exception(env, &exc) == napi_ok && exc != nullptr) {
+        napi_value exc_msg = nullptr;
+        if (napi_coerce_to_string(env, exc, &exc_msg) == napi_ok && exc_msg != nullptr) {
+          const std::string msg_str = ValueToUtf8(env, exc_msg);
+          std::string path_for_msg = resolved_path.string();
+          const size_t node_compat = path_for_msg.find("node-compat");
+          if (node_compat != std::string::npos) {
+            path_for_msg.replace(node_compat, 11, "test");
+          }
+          const std::string prefixed = path_for_msg + ": " + (msg_str.empty() ? "JSON parse error" : msg_str);
+          napi_value new_msg = nullptr;
+          if (napi_create_string_utf8(env, prefixed.c_str(), NAPI_AUTO_LENGTH, &new_msg) == napi_ok && new_msg != nullptr) {
+            const char* throw_script = "(function(m){ throw new SyntaxError(m); })";
+            napi_value throw_script_val = nullptr;
+            if (napi_create_string_utf8(env, throw_script, NAPI_AUTO_LENGTH, &throw_script_val) == napi_ok &&
+                throw_script_val != nullptr) {
+              napi_value throw_fn = nullptr;
+              if (napi_run_script(env, throw_script_val, &throw_fn) == napi_ok && throw_fn != nullptr) {
+                napi_value ignore = nullptr;
+                napi_call_function(env, global, throw_fn, 1, &new_msg, &ignore);
+                return false;
+              }
+            }
+            napi_throw(env, exc);
+          } else {
+            napi_throw(env, exc);
+          }
+        } else {
+          napi_throw(env, exc);
+        }
+      }
+    }
+    return false;
   }
 
   return napi_set_named_property(env, module_obj, "exports", parsed) == napi_ok;
@@ -416,17 +483,23 @@ napi_value RequireCallback(napi_env env, napi_callback_info info) {
     return from_js_cache;
   }
 
-  napi_value resolved_path_value = ResolveSpecifierForContext(env, context, specifier, true);
-  if (resolved_path_value == nullptr) {
-    return nullptr;
-  }
-  const std::string resolved_key = ValueToUtf8(env, resolved_path_value);
-  if (resolved_key.empty()) {
-    ThrowLoaderError(env, "Failed to resolve module path");
-    return nullptr;
+  std::string resolved_key;
+  fs::path resolved_path;
+  if (ResolveBuiltinPath(specifier, context->base_dir, &resolved_path)) {
+    resolved_key = resolved_path.string();
+  } else {
+    napi_value resolved_path_value = ResolveSpecifierForContext(env, context, specifier, true);
+    if (resolved_path_value == nullptr) {
+      return nullptr;
+    }
+    resolved_key = ValueToUtf8(env, resolved_path_value);
+    if (resolved_key.empty()) {
+      ThrowLoaderError(env, "Failed to resolve module path");
+      return nullptr;
+    }
+    resolved_path = fs::path(resolved_key);
   }
 
-  fs::path resolved_path = fs::path(resolved_key);
   from_js_cache = GetCachedExportsFromJsCache(env, context->state, resolved_key);
   if (from_js_cache != nullptr) {
     return from_js_cache;

@@ -55,18 +55,23 @@ endif()
 add_library(unode_runtime STATIC
   src/unode_runtime.cc
   src/unode_module_loader.cc
+  src/unode_fs.cc
 )
 target_include_directories(unode_runtime
   PUBLIC
     "${UNODE_ROOT}/src"
   PRIVATE
     "${NAPI_V8_ROOT}/include"
+    "${NAPI_V8_UV_INCLUDE_DIR}"
 )
 target_link_libraries(unode_runtime
   PUBLIC
     napi_v8
     unode_node_api
 )
+if(UNODE_UV_LIB)
+  target_link_libraries(unode_runtime PRIVATE "${UNODE_UV_LIB}")
+endif()
 
 add_library(unode_cli STATIC
   src/unode_cli.cc

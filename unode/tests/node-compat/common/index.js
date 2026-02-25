@@ -1,4 +1,4 @@
 'use strict';
 
-// Minimal shim for Node's test/common bootstrap.
+// Minimal shim for Node test common bootstrap (no-op for module-loading tests).
 module.exports = {};

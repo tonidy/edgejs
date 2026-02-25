@@ -21,6 +21,18 @@ function deepStrictEqual(actual, expected, message) {
   }
 }
 
+function ok(value, message) {
+  if (!value) {
+    throw new AssertionError(message || 'Expected truthy value');
+  }
+}
+
+function notStrictEqual(actual, expected, message) {
+  if (actual === expected) {
+    throw new AssertionError(message || ('Expected strict inequality. actual=' + actual + ' expected=' + expected));
+  }
+}
+
 function matchesExpected(err, expected) {
   if (!expected) return true;
   if (typeof expected === 'function') {
@@ -44,18 +56,6 @@ function matchesExpected(err, expected) {
     }
   }
   return true;
-}
-
-function ok(value, message) {
-  if (!value) {
-    throw new AssertionError(message || 'Expected truthy value');
-  }
-}
-
-function notStrictEqual(actual, expected, message) {
-  if (actual === expected) {
-    throw new AssertionError(message || ('Expected strict inequality. actual=' + actual + ' expected=' + expected));
-  }
 }
 
 function throws(fn, expected) {

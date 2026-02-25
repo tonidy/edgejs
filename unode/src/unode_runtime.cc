@@ -1,11 +1,13 @@
 #include "unode_runtime.h"
 
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "unode_fs.h"
 #include "unode_module_loader.h"
 
 namespace {
@@ -160,10 +162,69 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
     }
     return 1;
   }
+  status = UnodeInstallProcessObject(env);
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "UnodeInstallProcessObject failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+  UnodeInstallFsBinding(env);
   status = UnodeInstallModuleLoader(env, entry_script_path);
   if (status != napi_ok) {
     if (error_out != nullptr) {
       *error_out = "UnodeInstallModuleLoader failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+
+  // Minimal globals expected by Node test common (AbortController, timers, global, etc.).
+  static const char kPrelude[] =
+      "globalThis.global = globalThis;"
+      "if (typeof globalThis.AbortController === 'undefined') {"
+      "  globalThis.AbortController = function AbortController() {"
+      "    this.signal = { aborted: false, addEventListener: function() {} };"
+      "  };"
+      "}"
+      "if (typeof globalThis.AbortSignal === 'undefined') {"
+      "  globalThis.AbortSignal = { abort: function() { return { aborted: true }; } };"
+      "}"
+      "if (typeof globalThis.setImmediate === 'undefined') {"
+      "  globalThis.setImmediate = function(f) { if (typeof f === 'function') f(); };"
+      "}"
+      "if (typeof globalThis.clearImmediate === 'undefined') {"
+      "  globalThis.clearImmediate = function() {};"
+      "}"
+      "if (typeof globalThis.setInterval === 'undefined') {"
+      "  globalThis.setInterval = function() { return 0; };"
+      "}"
+      "if (typeof globalThis.clearInterval === 'undefined') {"
+      "  globalThis.clearInterval = function() {};"
+      "}"
+      "if (typeof globalThis.setTimeout === 'undefined') {"
+      "  globalThis.setTimeout = function(f) { if (typeof f === 'function') f(); return 0; };"
+      "}"
+      "if (typeof globalThis.clearTimeout === 'undefined') {"
+      "  globalThis.clearTimeout = function() {};"
+      "}"
+      "if (typeof globalThis.queueMicrotask === 'undefined') {"
+      "  globalThis.queueMicrotask = function(f) { if (typeof f === 'function') f(); };"
+      "}"
+      "if (typeof globalThis.structuredClone === 'undefined') {"
+      "  globalThis.structuredClone = function(v) { return JSON.parse(JSON.stringify(v)); };"
+      "}"
+      "if (typeof globalThis.fetch === 'undefined') {"
+      "  globalThis.fetch = function() { return Promise.reject(new Error('fetch not implemented')); };"
+      "}";
+  napi_value prelude = nullptr;
+  status = napi_create_string_utf8(env, kPrelude, NAPI_AUTO_LENGTH, &prelude);
+  if (status == napi_ok && prelude != nullptr) {
+    napi_value unused = nullptr;
+    status = napi_run_script(env, prelude, &unused);
+  }
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "Prelude failed: " + StatusToString(status);
     }
     return 1;
   }
@@ -232,6 +293,176 @@ napi_status UnodeInstallConsole(napi_env env) {
     return status;
   }
   return napi_set_named_property(env, global, "console", console_obj);
+}
+
+napi_value ProcessOnCallback(napi_env env, napi_callback_info info) {
+  napi_value undefined = nullptr;
+  if (napi_get_undefined(env, &undefined) != napi_ok) {
+    return nullptr;
+  }
+  return undefined;
+}
+
+napi_value ProcessCwdCallback(napi_env env, napi_callback_info info) {
+  const char* pwd = std::getenv("PWD");
+  if (pwd == nullptr || pwd[0] == '\0') {
+    pwd = ".";
+  }
+  napi_value result = nullptr;
+  if (napi_create_string_utf8(env, pwd, NAPI_AUTO_LENGTH, &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
+napi_value ProcessUmaskCallback(napi_env env, napi_callback_info info) {
+  napi_value result = nullptr;
+  if (napi_create_int32(env, 022, &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
+napi_status UnodeInstallProcessObject(napi_env env) {
+  if (env == nullptr) {
+    return napi_invalid_arg;
+  }
+  napi_value global = nullptr;
+  napi_status status = napi_get_global(env, &global);
+  if (status != napi_ok || global == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  napi_value process_obj = nullptr;
+  status = napi_create_object(env, &process_obj);
+  if (status != napi_ok || process_obj == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  napi_value env_obj = nullptr;
+  status = napi_create_object(env, &env_obj);
+  if (status != napi_ok || env_obj == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "env", env_obj);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value argv_arr = nullptr;
+  status = napi_create_array_with_length(env, 0, &argv_arr);
+  if (status != napi_ok || argv_arr == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "argv", argv_arr);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value cwd_fn = nullptr;
+  status = napi_create_function(env, "cwd", NAPI_AUTO_LENGTH, ProcessCwdCallback, nullptr, &cwd_fn);
+  if (status != napi_ok || cwd_fn == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "cwd", cwd_fn);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value umask_fn = nullptr;
+  status = napi_create_function(env, "umask", NAPI_AUTO_LENGTH, ProcessUmaskCallback, nullptr, &umask_fn);
+  if (status != napi_ok || umask_fn == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "umask", umask_fn);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value on_fn = nullptr;
+  status = napi_create_function(env, "on", NAPI_AUTO_LENGTH, [](napi_env env, napi_callback_info info) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }, nullptr, &on_fn);
+  if (status != napi_ok || on_fn == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "on", on_fn);
+  if (status != napi_ok) {
+    return status;
+  }
+  // process.arch and process.versions - stubs for Node test common.
+  napi_value arch_str = nullptr;
+  status = napi_create_string_utf8(env, "arm64", NAPI_AUTO_LENGTH, &arch_str);
+  if (status != napi_ok || arch_str == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "arch", arch_str);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value versions_obj = nullptr;
+  status = napi_create_object(env, &versions_obj);
+  if (status != napi_ok || versions_obj == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  napi_value openssl_str = nullptr;
+  status = napi_create_string_utf8(env, "3.0.0", NAPI_AUTO_LENGTH, &openssl_str);
+  if (status != napi_ok || openssl_str == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, versions_obj, "openssl", openssl_str);
+  if (status != napi_ok) {
+    return status;
+  }
+  status = napi_set_named_property(env, process_obj, "versions", versions_obj);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value features_obj = nullptr;
+  status = napi_create_object(env, &features_obj);
+  if (status != napi_ok || features_obj == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  napi_value inspector_true = nullptr;
+  status = napi_get_boolean(env, true, &inspector_true);
+  if (status != napi_ok || inspector_true == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, features_obj, "inspector", inspector_true);
+  if (status != napi_ok) {
+    return status;
+  }
+  status = napi_set_named_property(env, process_obj, "features", features_obj);
+  if (status != napi_ok) {
+    return status;
+  }
+  // process.config.variables - minimal stub for Node test common (e.g. hasIntl, hasQuic, isASan).
+  napi_value config_obj = nullptr;
+  status = napi_create_object(env, &config_obj);
+  if (status != napi_ok || config_obj == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  napi_value variables_obj = nullptr;
+  status = napi_create_object(env, &variables_obj);
+  if (status != napi_ok || variables_obj == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  napi_value zero = nullptr;
+  status = napi_create_int32(env, 0, &zero);
+  if (status != napi_ok || zero == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  const char* var_keys[] = {"v8_enable_i18n_support", "node_quic", "asan"};
+  for (const char* key : var_keys) {
+    if (napi_set_named_property(env, variables_obj, key, zero) != napi_ok) {
+      return napi_generic_failure;
+    }
+  }
+  status = napi_set_named_property(env, config_obj, "variables", variables_obj);
+  if (status != napi_ok) {
+    return status;
+  }
+  status = napi_set_named_property(env, process_obj, "config", config_obj);
+  if (status != napi_ok) {
+    return status;
+  }
+  return napi_set_named_property(env, global, "process", process_obj);
 }
 
 int UnodeRunScriptSource(napi_env env, const char* source_text, std::string* error_out) {
