@@ -144,6 +144,73 @@ bool ResolveAsDirectory(const fs::path& candidate, fs::path* out) {
   return false;
 }
 
+// True if request is relative (./, ../, ., ..) or absolute (starts with /).
+// Used to decide whether to try node_modules resolution (only for bare specifiers).
+static bool IsRelativeOrAbsoluteRequest(const std::string& specifier) {
+  if (specifier.empty()) return true;
+  if (specifier[0] == '/') return true;
+  if (specifier[0] != '.') return false;
+  if (specifier.size() == 1) return true;  // "."
+  if (specifier[1] == '/' || specifier[1] == '.') return true;  // "./" or ".."
+  return false;
+}
+
+// Build list of node_modules directories to search, from from_dir upward (Node's _nodeModulePaths).
+// from_dir must be absolute. Returns e.g. [from_dir/node_modules, parent/node_modules, ..., /node_modules].
+static std::vector<fs::path> NodeModulePaths(const fs::path& from_dir) {
+  std::vector<fs::path> out;
+  fs::path from = fs::absolute(from_dir).lexically_normal();
+  std::string from_str = from.string();
+  if (from_str.empty() || (from_str.size() == 1 && from_str[0] == '/')) {
+    out.push_back(fs::path("/node_modules"));
+    return out;
+  }
+  const std::string node_modules_name = "node_modules";
+  const size_t nm_len = node_modules_name.size();
+  size_t last = from_str.size();
+  for (size_t i = from_str.size(); i > 0; --i) {
+    size_t idx = i - 1;
+    if (from_str[idx] == '/' || from_str[idx] == '\\') {
+      bool segment_is_node_modules = (last >= nm_len &&
+          from_str.compare(last - nm_len, nm_len, node_modules_name) == 0 &&
+          (last == nm_len || from_str[last - nm_len - 1] == '/' || from_str[last - nm_len - 1] == '\\'));
+      if (!segment_is_node_modules) {
+        out.push_back(fs::path(from_str.substr(0, last) + "/node_modules"));
+      }
+      last = idx;
+    }
+  }
+  out.push_back(fs::path("/node_modules"));
+  return out;
+}
+
+// For each path in node_modules_dirs, try path/request as file or directory (package main / index).
+// Returns true and sets *out to the resolved absolute path when found.
+static bool FindPathInNodeModules(const std::string& request,
+                                  const std::vector<fs::path>& node_modules_dirs,
+                                  fs::path* out) {
+  for (const fs::path& nm_dir : node_modules_dirs) {
+    fs::path candidate = nm_dir / request;
+    fs::path resolved;
+    if (ResolveAsFile(candidate, &resolved) || ResolveAsDirectory(candidate, &resolved)) {
+      *out = fs::absolute(resolved).lexically_normal();
+      return true;
+    }
+  }
+  return false;
+}
+
+// Resolve a bare specifier (e.g. "lodash") via node_modules walk from base_dir.
+// Returns false if not found or if specifier is relative/absolute (use ResolveModulePath for those).
+static bool ResolveNodeModules(const std::string& specifier, const std::string& base_dir,
+                               fs::path* out) {
+  if (IsRelativeOrAbsoluteRequest(specifier)) {
+    return false;
+  }
+  std::vector<fs::path> paths = NodeModulePaths(fs::path(base_dir));
+  return FindPathInNodeModules(specifier, paths, out);
+}
+
 // Resolve bare specifier (e.g. "assert", "path", "node:worker_threads") from base_dir/../builtins/<id>.js, or from
 // UNODE_FALLBACK_BUILTINS_DIR when running from node/test/ (raw mode).
 // Strips "node:" prefix so node:worker_threads resolves to builtins/worker_threads.js.
@@ -290,7 +357,8 @@ napi_value CreateResolvedPathString(napi_env env, const fs::path& resolved_path)
 napi_value ResolveSpecifierForContext(napi_env env, RequireContext* context, const std::string& specifier, bool throw_on_error) {
   fs::path resolved_path;
   if (ResolveBuiltinPath(specifier, context->base_dir, &resolved_path) ||
-      ResolveModulePath(specifier, context->base_dir, &resolved_path)) {
+      ResolveModulePath(specifier, context->base_dir, &resolved_path) ||
+      ResolveNodeModules(specifier, context->base_dir, &resolved_path)) {
     return CreateResolvedPathString(env, resolved_path);
   }
   if (throw_on_error) {
