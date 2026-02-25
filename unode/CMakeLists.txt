@@ -54,6 +54,7 @@ endif()
 
 add_library(unode_runtime STATIC
   src/unode_runtime.cc
+  src/unode_module_loader.cc
 )
 target_include_directories(unode_runtime
   PUBLIC

@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "unode_module_loader.h"
+
 namespace {
 
 std::string ReadTextFile(const char* path) {
@@ -137,6 +139,61 @@ napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
   return undefined;
 }
 
+int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entry_script_path, std::string* error_out) {
+  if (env == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "Invalid environment";
+    }
+    return 1;
+  }
+  if (source_text == nullptr || source_text[0] == '\0') {
+    if (error_out != nullptr) {
+      *error_out = "Empty script source";
+    }
+    return 1;
+  }
+
+  napi_status status = UnodeInstallConsole(env);
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "UnodeInstallConsole failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+  status = UnodeInstallModuleLoader(env, entry_script_path);
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "UnodeInstallModuleLoader failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+
+  napi_value script = nullptr;
+  status = napi_create_string_utf8(env, source_text, NAPI_AUTO_LENGTH, &script);
+  if (status != napi_ok || script == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "napi_create_string_utf8 failed: " + StatusToString(status);
+    }
+    return 1;
+  }
+
+  napi_value result = nullptr;
+  status = napi_run_script(env, script, &result);
+  if (status == napi_ok) {
+    return 0;
+  }
+
+  const std::string exception_message = GetAndClearPendingException(env);
+  if (error_out != nullptr) {
+    if (!exception_message.empty()) {
+      *error_out = exception_message;
+    } else {
+      *error_out = "napi_run_script failed: " + StatusToString(status);
+    }
+  }
+  return 1;
+}
+
 }  // namespace
 
 napi_status UnodeInstallConsole(napi_env env) {
@@ -181,51 +238,7 @@ int UnodeRunScriptSource(napi_env env, const char* source_text, std::string* err
   if (error_out != nullptr) {
     error_out->clear();
   }
-  if (env == nullptr) {
-    if (error_out != nullptr) {
-      *error_out = "Invalid environment";
-    }
-    return 1;
-  }
-  if (source_text == nullptr || source_text[0] == '\0') {
-    if (error_out != nullptr) {
-      *error_out = "Empty script source";
-    }
-    return 1;
-  }
-
-  napi_status status = UnodeInstallConsole(env);
-  if (status != napi_ok) {
-    if (error_out != nullptr) {
-      *error_out = "UnodeInstallConsole failed: " + StatusToString(status);
-    }
-    return 1;
-  }
-
-  napi_value script = nullptr;
-  status = napi_create_string_utf8(env, source_text, NAPI_AUTO_LENGTH, &script);
-  if (status != napi_ok || script == nullptr) {
-    if (error_out != nullptr) {
-      *error_out = "napi_create_string_utf8 failed: " + StatusToString(status);
-    }
-    return 1;
-  }
-
-  napi_value result = nullptr;
-  status = napi_run_script(env, script, &result);
-  if (status == napi_ok) {
-    return 0;
-  }
-
-  const std::string exception_message = GetAndClearPendingException(env);
-  if (error_out != nullptr) {
-    if (!exception_message.empty()) {
-      *error_out = exception_message;
-    } else {
-      *error_out = "napi_run_script failed: " + StatusToString(status);
-    }
-  }
-  return 1;
+  return RunScriptWithGlobals(env, source_text, nullptr, error_out);
 }
 
 int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error_out) {
@@ -239,5 +252,5 @@ int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error
     }
     return 1;
   }
-  return UnodeRunScriptSource(env, source.c_str(), error_out);
+  return RunScriptWithGlobals(env, source.c_str(), script_path, error_out);
 }
