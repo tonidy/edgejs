@@ -123,6 +123,9 @@ const isDumbTerminal = typeof process !== 'undefined' &&
   process.env.TERM === 'dumb';
 const localhostIPv4 = '127.0.0.1';
 const localhostIPv6 = '::1';
+const PIPE = isWindows ?
+  `\\\\.\\pipe\\node-napi-test-${process.pid}` :
+  (20000 + (process.pid % 20000));
 const hasCrypto = (() => {
   try {
     return !!require('crypto');
@@ -199,6 +202,10 @@ function runWithInvalidFD(func) {
   printSkipMessage('Could not generate an invalid fd');
 }
 
+function allowGlobals() {
+  // No-op in compatibility harness.
+}
+
 module.exports = {
   mustCall,
   mustCallAtLeast,
@@ -218,6 +225,7 @@ module.exports = {
   isDumbTerminal,
   localhostIPv4,
   localhostIPv6,
+  PIPE,
   hasCrypto,
   canCreateSymLink,
   printSkipMessage,
@@ -228,4 +236,5 @@ module.exports = {
   getArrayBufferViews,
   getTTYfd,
   runWithInvalidFD,
+  allowGlobals,
 };

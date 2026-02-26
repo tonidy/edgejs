@@ -40,6 +40,14 @@ function runInNewContext(code, context, options) {
   return result;
 }
 
+function createContext(contextObject) {
+  return contextObject && typeof contextObject === 'object' ? contextObject : {};
+}
+
+function runInContext(code, context, options) {
+  return runWithContext(code, context, options);
+}
+
 function runInThisContext(code, options) {
   let source = String(code);
   if (options && typeof options === 'object' && typeof options.filename === 'string' && options.filename.length > 0) {
@@ -49,6 +57,8 @@ function runInThisContext(code, options) {
 }
 
 module.exports = {
+  createContext,
+  runInContext,
   runInNewContext,
   runInThisContext,
 };

@@ -77,6 +77,15 @@ function match(actual, regexp, message) {
   }
 }
 
+function doesNotMatch(actual, regexp, message) {
+  if (Object.prototype.toString.call(regexp) !== '[object RegExp]') {
+    throw new AssertionError('The "regexp" argument must be a RegExp');
+  }
+  if (regexp.test(String(actual))) {
+    throw new AssertionError(message || `Expected "${String(actual)}" not to match ${String(regexp)}`);
+  }
+}
+
 function ifError(err) {
   if (err) {
     throw err;
@@ -188,6 +197,7 @@ assert.fail = fail;
 assert.throws = throws;
 assert.rejects = rejects;
 assert.match = match;
+assert.doesNotMatch = doesNotMatch;
 assert.strict = assert;
 
 module.exports = assert;

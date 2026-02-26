@@ -35,6 +35,15 @@ function spawnSync(_file, args, _options) {
   const wantsDeprecation = argv.includes('--pending-deprecation');
   let stderr = '';
   let stdout = '';
+  if (argv.includes('-i') && argv.includes('--input-type=module')) {
+    return {
+      status: 1,
+      signal: null,
+      stdout: '',
+      stderr: 'Cannot specify --input-type for REPL\n',
+      output: [null, '', 'Cannot specify --input-type for REPL\n'],
+    };
+  }
   if (typeof argv[0] === 'string' && fs.existsSync(argv[0]) && path.extname(argv[0]) === '.js') {
     const scriptPath = argv[0];
     if (argv[1] === 'child') {

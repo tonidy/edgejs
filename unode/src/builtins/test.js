@@ -4,6 +4,18 @@ function runBody(fn) {
   if (typeof fn !== 'function') return;
   const t = { assert: require('assert') };
   try {
+    if (fn.length >= 2) {
+      const done = (err) => {
+        if (err) throw err;
+      };
+      const result = fn(t, done);
+      if (result && typeof result.then === 'function') {
+        result.catch((err) => {
+          throw err;
+        });
+      }
+      return;
+    }
     const result = fn(t);
     if (result && typeof result.then === 'function') {
       result.catch((err) => {
