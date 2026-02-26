@@ -1451,5 +1451,6 @@ DEFINE_RAW_NODE_TEST(RawNetPingpongPummelFromNodeTest, "pummel/test-net-pingpong
 DEFINE_RAW_NODE_TEST(RawNetTimeoutPummelFromNodeTest, "pummel/test-net-timeout.js")
 DEFINE_RAW_NODE_TEST(RawNetTimeout2PummelFromNodeTest, "pummel/test-net-timeout2.js")
 DEFINE_RAW_NODE_TEST(RawNetWriteCallbacksPummelFromNodeTest, "pummel/test-net-write-callbacks.js")
+DEFINE_RAW_NODE_TEST(RawPunycodeParallelFromNodeTest, "parallel/test-punycode.js")
 #undef DEFINE_RAW_NODE_TEST
 #endif
