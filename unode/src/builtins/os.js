@@ -1,8 +1,53 @@
 'use strict';
 
-const {
-  getCIDR,
-} = require('internal/util');
+const internalUtil = require('internal/util');
+function countBinaryOnes(n) {
+  n = n - ((n >>> 1) & 0x55555555);
+  n = (n & 0x33333333) + ((n >>> 2) & 0x33333333);
+  return ((n + (n >>> 4) & 0xF0F0F0F) * 0x1010101) >>> 24;
+}
+
+function getCIDRFallback(address, netmask, family) {
+  let ones = 0;
+  let split = '.';
+  let range = 10;
+  let groupLength = 8;
+  let hasZeros = false;
+  let lastPos = 0;
+
+  if (family === 'IPv6') {
+    split = ':';
+    range = 16;
+    groupLength = 16;
+  }
+
+  for (let i = 0; i < netmask.length; i++) {
+    if (netmask[i] !== split) {
+      if (i + 1 < netmask.length) continue;
+      i++;
+    }
+    const part = netmask.slice(lastPos, i);
+    lastPos = i + 1;
+    if (part !== '') {
+      if (hasZeros) {
+        if (part !== '0') return null;
+      } else {
+        const binary = Number.parseInt(part, range);
+        const binaryOnes = countBinaryOnes(binary);
+        ones += binaryOnes;
+        if (binaryOnes !== groupLength) {
+          if (binary.toString(2).includes('01')) return null;
+          hasZeros = true;
+        }
+      }
+    }
+  }
+  return `${address}/${ones}`;
+}
+
+const getCIDR = (internalUtil && typeof internalUtil.getCIDR === 'function') ?
+  internalUtil.getCIDR :
+  getCIDRFallback;
 const {
   codes: {
     ERR_SYSTEM_ERROR,

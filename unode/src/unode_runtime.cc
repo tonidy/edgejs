@@ -1352,7 +1352,7 @@ int RunScriptWithGlobals(napi_env env,
   }
 
   // Create empty primordials container on the native side first (Node-aligned). The prelude's
-  // require('internal/test/binding_runtime') will receive this via the loader wrapper and fill
+  // require('internal/bootstrap/realm') will receive this via the loader wrapper and fill
   // it in place, so one object identity is used for all modules regardless of load order.
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
@@ -1375,18 +1375,20 @@ int RunScriptWithGlobals(napi_env env,
     return 1;
   }
 
-  // Bootstrap: load binding_runtime using a require that resolves from builtins dir (so it is found
-  // regardless of entry script path). Declare internalBinding and primordials once; do not run entry
-  // script until these are set. No try/catch so we fail fast if binding_runtime is missing.
+  // Bootstrap: load internal/bootstrap/realm using a require that resolves from builtins
+  // dir (so it is found regardless of entry script path). Declare internalBinding and primordials
+  // once; do not run entry script until these are set.
   static const char kBootstrapPrelude[] =
       "globalThis.global = globalThis;"
       "var __unodeBootstrapRequire = globalThis.__unode_bootstrap_require;"
       "if (typeof __unodeBootstrapRequire !== 'function') throw new Error('__unode_bootstrap_require is not a function');"
-      "var __itb = __unodeBootstrapRequire('internal/test/binding_runtime');"
-      "if (!__itb || typeof __itb.internalBinding !== 'function') throw new Error('internal/test/binding_runtime did not export internalBinding');"
-      "globalThis.internalBinding = __itb.internalBinding;"
+      "var __ib = __unodeBootstrapRequire('internal/bootstrap/realm');"
+      "if (!__ib || typeof __ib.internalBinding !== 'function') throw new Error('internal/bootstrap/realm did not export internalBinding');"
+      "globalThis.internalBinding = __ib.internalBinding;"
+      "if (__ib && __ib.primordials) globalThis.primordials = __ib.primordials;"
+      "__unodeBootstrapRequire('internal/util');"
       "if (globalThis.__unode_primordials && typeof globalThis.__unode_primordials.SymbolFor === 'function') globalThis.primordials = globalThis.__unode_primordials;"
-      "else if (__itb && __itb.primordials) globalThis.primordials = __itb.primordials;";
+      "else if (__ib && __ib.primordials) globalThis.primordials = __ib.primordials;";
   napi_value bootstrap_prelude = nullptr;
   status = napi_create_string_utf8(env, kBootstrapPrelude, NAPI_AUTO_LENGTH, &bootstrap_prelude);
   if (status == napi_ok && bootstrap_prelude != nullptr) {

@@ -75,12 +75,12 @@ int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* er
   namespace fs = std::filesystem;
   const std::string unode_root(NAPI_V8_ROOT_PATH);
   fs::path unode_root_path(unode_root);
+  const fs::path tests_relative = unode_root_path / "tests" / "node-compat";
   if (!unode_root_path.is_absolute()) {
     fs::path search = fs::current_path();
-    const fs::path builtins_relative = unode_root_path / "tests" / "node-compat" / "builtins";
     bool found = false;
     for (; !search.empty() && search != search.parent_path(); search = search.parent_path()) {
-      fs::path candidate = (search / builtins_relative).lexically_normal();
+      fs::path candidate = (search / tests_relative).lexically_normal();
       if (fs::exists(candidate)) {
         unode_root_path = fs::absolute(search / unode_root_path);
         found = true;
@@ -93,8 +93,6 @@ int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* er
   } else {
     unode_root_path = fs::absolute(unode_root_path);
   }
-  const std::string fallback_builtins =
-      (unode_root_path / "tests" / "node-compat" / "builtins").string();
   const std::string script_path =
       (unode_root_path / "tests" / "node-compat" / relative_path).string();
   std::string prior_test_serial_id;
@@ -119,19 +117,14 @@ int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* er
   setenv("TEST_SERIAL_ID", test_serial_id.c_str(), 1);
   setenv("TEST_THREAD_ID", test_serial_id.c_str(), 1);
   setenv("TEST_PARALLEL", "0", 1);
-  setenv("UNODE_FALLBACK_BUILTINS_DIR", fallback_builtins.c_str(), 1);
-  UnodeSetFallbackBuiltinsDir(fallback_builtins.c_str());
   const int exit_code = UnodeRunScriptFile(env, script_path.c_str(), error_out);
-  UnodeSetFallbackBuiltinsDir(nullptr);
-  unsetenv("UNODE_FALLBACK_BUILTINS_DIR");
   SetOrUnsetEnv("TEST_SERIAL_ID", had_prior_test_serial_id ? &prior_test_serial_id : nullptr);
   SetOrUnsetEnv("TEST_THREAD_ID", had_prior_test_thread_id ? &prior_test_thread_id : nullptr);
   SetOrUnsetEnv("TEST_PARALLEL", had_prior_test_parallel ? &prior_test_parallel : nullptr);
   return exit_code;
 }
 
-// Run a Node test script from the node repo (raw drop-in). Uses UNODE_FALLBACK_BUILTINS_DIR
-// so require('assert'), require('path'), etc. resolve to unode/tests/node-compat/builtins.
+// Run a Node test script from the node repo (raw drop-in).
 // NODE_TEST_DIR points to node/test so common/fixtures.js can resolve fixtures under node/test/fixtures.
 int RunRawNodeTestScript(napi_env env,
                          const char* node_test_relative_path,
@@ -171,14 +164,14 @@ int RunRawNodeTestScript(napi_env env,
   }
   const fs::path script_path = node_root_path / "test" / script_rel;
   const std::string script_path_absolute = fs::absolute(script_path).string();
-  // Resolve unode root so fallback_builtins exists (works from build/ or build/tests/).
+  // Resolve unode root so node-compat helpers exist (works from build/ or build/tests/).
   fs::path unode_root_path(unode_root);
+  const fs::path tests_relative = unode_root_path / "tests" / "node-compat";
   if (!unode_root_path.is_absolute()) {
     fs::path search = fs::current_path();
-    const fs::path builtins_relative = unode_root_path / "tests" / "node-compat" / "builtins";
     bool found = false;
     for (; !search.empty() && search != search.parent_path(); search = search.parent_path()) {
-      fs::path candidate = (search / builtins_relative).lexically_normal();
+      fs::path candidate = (search / tests_relative).lexically_normal();
       if (fs::exists(candidate)) {
         unode_root_path = fs::absolute(search / unode_root_path);
         found = true;
@@ -191,8 +184,6 @@ int RunRawNodeTestScript(napi_env env,
   } else {
     unode_root_path = fs::absolute(unode_root_path);
   }
-  const std::string fallback_builtins =
-      (unode_root_path / "tests" / "node-compat" / "builtins").string();
   const std::string node_test_dir = (node_root_path / "test").string();
   std::string prior_test_serial_id;
   bool had_prior_test_serial_id = false;
@@ -219,7 +210,6 @@ int RunRawNodeTestScript(napi_env env,
     prior_known_globals = existing;
     had_prior_known_globals = true;
   }
-  setenv("UNODE_FALLBACK_BUILTINS_DIR", fallback_builtins.c_str(), 1);
   setenv("NODE_TEST_DIR", node_test_dir.c_str(), 1);
   setenv("NODE_TEST_KNOWN_GLOBALS", "0", 1);
   setenv("TEST_SERIAL_ID", test_serial_id.c_str(), 1);
@@ -266,11 +256,8 @@ int RunRawNodeTestScript(napi_env env,
       setenv("UNODE_LOOP_TIMEOUT_MS", "10000", 1);
     }
   }
-  UnodeSetFallbackBuiltinsDir(fallback_builtins.c_str());
   const int exit_code =
       UnodeRunScriptFileWithLoop(env, script_path_absolute.c_str(), error_out, keep_event_loop_alive);
-  UnodeSetFallbackBuiltinsDir(nullptr);
-  unsetenv("UNODE_FALLBACK_BUILTINS_DIR");
   unsetenv("NODE_TEST_DIR");
   SetOrUnsetEnv("TEST_SERIAL_ID", had_prior_test_serial_id ? &prior_test_serial_id : nullptr);
   SetOrUnsetEnv("TEST_THREAD_ID", had_prior_test_thread_id ? &prior_test_thread_id : nullptr);

@@ -1,7 +1,6 @@
 'use strict';
 
 const path = require('path');
-const { internalBinding } = require('internal/test/binding_runtime');
 
 const exported = require(path.resolve(__dirname, '../../../../node/lib/buffer.js'));
 const { Buffer } = exported;

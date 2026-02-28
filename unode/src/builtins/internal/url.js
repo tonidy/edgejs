@@ -4,7 +4,6 @@ const NativeURL = globalThis.URL;
 const NativeURLSearchParams = globalThis.URLSearchParams;
 const { Buffer } = require('buffer');
 const path = require('path');
-const { internalBinding } = require('internal/test/binding_runtime');
 const {
   codes: {
     ERR_INVALID_ARG_TYPE,

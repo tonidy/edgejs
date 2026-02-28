@@ -13,7 +13,7 @@ When `NAPI_V8_NODE_ROOT_PATH` is set, the phase02 test runner runs these Node te
 - **test-module-cache.js**
 - **test-require-dot.js**
 
-They use: redirect of `node/test/common/` to unode's minimal `common/` (index, fixtures, tmpdir), `NODE_TEST_DIR` for fixtures, `UNODE_FALLBACK_BUILTINS_DIR` for builtins (assert, path, fs, module). The runner is the CI gate for raw Node tests.
+They use: redirect of `node/test/common/` to unode's minimal `common/` (index, fixtures, tmpdir) and `NODE_TEST_DIR` for fixtures. Builtins resolve through the same runtime builtins as normal execution. The runner is the CI gate for raw Node tests.
 
 ---
 
@@ -53,7 +53,7 @@ They use: redirect of `node/test/common/` to unode's minimal `common/` (index, f
 
 ## 3. Provide Node-compatible builtins (assert, path, fs, module)
 
-**Current:** We resolve `require('assert')` and `require('path')` to `unode/tests/node-compat/builtins/*.js` with a minimal API.
+**Current:** `require('assert')` and `require('path')` resolve through `unode/src/builtins` (same path used in non-test runtime).
 
 **Target:** So that Node tests run unmodified:
 

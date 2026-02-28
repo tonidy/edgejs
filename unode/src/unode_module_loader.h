@@ -5,9 +5,6 @@
 
 napi_status UnodeInstallModuleLoader(napi_env env, const char* entry_script_path);
 
-// Override for raw Node tests: when set, used instead of UNODE_FALLBACK_BUILTINS_DIR env.
-void UnodeSetFallbackBuiltinsDir(const char* path);
-
 // Store primordials and internalBinding in loader state so they are passed from C++ when calling
 // the module wrapper (Node-aligned: fn->Call(context, undefined, argc, argv) with argv from C++).
 // Call after the bootstrap prelude so every user module receives the same reference.

@@ -13,6 +13,7 @@ const UV_ENOTSOCK = -88;
 const UV_ESRCH = -3;
 const UV_UNKNOWN = -4094;
 const UV_EAI_MEMORY = -3001;
+const { getUvErrorMap, getUvErrorMessage } = require('../uv_errmap');
 const kNativeTimersBinding = (typeof globalThis === 'object' && globalThis) ?
   (globalThis.__unode_timers_binding || null) : null;
 const kHasBackingStore = new WeakSet();
@@ -73,9 +74,12 @@ const kUntransferable = Symbol('untransferable_object_private_symbol');
 const kArrowMessagePrivate = '__unode_arrow_message_private_symbol__';
 const kDecoratedPrivate = '__unode_decorated_private_symbol__';
 const kPrivateStore = new WeakMap();
-const kExternalStreamTag = Symbol('unode.external.stream');
-const kProxyTag = Symbol('unode.proxy.tag');
-const kProxyDetails = new WeakMap();
+const kExternalStreamTag = globalThis.__unode_external_stream_tag ||
+  (globalThis.__unode_external_stream_tag = Symbol('unode.external.stream'));
+const kProxyTag = globalThis.__unode_proxy_tag ||
+  (globalThis.__unode_proxy_tag = Symbol('unode.proxy.tag'));
+const kProxyDetails = globalThis.__unode_proxy_details ||
+  (globalThis.__unode_proxy_details = new WeakMap());
 const kCtorNameMap = new WeakMap();
 
 const NativeProxy = Proxy;
@@ -294,6 +298,97 @@ function ensureTimersBootstrap() {
   }
 }
 
+function createTimersBinding() {
+  const nativeTimers = kNativeTimersBinding;
+  return {
+    immediateInfo: kImmediateInfo,
+    timeoutInfo: kTimeoutInfo,
+    setupTimers(processImmediate, processTimers) {
+      timersImmediateCallback = typeof processImmediate === 'function' ? processImmediate : null;
+      timersProcessTimersCallback = typeof processTimers === 'function' ? processTimers : null;
+      if (nativeTimers && typeof nativeTimers.setupTimers === 'function') {
+        const wrappedImmediate = () => {
+          kDebugTimersImmediateCalls++;
+          if (isDebugTimersJsEnabled() &&
+              (kDebugTimersImmediateCalls <= 20 || (kDebugTimersImmediateCalls % 1000) === 0)) {
+            try {
+              const m = '[unode-timers-js] before processImmediate #' +
+                String(kDebugTimersImmediateCalls) +
+                ' count=' + String(kImmediateInfo[0]) +
+                ' refCount=' + String(kImmediateInfo[1]) +
+                ' hasOutstanding=' + String(kImmediateInfo[2]);
+              if (process && typeof process._rawDebug === 'function') process._rawDebug(m);
+              else if (typeof console === 'object' && console && typeof console.error === 'function') console.error(m);
+            } catch {}
+          }
+          if (kImmediateInfo[0] === 0 && kImmediateInfo[1] === 0 && kImmediateInfo[2] === 0) {
+            if (typeof nativeTimers.toggleImmediateRef === 'function') {
+              nativeTimers.toggleImmediateRef(false);
+            }
+            return;
+          }
+          if (typeof timersImmediateCallback === 'function') timersImmediateCallback();
+          if (typeof nativeTimers.toggleImmediateRef === 'function') {
+            nativeTimers.toggleImmediateRef(kImmediateInfo[1] > 0);
+          }
+          if (isDebugTimersJsEnabled() &&
+              (kDebugTimersImmediateCalls <= 20 || (kDebugTimersImmediateCalls % 1000) === 0)) {
+            try {
+              const m = '[unode-timers-js] after processImmediate #' +
+                String(kDebugTimersImmediateCalls) +
+                ' count=' + String(kImmediateInfo[0]) +
+                ' refCount=' + String(kImmediateInfo[1]) +
+                ' hasOutstanding=' + String(kImmediateInfo[2]);
+              if (process && typeof process._rawDebug === 'function') process._rawDebug(m);
+              else if (typeof console === 'object' && console && typeof console.error === 'function') console.error(m);
+            } catch {}
+          }
+        };
+        nativeTimers.setupTimers(wrappedImmediate, timersProcessTimersCallback);
+      } else if (kImmediateInfo[0] > 0) {
+        scheduleImmediateDispatch();
+      }
+    },
+    toggleTimerRef(ref) {
+      ensureTimersBootstrap();
+      timerRefEnabled = !!ref;
+      if (nativeTimers && typeof nativeTimers.toggleTimerRef === 'function') {
+        nativeTimers.toggleTimerRef(timerRefEnabled);
+      } else {
+        applyHandleRefState(timersScheduledHandle, timerRefEnabled);
+      }
+    },
+    toggleImmediateRef(ref) {
+      ensureTimersBootstrap();
+      immediateRefEnabled = !!ref;
+      if (nativeTimers && typeof nativeTimers.toggleImmediateRef === 'function') {
+        nativeTimers.toggleImmediateRef(immediateRefEnabled);
+      } else {
+        applyHandleRefState(timersImmediateHandle, immediateRefEnabled);
+        if (kImmediateInfo[0] > 0) scheduleImmediateDispatch();
+      }
+    },
+    scheduleTimer(duration) {
+      ensureTimersBootstrap();
+      if (nativeTimers && typeof nativeTimers.scheduleTimer === 'function') {
+        nativeTimers.scheduleTimer(duration);
+      } else {
+        scheduleTimersDispatch(duration);
+      }
+    },
+    getLibuvNow() {
+      if (nativeTimers && typeof nativeTimers.getLibuvNow === 'function') {
+        return nativeTimers.getLibuvNow();
+      }
+      return Date.now();
+    },
+  };
+}
+
+if (!globalThis.__unode_timers_binding_js) {
+  globalThis.__unode_timers_binding_js = createTimersBinding();
+}
+
 function toStringTag(value) {
   return Object.prototype.toString.call(value);
 }
@@ -415,10 +510,37 @@ function makeTypesBinding() {
   return binding;
 }
 function getNativeInternalBinding() {
+  const nativeGetInternalBinding = globalThis.__unode_get_internal_binding;
+  if (typeof nativeGetInternalBinding === 'function') {
+    return nativeGetInternalBinding;
+  }
   const ib = globalThis.internalBinding;
-  if (typeof ib === 'function' && ib !== internalBinding) return ib;
-  return null;
+  if (typeof ib !== 'function' || ib === internalBinding) return null;
+  if (ib.__unode_internal_test_binding_wrapper === true) {
+    const target = ib.__unode_internal_test_binding_target;
+    if (typeof target === 'function' && target !== internalBinding) {
+      return target;
+    }
+    return null;
+  }
+  return ib;
 }
+const kInternalBindingCache = new Map();
+const kLazyGlobalBackedBindings = new Set([
+  'buffer',
+  'cares_wrap',
+  'fs',
+  'os',
+  'pipe_wrap',
+  'process_wrap',
+  'spawn_sync',
+  'stream_wrap',
+  'tcp_wrap',
+  'tty_wrap',
+  'udp_wrap',
+  'url',
+  'util',
+]);
 
 class UnodePipeStub {}
 class UnodePipeConnectWrapStub {}
@@ -475,17 +597,8 @@ class UnodeTTYWrap {
   unref() {}
 }
 
-function internalBinding(name) {
+function resolveFallbackBinding(name) {
   if (name === 'uv') {
-    const uvErrorMap = new Map([
-      [-2, ['ENOENT', 'no such file or directory']],
-      [-9, ['EBADF', 'bad file descriptor']],
-      [-12, ['ENOMEM', 'out of memory']],
-      [-13, ['EACCES', 'permission denied']],
-      [-22, ['EINVAL', 'invalid argument']],
-      [-55, ['ENOBUFS', 'no buffer space available']],
-      [-60, ['ETIMEDOUT', 'connection timed out']],
-    ]);
     return {
       UV_ENOENT,
       UV_EEXIST,
@@ -500,23 +613,28 @@ function internalBinding(name) {
       UV_UNKNOWN,
       UV_EAI_MEMORY,
       getErrorMap() {
-        return uvErrorMap;
+        return getUvErrorMap();
       },
       getErrorMessage(err) {
-        const row = uvErrorMap.get(Number(err));
-        return row ? String(row[1]) : `Unknown system error ${String(err)}`;
+        return getUvErrorMessage(err);
       },
     };
   }
   if (name === 'constants') {
     let fsConstants = {};
+    let osConstants = {};
     try {
       const fs = require('fs');
       fsConstants = (fs && fs.constants) ? fs.constants : {};
     } catch {}
+    try {
+      const os = require('os');
+      osConstants = (os && os.constants) ? os.constants : {};
+    } catch {}
     return {
       os: {
         UV_UDP_REUSEADDR: 4,
+        signals: osConstants.signals || {},
         errno: {
           EISDIR: 21,
         },
@@ -531,90 +649,7 @@ function internalBinding(name) {
     };
   }
   if (name === 'timers') {
-    const nativeTimers = kNativeTimersBinding;
-    return {
-      immediateInfo: kImmediateInfo,
-      timeoutInfo: kTimeoutInfo,
-      setupTimers(processImmediate, processTimers) {
-        timersImmediateCallback = typeof processImmediate === 'function' ? processImmediate : null;
-        timersProcessTimersCallback = typeof processTimers === 'function' ? processTimers : null;
-        if (nativeTimers && typeof nativeTimers.setupTimers === 'function') {
-          const wrappedImmediate = () => {
-            kDebugTimersImmediateCalls++;
-            if (isDebugTimersJsEnabled() &&
-                (kDebugTimersImmediateCalls <= 20 || (kDebugTimersImmediateCalls % 1000) === 0)) {
-              try {
-                const m = '[unode-timers-js] before processImmediate #' +
-                  String(kDebugTimersImmediateCalls) +
-                  ' count=' + String(kImmediateInfo[0]) +
-                  ' refCount=' + String(kImmediateInfo[1]) +
-                  ' hasOutstanding=' + String(kImmediateInfo[2]);
-                if (process && typeof process._rawDebug === 'function') process._rawDebug(m);
-                else if (typeof console === 'object' && console && typeof console.error === 'function') console.error(m);
-              } catch {}
-            }
-            if (kImmediateInfo[0] === 0 && kImmediateInfo[1] === 0 && kImmediateInfo[2] === 0) {
-              if (typeof nativeTimers.toggleImmediateRef === 'function') {
-                nativeTimers.toggleImmediateRef(false);
-              }
-              return;
-            }
-            if (typeof timersImmediateCallback === 'function') timersImmediateCallback();
-            if (typeof nativeTimers.toggleImmediateRef === 'function') {
-              nativeTimers.toggleImmediateRef(kImmediateInfo[1] > 0);
-            }
-            if (isDebugTimersJsEnabled() &&
-                (kDebugTimersImmediateCalls <= 20 || (kDebugTimersImmediateCalls % 1000) === 0)) {
-              try {
-                const m = '[unode-timers-js] after processImmediate #' +
-                  String(kDebugTimersImmediateCalls) +
-                  ' count=' + String(kImmediateInfo[0]) +
-                  ' refCount=' + String(kImmediateInfo[1]) +
-                  ' hasOutstanding=' + String(kImmediateInfo[2]);
-                if (process && typeof process._rawDebug === 'function') process._rawDebug(m);
-                else if (typeof console === 'object' && console && typeof console.error === 'function') console.error(m);
-              } catch {}
-            }
-          };
-          nativeTimers.setupTimers(wrappedImmediate, timersProcessTimersCallback);
-        } else if (kImmediateInfo[0] > 0) {
-          scheduleImmediateDispatch();
-        }
-      },
-      toggleTimerRef(ref) {
-        ensureTimersBootstrap();
-        timerRefEnabled = !!ref;
-        if (nativeTimers && typeof nativeTimers.toggleTimerRef === 'function') {
-          nativeTimers.toggleTimerRef(timerRefEnabled);
-        } else {
-          applyHandleRefState(timersScheduledHandle, timerRefEnabled);
-        }
-      },
-      toggleImmediateRef(ref) {
-        ensureTimersBootstrap();
-        immediateRefEnabled = !!ref;
-        if (nativeTimers && typeof nativeTimers.toggleImmediateRef === 'function') {
-          nativeTimers.toggleImmediateRef(immediateRefEnabled);
-        } else {
-          applyHandleRefState(timersImmediateHandle, immediateRefEnabled);
-          if (kImmediateInfo[0] > 0) scheduleImmediateDispatch();
-        }
-      },
-      scheduleTimer(duration) {
-        ensureTimersBootstrap();
-        if (nativeTimers && typeof nativeTimers.scheduleTimer === 'function') {
-          nativeTimers.scheduleTimer(duration);
-        } else {
-          scheduleTimersDispatch(duration);
-        }
-      },
-      getLibuvNow() {
-        if (nativeTimers && typeof nativeTimers.getLibuvNow === 'function') {
-          return nativeTimers.getLibuvNow();
-        }
-        return Date.now();
-      },
-    };
+    return globalThis.__unode_timers_binding_js || createTimersBinding();
   }
   if (name === 'task_queue') {
     return {
@@ -664,7 +699,13 @@ function internalBinding(name) {
   if (name === 'symbols') {
     return kSharedSymbolsBinding;
   }
-  if (name === 'os') return globalThis.__unode_os || {};
+  if (name === 'os') {
+    const binding = globalThis.__unode_os || {};
+    if (typeof binding.getCIDR !== 'function') {
+      binding.getCIDR = () => null;
+    }
+    return binding;
+  }
   if (name === 'buffer') return globalThis.__unode_buffer || {};
   if (name === 'crypto') {
     return globalThis.__unode_crypto_binding || globalThis.__unode_crypto || {};
@@ -763,9 +804,18 @@ function internalBinding(name) {
     };
   }
   if (name === 'cares_wrap') {
-    if (globalThis.__unode_cares_wrap) return globalThis.__unode_cares_wrap;
+    if (globalThis.__unode_cares_wrap) {
+      const binding = globalThis.__unode_cares_wrap;
+      if (typeof binding.getCIDR !== 'function') {
+        binding.getCIDR = () => null;
+      }
+      return binding;
+    }
     return {
       convertIpv6StringToBuffer() {
+        return null;
+      },
+      getCIDR() {
         return null;
       },
     };
@@ -868,7 +918,7 @@ function internalBinding(name) {
           if (!m) m = /at (.*):(\d+):(\d+)$/.exec(line);
           if (!m) continue;
           const scriptName = m[1];
-          if (!scriptName || scriptName.includes('binding_runtime.js')) continue;
+          if (!scriptName || scriptName.includes('internal_binding.js')) continue;
           out.push({
             scriptName,
             scriptId: '0',
@@ -1028,9 +1078,34 @@ function internalBinding(name) {
       },
     };
   }
-  const nativeInternalBinding = getNativeInternalBinding();
-  if (nativeInternalBinding) return nativeInternalBinding(name);
   return {};
 }
+
+function internalBinding(name) {
+  const key = String(name);
+  if (kInternalBindingCache.has(key)) return kInternalBindingCache.get(key);
+
+  let binding;
+  const nativeInternalBinding = getNativeInternalBinding();
+  if (nativeInternalBinding) {
+    try {
+      binding = nativeInternalBinding(key);
+    } catch {
+      binding = undefined;
+    }
+  }
+  if (binding === undefined || binding === null) {
+    binding = resolveFallbackBinding(key);
+  }
+
+  if (kLazyGlobalBackedBindings.has(key) &&
+      binding && typeof binding === 'object' &&
+      Object.keys(binding).length === 0) {
+    return binding;
+  }
+  kInternalBindingCache.set(key, binding);
+  return binding;
+}
+
 
 module.exports = { internalBinding, primordials: primordialsExport };

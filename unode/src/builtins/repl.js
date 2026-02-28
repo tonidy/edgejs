@@ -9,7 +9,8 @@ const { inspect, types } = require('util');
 
 const REPL_MODE_SLOPPY = 0;
 const REPL_MODE_STRICT = 1;
-const kBuiltinBase = builtinModules.filter((m) => !m.startsWith('_'));
+const kPublicBuiltinModules = builtinModules.filter((m) => !m.startsWith('_'));
+const kBuiltinBase = kPublicBuiltinModules.slice();
 const kCompletionBlocked = Symbol('completionBlocked');
 let gReplEvalId = 0;
 const alphaSort = (a, b) => (a < b ? -1 : (a > b ? 1 : 0));
@@ -1493,7 +1494,7 @@ module.exports = {
   REPL_MODE_SLOPPY,
   REPL_MODE_STRICT,
   Recoverable,
-  builtinModules: builtinModules.filter((m) => !m.startsWith('_')).slice(),
-  _builtinLibs: builtinModules.filter((m) => !m.startsWith('_')).slice(),
+  builtinModules: kPublicBuiltinModules.slice(),
+  _builtinLibs: kPublicBuiltinModules.slice(),
   writer: inspect,
 };

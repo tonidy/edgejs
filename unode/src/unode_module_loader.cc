@@ -1,5 +1,6 @@
 #include "unode_module_loader.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -7,8 +8,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-static std::string g_fallback_builtins_override;
 
 namespace {
 
@@ -19,6 +18,7 @@ struct ModuleLoaderState {
   napi_ref cache_object_ref = nullptr;
   napi_ref primordials_ref = nullptr;
   napi_ref internal_binding_ref = nullptr;
+  napi_ref native_builtins_binding_ref = nullptr;
   std::string entry_dir;
 };
 
@@ -215,8 +215,7 @@ static bool ResolveNodeModules(const std::string& specifier, const std::string& 
   return FindPathInNodeModules(specifier, paths, out);
 }
 
-// Resolve bare specifier (e.g. "assert", "path", "node:worker_threads") from unode/src/builtins/<id>.js, or from
-// UNODE_FALLBACK_BUILTINS_DIR when running from node/test/ (raw mode).
+// Resolve bare specifier (e.g. "assert", "path", "node:worker_threads") from unode/src/builtins/<id>.js.
 // Strips "node:" prefix so node:worker_threads resolves to builtins/worker_threads.js.
 bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
   std::string id = specifier;
@@ -226,9 +225,6 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
   if (id.empty() || id.rfind(".", 0) == 0) {
     return false;
   }
-  const char* fallback = !g_fallback_builtins_override.empty()
-                             ? g_fallback_builtins_override.c_str()
-                             : std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
   static const fs::path runtime_builtins_dir =
       fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
   fs::path resolved;
@@ -264,51 +260,177 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
     *out = resolved.lexically_normal();
     return true;
   }
-  // When fallback is set, allow "internal/..." specifiers (e.g. internal/test/binding) for raw Node tests.
-  // Match prefix "internal" (8 chars). Must not use "internal/" here: compare(0, 8, "internal/") compares
-  // 8 chars of id with the full 9-char literal and never matches.
-  static const char kInternalPrefix[] = "internal";
-  if (fallback != nullptr && fallback[0] != '\0' && id.size() > 8 &&
-      id.compare(0, sizeof(kInternalPrefix) - 1, kInternalPrefix) == 0) {
-    fs::path fallback_path = fs::absolute(fs::path(fallback));
-    std::string flat;
-    for (char c : id) {
-      flat += (c == '/') ? '_' : c;
-    }
-    fs::path candidate = fallback_path / (flat + ".js");
-    if (ResolveAsFile(candidate, &resolved)) {
-      *out = resolved.lexically_normal();
-      return true;
-    }
-    candidate = fallback_path / (id + ".js");
-    if (ResolveAsFile(candidate, &resolved)) {
-      *out = resolved.lexically_normal();
-      return true;
-    }
-  }
-  // Keep fallback support for test-only shims when running raw Node tests.
-  if (fallback != nullptr && fallback[0] != '\0') {
-    candidate = fs::absolute(fs::path(fallback)) / (id + ".js");
-    if (ResolveAsFile(candidate, &resolved)) {
-      *out = resolved.lexically_normal();
-      return true;
-    }
-  }
   return false;
 }
 
-// Directory to use when loading binding_runtime in the prelude, so it is found regardless of
-// entry_dir. Prefer UNODE_FALLBACK_BUILTINS_DIR / g_fallback_builtins_override, else runtime builtins.
+// Directory to use when loading bootstrap builtins in the prelude, so they are found regardless of entry_dir.
 static std::string GetBuiltinsDirForBootstrap() {
-  const char* fallback = !g_fallback_builtins_override.empty()
-                             ? g_fallback_builtins_override.c_str()
-                             : std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
-  if (fallback != nullptr && fallback[0] != '\0') {
-    return fs::absolute(fs::path(fallback)).lexically_normal().string();
-  }
   static const fs::path runtime_builtins_dir =
       fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
   return runtime_builtins_dir.string();
+}
+
+static std::vector<std::string> CollectRuntimeBuiltinIds() {
+  static std::vector<std::string> ids;
+  if (!ids.empty()) return ids;
+
+  const fs::path root = fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
+  std::error_code ec;
+  if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
+    return ids;
+  }
+
+  for (fs::recursive_directory_iterator it(root, ec), end; it != end && !ec; it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    const fs::path p = it->path();
+    if (p.extension() != ".js") continue;
+    fs::path rel = p.lexically_relative(root);
+    std::string id = rel.generic_string();
+    if (id.size() <= 3) continue;
+    id.resize(id.size() - 3);  // trim ".js"
+    if (id == "internal_test_binding") {
+      ids.push_back("internal/test/binding");
+      continue;
+    }
+    ids.push_back(id);
+  }
+
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  return ids;
+}
+
+static napi_value NoopCallback(napi_env env, napi_callback_info /*info*/) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return nullptr;
+  if (state->native_builtins_binding_ref != nullptr) {
+    napi_value existing = nullptr;
+    if (napi_get_reference_value(env, state->native_builtins_binding_ref, &existing) == napi_ok &&
+        existing != nullptr) {
+      return existing;
+    }
+  }
+
+  napi_value binding = nullptr;
+  if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
+
+  const std::vector<std::string>& builtin_ids = CollectRuntimeBuiltinIds();
+  napi_value builtin_ids_array = nullptr;
+  if (napi_create_array_with_length(env, builtin_ids.size(), &builtin_ids_array) != napi_ok ||
+      builtin_ids_array == nullptr) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < builtin_ids.size(); ++i) {
+    napi_value id = nullptr;
+    if (napi_create_string_utf8(env, builtin_ids[i].c_str(), NAPI_AUTO_LENGTH, &id) != napi_ok ||
+        id == nullptr ||
+        napi_set_element(env, builtin_ids_array, i, id) != napi_ok) {
+      return nullptr;
+    }
+  }
+  if (napi_set_named_property(env, binding, "builtinIds", builtin_ids_array) != napi_ok) {
+    return nullptr;
+  }
+
+  napi_value compile_fn = nullptr;
+  if (napi_create_function(env, "compileFunction", NAPI_AUTO_LENGTH, NoopCallback, nullptr, &compile_fn) != napi_ok ||
+      compile_fn == nullptr ||
+      napi_set_named_property(env, binding, "compileFunction", compile_fn) != napi_ok) {
+    return nullptr;
+  }
+  napi_value set_internal_loaders_fn = nullptr;
+  if (napi_create_function(env,
+                           "setInternalLoaders",
+                           NAPI_AUTO_LENGTH,
+                           NoopCallback,
+                           nullptr,
+                           &set_internal_loaders_fn) != napi_ok ||
+      set_internal_loaders_fn == nullptr ||
+      napi_set_named_property(env, binding, "setInternalLoaders", set_internal_loaders_fn) != napi_ok) {
+    return nullptr;
+  }
+
+  if (state->native_builtins_binding_ref != nullptr) {
+    napi_delete_reference(env, state->native_builtins_binding_ref);
+    state->native_builtins_binding_ref = nullptr;
+  }
+  if (napi_create_reference(env, binding, 1, &state->native_builtins_binding_ref) != napi_ok ||
+      state->native_builtins_binding_ref == nullptr) {
+    return nullptr;
+  }
+  return binding;
+}
+
+static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, &data) != napi_ok || data == nullptr) {
+    return nullptr;
+  }
+  auto* state = static_cast<ModuleLoaderState*>(data);
+
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+
+  if (argc < 1 || argv[0] == nullptr) {
+    return undefined;
+  }
+  const std::string name = ValueToUtf8(env, argv[0]);
+  if (name == "builtins") {
+    napi_value binding = GetOrCreateNativeBuiltinsBinding(env, state);
+    return binding != nullptr ? binding : undefined;
+  }
+  if (name == "timers") {
+    napi_value global = nullptr;
+    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+      return undefined;
+    }
+    napi_value timers_binding = nullptr;
+    if (napi_get_named_property(env, global, "__unode_timers_binding_js", &timers_binding) == napi_ok &&
+        timers_binding != nullptr) {
+      return timers_binding;
+    }
+    if (napi_get_named_property(env, global, "__unode_timers_binding", &timers_binding) == napi_ok &&
+        timers_binding != nullptr) {
+      return timers_binding;
+    }
+    return undefined;
+  }
+  if (name == "types") {
+    napi_value global = nullptr;
+    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+      return undefined;
+    }
+    napi_value types_binding = nullptr;
+    if (napi_get_named_property(env, global, "__unode_types", &types_binding) != napi_ok ||
+        types_binding == nullptr) {
+      return undefined;
+    }
+    return types_binding;
+  }
+  if (name == "util") {
+    napi_value global = nullptr;
+    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+      return undefined;
+    }
+    bool has_util = false;
+    if (napi_has_named_property(env, global, "__unode_util", &has_util) != napi_ok || !has_util) {
+      return undefined;
+    }
+    napi_value util_binding = nullptr;
+    if (napi_get_named_property(env, global, "__unode_util", &util_binding) != napi_ok ||
+        util_binding == nullptr) {
+      return undefined;
+    }
+    return util_binding;
+  }
+  return undefined;
 }
 
 bool ResolveModulePath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
@@ -429,10 +551,6 @@ napi_value CreateResolvedPathString(napi_env env, const fs::path& resolved_path)
 // common shims so Node's heavy common/index.js is not loaded.
 static bool ApplyNodeTestCommonRedirect(ModuleLoaderState* state, fs::path* resolved_path) {
   if (state == nullptr || state->entry_dir.empty()) return false;
-  const char* fallback = !g_fallback_builtins_override.empty()
-                             ? g_fallback_builtins_override.c_str()
-                             : std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
-  if (fallback == nullptr || fallback[0] == '\0') return false;
 
   fs::path entry_dir = fs::path(state->entry_dir).lexically_normal();
   if (entry_dir.filename() != "parallel") return false;
@@ -446,7 +564,8 @@ static bool ApplyNodeTestCommonRedirect(ModuleLoaderState* state, fs::path* reso
   fs::path rel = normalized.lexically_relative(node_common_dir);
   if (rel.empty() || rel.string().find("..") == 0) return false;
 
-  fs::path unode_common_dir = fs::path(fallback).parent_path() / "common";
+  static const fs::path unode_common_dir =
+      fs::absolute(fs::path(__FILE__).parent_path() / ".." / "tests" / "node-compat" / "common").lexically_normal();
   if (!PathExistsDirectory(unode_common_dir)) {
     return false;
   }
@@ -869,10 +988,6 @@ bool LoadResolvedModule(napi_env env, ModuleLoaderState* state, const fs::path& 
 
 }  // namespace
 
-void UnodeSetFallbackBuiltinsDir(const char* path) {
-  g_fallback_builtins_override = (path != nullptr && path[0] != '\0') ? path : "";
-}
-
 void UnodeSetPrimordials(napi_env env, napi_value primordials) {
   if (env == nullptr || primordials == nullptr) return;
   auto it = g_loader_states.find(env);
@@ -930,6 +1045,10 @@ napi_status UnodeInstallModuleLoader(napi_env env, const char* entry_script_path
     napi_delete_reference(env, state.internal_binding_ref);
     state.internal_binding_ref = nullptr;
   }
+  if (state.native_builtins_binding_ref != nullptr) {
+    napi_delete_reference(env, state.native_builtins_binding_ref);
+    state.native_builtins_binding_ref = nullptr;
+  }
   state.entry_dir = entry_path.parent_path().string();
 
   auto* root_context = new RequireContext{&state, state.entry_dir};
@@ -963,7 +1082,23 @@ napi_status UnodeInstallModuleLoader(napi_env env, const char* entry_script_path
     return napi_generic_failure;
   }
 
-  // Bootstrap require: resolves from builtins dir so the prelude can load internal/test/binding_runtime
+  napi_value native_get_internal_binding_fn = nullptr;
+  if (napi_create_function(env,
+                           "__unode_get_internal_binding",
+                           NAPI_AUTO_LENGTH,
+                           NativeGetInternalBindingCallback,
+                           &state,
+                           &native_get_internal_binding_fn) != napi_ok ||
+      native_get_internal_binding_fn == nullptr ||
+      napi_set_named_property(env,
+                              global,
+                              "__unode_get_internal_binding",
+                              native_get_internal_binding_fn) != napi_ok) {
+    return napi_generic_failure;
+  }
+
+  // Bootstrap require: resolves from builtins dir so the prelude can load
+  // internal/bootstrap/realm
   // before the entry script runs, regardless of entry_dir. Declares internalBinding once.
   const std::string bootstrap_base_dir = GetBuiltinsDirForBootstrap();
   auto* bootstrap_context = new RequireContext{&state, bootstrap_base_dir};
