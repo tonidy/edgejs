@@ -189,6 +189,33 @@ void ThrowErrnoException(napi_env env, int errorno, const char* syscall,
   napi_throw(env, error);
 }
 
+void SetContextUVError(napi_env env, napi_value ctx, int errorno,
+                       const char* syscall) {
+  if (ctx == nullptr) return;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, ctx, &type) != napi_ok || type != napi_object) return;
+  const char* code = uv_err_name(errorno);
+  const char* msg = uv_strerror(errorno);
+  if (code == nullptr) code = "UNKNOWN";
+  if (msg == nullptr) msg = "unknown error";
+  napi_value v = nullptr;
+  if (napi_create_int32(env, errorno, &v) == napi_ok && v != nullptr) {
+    napi_set_named_property(env, ctx, "errno", v);
+  }
+  if (napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &v) == napi_ok &&
+      v != nullptr) {
+    napi_set_named_property(env, ctx, "code", v);
+  }
+  if (napi_create_string_utf8(env, msg, NAPI_AUTO_LENGTH, &v) == napi_ok &&
+      v != nullptr) {
+    napi_set_named_property(env, ctx, "message", v);
+  }
+  if (napi_create_string_utf8(env, syscall, NAPI_AUTO_LENGTH, &v) == napi_ok &&
+      v != nullptr) {
+    napi_set_named_property(env, ctx, "syscall", v);
+  }
+}
+
 napi_value BindingReadFileUtf8(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr};
@@ -1006,6 +1033,71 @@ napi_value BindingWriteSyncString(napi_env env, napi_callback_info info) {
   return result;
 }
 
+napi_value BindingWriteBuffer(napi_env env, napi_callback_info info) {
+  size_t argc = 7;
+  napi_value argv[7] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 2) {
+    return nullptr;
+  }
+  int32_t fd = 0;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) return nullptr;
+  void* buf_data = nullptr;
+  size_t buf_byte_length = 0;
+  if (!BufferFromValue(env, argv[1], &buf_data, &buf_byte_length)) {
+    return nullptr;
+  }
+  int64_t offset_i = 0;
+  int64_t length_i = static_cast<int64_t>(buf_byte_length);
+  int64_t position = -1;
+  if (argc >= 3 && argv[2] != nullptr &&
+      napi_get_value_int64(env, argv[2], &offset_i) != napi_ok) {
+    return nullptr;
+  }
+  if (argc >= 4 && argv[3] != nullptr &&
+      napi_get_value_int64(env, argv[3], &length_i) != napi_ok) {
+    return nullptr;
+  }
+  if (argc >= 5 && argv[4] != nullptr) {
+    bool is_null = false;
+    napi_value null_value = nullptr;
+    if (napi_get_null(env, &null_value) == napi_ok && null_value != nullptr) {
+      napi_strict_equals(env, argv[4], null_value, &is_null);
+    }
+    if (!is_null && napi_get_value_int64(env, argv[4], &position) != napi_ok) {
+      return nullptr;
+    }
+  }
+  napi_value ctx = (argc >= 7) ? argv[6] : nullptr;
+  if (offset_i < 0 || length_i < 0 ||
+      static_cast<size_t>(offset_i) > buf_byte_length ||
+      static_cast<size_t>(length_i) >
+          buf_byte_length - static_cast<size_t>(offset_i)) {
+    SetContextUVError(env, ctx, UV_EINVAL, "write");
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+  size_t offset = static_cast<size_t>(offset_i);
+  size_t length = static_cast<size_t>(length_i);
+  uv_buf_t uv_buf = uv_buf_init(static_cast<char*>(buf_data) + offset,
+                                static_cast<unsigned int>(length));
+  uv_fs_t req;
+  int r = uv_fs_write(nullptr, &req, fd, &uv_buf, 1, position, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (r < 0) {
+    SetContextUVError(env, ctx, r, "write");
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+  napi_value result = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(r), &result) != napi_ok) {
+    return nullptr;
+  }
+  return result;
+}
+
 napi_value BindingRename(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr};
@@ -1356,6 +1448,7 @@ void UnodeInstallFsBinding(napi_env env) {
   SetMethod(env, binding, "readSync", BindingReadSync);
   SetMethod(env, binding, "writeSync", BindingWriteSync);
   SetMethod(env, binding, "writeSyncString", BindingWriteSyncString);
+  SetMethod(env, binding, "writeBuffer", BindingWriteBuffer);
   SetMethod(env, binding, "rename", BindingRename);
   SetMethod(env, binding, "unlink", BindingUnlink);
   SetMethod(env, binding, "rmdir", BindingRmdir);

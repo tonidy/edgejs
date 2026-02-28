@@ -22,6 +22,9 @@ using unode::encoding_ids::kEncLatin1;
 using unode::encoding_ids::kEncUtf16Le;
 using unode::encoding_ids::kEncUtf8;
 
+constexpr double kUnodeBufferMaxLength = 9007199254740991.0;
+constexpr double kUnodeUnsafeArrayBufferAllocCap = 2147483647.0;
+
 std::string GetUtf8String(napi_env env, napi_value value);
 
 int32_t ParseEncodingArg(napi_env env, napi_value value, int32_t fallback) {
@@ -125,6 +128,91 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, uint8_t** data, size_
   }
   *len = element_len * bytes_per_element;
   return true;
+}
+
+bool ExtractArrayBufferParts(napi_env env, napi_value value, uint8_t** data, size_t* len) {
+  if (value == nullptr || data == nullptr || len == nullptr) return false;
+
+  bool is_ab = false;
+  if (napi_is_arraybuffer(env, value, &is_ab) == napi_ok && is_ab) {
+    void* ptr = nullptr;
+    size_t byte_len = 0;
+    if (napi_get_arraybuffer_info(env, value, &ptr, &byte_len) != napi_ok || ptr == nullptr) return false;
+    *data = static_cast<uint8_t*>(ptr);
+    *len = byte_len;
+    return true;
+  }
+
+  return false;
+}
+
+bool IsValueTrackedDetachedArrayBuffer(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  bool has_marker = false;
+  if (napi_has_named_property(env, value, "__unode_detached_arraybuffer_marker", &has_marker) == napi_ok &&
+      has_marker) {
+    return true;
+  }
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+  bool has_set = false;
+  if (napi_has_named_property(env, global, "__unode_detached_arraybuffers", &has_set) != napi_ok || !has_set) {
+    return false;
+  }
+  napi_value detached_set = nullptr;
+  if (napi_get_named_property(env, global, "__unode_detached_arraybuffers", &detached_set) != napi_ok ||
+      detached_set == nullptr) {
+    return false;
+  }
+  napi_value has_fn = nullptr;
+  if (napi_get_named_property(env, detached_set, "has", &has_fn) != napi_ok || has_fn == nullptr) return false;
+  napi_valuetype t = napi_undefined;
+  if (napi_typeof(env, has_fn, &t) != napi_ok || t != napi_function) return false;
+  napi_value argv[1] = {value};
+  napi_value result = nullptr;
+  if (napi_call_function(env, detached_set, has_fn, 1, argv, &result) != napi_ok || result == nullptr) return false;
+  bool detached = false;
+  if (napi_get_value_bool(env, result, &detached) != napi_ok) return false;
+  return detached;
+}
+
+bool ExtractValidationBytesOrThrow(napi_env env, napi_value value, uint8_t** data, size_t* len) {
+  if (value == nullptr || data == nullptr || len == nullptr) return false;
+
+  bool is_ab = false;
+  if (napi_is_arraybuffer(env, value, &is_ab) == napi_ok && is_ab) {
+    if (IsValueTrackedDetachedArrayBuffer(env, value)) {
+      napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
+      return false;
+    }
+    void* ptr = nullptr;
+    size_t byte_len = 0;
+    if (napi_get_arraybuffer_info(env, value, &ptr, &byte_len) != napi_ok) return false;
+    if (ptr == nullptr && byte_len != 0) {
+      napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
+      return false;
+    }
+    *data = static_cast<uint8_t*>(ptr);
+    *len = byte_len;
+    return true;
+  }
+
+  bool is_typed = false;
+  if (napi_is_typedarray(env, value, &is_typed) == napi_ok && is_typed) {
+    napi_typedarray_type type = napi_uint8_array;
+    size_t element_len = 0;
+    void* ptr = nullptr;
+    napi_value arraybuffer = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_typedarray_info(env, value, &type, &element_len, &ptr, &arraybuffer, &byte_offset) == napi_ok &&
+        arraybuffer != nullptr &&
+        IsValueTrackedDetachedArrayBuffer(env, arraybuffer)) {
+      napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
+      return false;
+    }
+  }
+
+  return ExtractBytesFromValue(env, value, data, len);
 }
 
 std::string GetUtf8String(napi_env env, napi_value value) {
@@ -448,7 +536,7 @@ napi_value BindingIsAscii(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
   uint8_t* data = nullptr;
   size_t len = 0;
-  if (!ExtractBytesFromValue(env, argv[0], &data, &len)) return nullptr;
+  if (!ExtractValidationBytesOrThrow(env, argv[0], &data, &len)) return nullptr;
   bool ok = true;
   for (size_t i = 0; i < len; i++) {
     if (data[i] > 0x7f) {
@@ -467,8 +555,12 @@ napi_value BindingIsUtf8(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
   uint8_t* data = nullptr;
   size_t len = 0;
-  if (!ExtractBytesFromValue(env, argv[0], &data, &len)) return nullptr;
+  if (!ExtractValidationBytesOrThrow(env, argv[0], &data, &len)) return nullptr;
   napi_value out = nullptr;
+  if (len == 0) {
+    napi_get_boolean(env, true, &out);
+    return out;
+  }
   napi_get_boolean(env, simdutf::validate_utf8(reinterpret_cast<const char*>(data), len), &out);
   return out;
 }
@@ -799,15 +891,75 @@ napi_value BindingCreateUnsafeArrayBuffer(napi_env env, napi_callback_info info)
     napi_throw_range_error(env, "ERR_OUT_OF_RANGE", "The value is out of range");
     return nullptr;
   }
-  if (size_double > static_cast<double>(INT32_MAX)) {
+  if (size_double >= kUnodeUnsafeArrayBufferAllocCap) {
     napi_throw_error(env, "ERR_MEMORY_ALLOCATION_FAILED", "Array buffer allocation failed");
     return nullptr;
   }
-  int32_t size = static_cast<int32_t>(std::trunc(size_double));
+
+  const size_t size = static_cast<size_t>(std::trunc(size_double));
   napi_value ab = nullptr;
   void* data = nullptr;
-  napi_create_arraybuffer(env, static_cast<size_t>(size), &data, &ab);
+  if (napi_create_arraybuffer(env, size, &data, &ab) != napi_ok || ab == nullptr) {
+    napi_throw_error(env, "ERR_MEMORY_ALLOCATION_FAILED", "Array buffer allocation failed");
+    return nullptr;
+  }
   return ab;
+}
+
+napi_value BindingSetBufferPrototype(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  napi_valuetype t = napi_undefined;
+  if (napi_typeof(env, argv[0], &t) != napi_ok || t != napi_object) {
+    napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", "The \"prototype\" argument must be an object");
+    return nullptr;
+  }
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+  napi_set_named_property(env, global, "__unode_buffer_prototype", argv[0]);
+  napi_value undef = nullptr;
+  napi_get_undefined(env, &undef);
+  return undef;
+}
+
+napi_value BindingCopyArrayBuffer(napi_env env, napi_callback_info info) {
+  size_t argc = 5;
+  napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 5) return nullptr;
+
+  uint8_t* dst = nullptr;
+  uint8_t* src = nullptr;
+  size_t dst_len = 0;
+  size_t src_len = 0;
+  if (!ExtractArrayBufferParts(env, argv[0], &dst, &dst_len) ||
+      !ExtractArrayBufferParts(env, argv[2], &src, &src_len)) {
+    napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", "copyArrayBuffer expects (ArrayBuffer, ...)");
+    return nullptr;
+  }
+
+  uint32_t dst_offset = 0;
+  uint32_t src_offset = 0;
+  uint32_t bytes_to_copy = 0;
+  if (napi_get_value_uint32(env, argv[1], &dst_offset) != napi_ok ||
+      napi_get_value_uint32(env, argv[3], &src_offset) != napi_ok ||
+      napi_get_value_uint32(env, argv[4], &bytes_to_copy) != napi_ok) {
+    napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", "copyArrayBuffer offsets and length must be uint32");
+    return nullptr;
+  }
+
+  const size_t dst_off = static_cast<size_t>(dst_offset);
+  const size_t src_off = static_cast<size_t>(src_offset);
+  const size_t count = static_cast<size_t>(bytes_to_copy);
+  if (dst_off > dst_len || src_off > src_len || count > (dst_len - dst_off) || count > (src_len - src_off)) {
+    napi_throw_range_error(env, "ERR_OUT_OF_RANGE", "copyArrayBuffer range is out of bounds");
+    return nullptr;
+  }
+  if (count > 0) std::memcpy(dst + dst_off, src + src_off, count);
+
+  napi_value undef = nullptr;
+  napi_get_undefined(env, &undef);
+  return undef;
 }
 
 napi_value BindingAtob(napi_env env, napi_callback_info info) {
@@ -875,6 +1027,7 @@ void UnodeInstallBufferBinding(napi_env env) {
   SetMethod(env, binding, "swap64", BindingSwap64);
   SetMethod(env, binding, "atob", BindingAtob);
   SetMethod(env, binding, "btoa", BindingBtoa);
+  SetMethod(env, binding, "setBufferPrototype", BindingSetBufferPrototype);
 
   SetMethod(env, binding, "asciiSlice", BindingAsciiSlice);
   SetMethod(env, binding, "base64Slice", BindingBase64Slice);
@@ -891,9 +1044,10 @@ void UnodeInstallBufferBinding(napi_env env) {
   SetMethod(env, binding, "base64urlWrite", BindingBase64UrlWrite);
   SetMethod(env, binding, "hexWrite", BindingHexWrite);
   SetMethod(env, binding, "ucs2Write", BindingUcs2Write);
+  SetMethod(env, binding, "copyArrayBuffer", BindingCopyArrayBuffer);
   SetMethod(env, binding, "createUnsafeArrayBuffer", BindingCreateUnsafeArrayBuffer);
 
-  SetNumberConst(env, binding, "kMaxLength", 9007199254740991.0);
+  SetNumberConst(env, binding, "kMaxLength", kUnodeBufferMaxLength);
   SetIntConst(env, binding, "kStringMaxLength", 0x1fffffe8);
 
   napi_value global = nullptr;

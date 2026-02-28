@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "ada.h"
 #include "simdutf.h"
 
 namespace {
@@ -267,6 +268,56 @@ napi_value BindingDecodeBase64(napi_env env, napi_callback_info info) {
   return MakeUint8Array(env, out.data(), out_len);
 }
 
+napi_value BindingToASCII(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
+    return nullptr;
+  }
+  size_t in_len = 0;
+  if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &in_len) != napi_ok) return nullptr;
+  std::string input(in_len + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, argv[0], input.data(), input.size(), &copied) != napi_ok) return nullptr;
+  input.resize(copied);
+
+  napi_value out = nullptr;
+  if (input.empty()) {
+    napi_create_string_utf8(env, "", 0, &out);
+    return out;
+  }
+  auto parsed = ada::parse<ada::url>("ws://x");
+  std::string result;
+  if (parsed && parsed->set_hostname(input)) result = parsed->get_hostname();
+  napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+  return out;
+}
+
+napi_value BindingToUnicode(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
+    return nullptr;
+  }
+  size_t in_len = 0;
+  if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &in_len) != napi_ok) return nullptr;
+  std::string input(in_len + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, argv[0], input.data(), input.size(), &copied) != napi_ok) return nullptr;
+  input.resize(copied);
+
+  napi_value out = nullptr;
+  if (input.empty()) {
+    napi_create_string_utf8(env, "", 0, &out);
+    return out;
+  }
+  auto parsed = ada::parse<ada::url>("ws://x");
+  std::string result;
+  if (parsed && parsed->set_hostname(input)) result = ada::idna::to_unicode(parsed->get_hostname());
+  napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+  return out;
+}
+
 void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
   napi_value fn = nullptr;
   if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok && fn != nullptr) {
@@ -285,6 +336,8 @@ void UnodeInstallEncodingBinding(napi_env env) {
   SetMethod(env, binding, "validateUtf8", BindingValidateUtf8);
   SetMethod(env, binding, "encodeBase64", BindingEncodeBase64);
   SetMethod(env, binding, "decodeBase64", BindingDecodeBase64);
+  SetMethod(env, binding, "toASCII", BindingToASCII);
+  SetMethod(env, binding, "toUnicode", BindingToUnicode);
 
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) return;

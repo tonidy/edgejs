@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "uv.h"
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -27,7 +29,23 @@ struct RequireContext {
   std::string base_dir;
 };
 
+struct TaskQueueBindingState {
+  napi_ref binding_ref = nullptr;
+  napi_ref tick_callback_ref = nullptr;
+  napi_ref promise_reject_callback_ref = nullptr;
+};
+struct ErrorsBindingState {
+  napi_ref binding_ref = nullptr;
+};
+struct TraceEventsBindingState {
+  napi_ref binding_ref = nullptr;
+  napi_ref state_update_handler_ref = nullptr;
+};
+
 std::unordered_map<napi_env, ModuleLoaderState> g_loader_states;
+std::unordered_map<napi_env, TaskQueueBindingState> g_task_queue_states;
+std::unordered_map<napi_env, ErrorsBindingState> g_errors_states;
+std::unordered_map<napi_env, TraceEventsBindingState> g_trace_events_states;
 std::vector<RequireContext*> g_require_contexts;
 
 std::string ReadTextFile(const fs::path& path) {
@@ -146,6 +164,21 @@ bool ResolveAsDirectory(const fs::path& candidate, fs::path* out) {
     return true;
   }
   return false;
+}
+
+std::string CanonicalPathKey(const fs::path& path) {
+  std::error_code ec;
+  fs::path absolute = path;
+  if (!absolute.is_absolute()) {
+    absolute = fs::absolute(path, ec);
+    if (ec) {
+      absolute = path;
+      ec.clear();
+    }
+  }
+  const fs::path canonical = fs::weakly_canonical(absolute, ec);
+  if (!ec) return canonical.lexically_normal().string();
+  return absolute.lexically_normal().string();
 }
 
 // True if request is relative (./, ../, ., ..) or absolute (starts with /).
@@ -366,6 +399,346 @@ static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderSta
   return binding;
 }
 
+static napi_value TaskQueueEnqueueMicrotask(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+
+  napi_value queue_microtask = nullptr;
+  if (napi_get_named_property(env, global, "queueMicrotask", &queue_microtask) == napi_ok &&
+      queue_microtask != nullptr) {
+    napi_valuetype t = napi_undefined;
+    if (napi_typeof(env, queue_microtask, &t) == napi_ok && t == napi_function) {
+      napi_value ignored = nullptr;
+      napi_call_function(env, global, queue_microtask, 1, argv, &ignored);
+    }
+  }
+
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value TaskQueueRunMicrotasks(napi_env env, napi_callback_info /*info*/) {
+  // V8 performs microtask checkpoints automatically for most turns in unode.
+  // Keep this as a no-op hook with Node-compatible shape.
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value TaskQueueSetTickCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  auto& st = g_task_queue_states[env];
+  if (st.tick_callback_ref != nullptr) {
+    napi_delete_reference(env, st.tick_callback_ref);
+    st.tick_callback_ref = nullptr;
+  }
+  napi_valuetype t = napi_undefined;
+  if (napi_typeof(env, argv[0], &t) == napi_ok && t == napi_function) {
+    napi_create_reference(env, argv[0], 1, &st.tick_callback_ref);
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value TaskQueueSetPromiseRejectCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  auto& st = g_task_queue_states[env];
+  if (st.promise_reject_callback_ref != nullptr) {
+    napi_delete_reference(env, st.promise_reject_callback_ref);
+    st.promise_reject_callback_ref = nullptr;
+  }
+  napi_valuetype t = napi_undefined;
+  if (napi_typeof(env, argv[0], &t) == napi_ok && t == napi_function) {
+    napi_create_reference(env, argv[0], 1, &st.promise_reject_callback_ref);
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value GetOrCreateTaskQueueBinding(napi_env env) {
+  auto& st = g_task_queue_states[env];
+  if (st.binding_ref != nullptr) {
+    napi_value existing = nullptr;
+    if (napi_get_reference_value(env, st.binding_ref, &existing) == napi_ok && existing != nullptr) {
+      return existing;
+    }
+  }
+
+  napi_value binding = nullptr;
+  if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
+
+  auto define_method = [&](const char* name, napi_callback cb) -> bool {
+    napi_value fn = nullptr;
+    if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) != napi_ok || fn == nullptr) {
+      return false;
+    }
+    return napi_set_named_property(env, binding, name, fn) == napi_ok;
+  };
+
+  if (!define_method("enqueueMicrotask", TaskQueueEnqueueMicrotask) ||
+      !define_method("setTickCallback", TaskQueueSetTickCallback) ||
+      !define_method("runMicrotasks", TaskQueueRunMicrotasks) ||
+      !define_method("setPromiseRejectCallback", TaskQueueSetPromiseRejectCallback)) {
+    return nullptr;
+  }
+
+  napi_value tick_ab = nullptr;
+  void* tick_data = nullptr;
+  if (napi_create_arraybuffer(env, 2 * sizeof(int32_t), &tick_data, &tick_ab) != napi_ok ||
+      tick_ab == nullptr || tick_data == nullptr) {
+    return nullptr;
+  }
+  auto* fields = static_cast<int32_t*>(tick_data);
+  fields[0] = 0;  // hasTickScheduled
+  fields[1] = 0;  // hasRejectionToWarn
+  napi_value tick_info = nullptr;
+  if (napi_create_typedarray(env, napi_int32_array, 2, tick_ab, 0, &tick_info) != napi_ok || tick_info == nullptr) {
+    return nullptr;
+  }
+  if (napi_set_named_property(env, binding, "tickInfo", tick_info) != napi_ok) return nullptr;
+
+  napi_value promise_events = nullptr;
+  if (napi_create_object(env, &promise_events) != napi_ok || promise_events == nullptr) return nullptr;
+  auto set_event_const = [&](const char* name, int32_t value) -> bool {
+    napi_value v = nullptr;
+    return napi_create_int32(env, value, &v) == napi_ok && v != nullptr &&
+           napi_set_named_property(env, promise_events, name, v) == napi_ok;
+  };
+  if (!set_event_const("kPromiseRejectWithNoHandler", 0) ||
+      !set_event_const("kPromiseHandlerAddedAfterReject", 1) ||
+      !set_event_const("kPromiseResolveAfterResolved", 2) ||
+      !set_event_const("kPromiseRejectAfterResolved", 3)) {
+    return nullptr;
+  }
+  if (napi_set_named_property(env, binding, "promiseRejectEvents", promise_events) != napi_ok) return nullptr;
+
+  if (st.binding_ref != nullptr) {
+    napi_delete_reference(env, st.binding_ref);
+    st.binding_ref = nullptr;
+  }
+  if (napi_create_reference(env, binding, 1, &st.binding_ref) != napi_ok || st.binding_ref == nullptr) {
+    return nullptr;
+  }
+  return binding;
+}
+
+static napi_value ErrorsNoSideEffectsToString(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  napi_value out = nullptr;
+  if (napi_coerce_to_string(env, argv[0], &out) != napi_ok || out == nullptr) {
+    napi_get_undefined(env, &out);
+  }
+  return out;
+}
+
+static napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_throw(env, argv[0]);
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value GetOrCreateErrorsBinding(napi_env env) {
+  auto& st = g_errors_states[env];
+  if (st.binding_ref != nullptr) {
+    napi_value existing = nullptr;
+    if (napi_get_reference_value(env, st.binding_ref, &existing) == napi_ok && existing != nullptr) {
+      return existing;
+    }
+  }
+
+  napi_value binding = nullptr;
+  if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
+  auto define_method = [&](const char* name, napi_callback cb) -> bool {
+    napi_value fn = nullptr;
+    return napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
+           fn != nullptr &&
+           napi_set_named_property(env, binding, name, fn) == napi_ok;
+  };
+  if (!define_method("noSideEffectsToString", ErrorsNoSideEffectsToString) ||
+      !define_method("triggerUncaughtException", ErrorsTriggerUncaughtException)) {
+    return nullptr;
+  }
+
+  napi_value exit_codes = nullptr;
+  if (napi_create_object(env, &exit_codes) != napi_ok || exit_codes == nullptr) return nullptr;
+  auto set_const = [&](const char* name, int32_t value) -> bool {
+    napi_value v = nullptr;
+    return napi_create_int32(env, value, &v) == napi_ok &&
+           v != nullptr &&
+           napi_set_named_property(env, exit_codes, name, v) == napi_ok;
+  };
+  if (!set_const("kNoFailure", 0) ||
+      !set_const("kGenericUserError", 1) ||
+      !set_const("kInvalidArgument", 9)) {
+    return nullptr;
+  }
+  if (napi_set_named_property(env, binding, "exitCodes", exit_codes) != napi_ok) return nullptr;
+
+  if (st.binding_ref != nullptr) {
+    napi_delete_reference(env, st.binding_ref);
+    st.binding_ref = nullptr;
+  }
+  if (napi_create_reference(env, binding, 1, &st.binding_ref) != napi_ok || st.binding_ref == nullptr) {
+    return nullptr;
+  }
+  return binding;
+}
+
+static napi_value TraceEventsTrace(napi_env env, napi_callback_info /*info*/) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value TraceEventsIsTraceCategoryEnabled(napi_env env, napi_callback_info /*info*/) {
+  napi_value out = nullptr;
+  napi_get_boolean(env, false, &out);
+  return out;
+}
+
+static napi_value TraceEventsGetEnabledCategories(napi_env env, napi_callback_info /*info*/) {
+  napi_value out = nullptr;
+  napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &out);
+  return out;
+}
+
+static napi_value TraceEventsGetCategoryEnabledBuffer(napi_env env, napi_callback_info /*info*/) {
+  napi_value ab = nullptr;
+  void* data = nullptr;
+  if (napi_create_arraybuffer(env, sizeof(uint8_t), &data, &ab) != napi_ok || ab == nullptr || data == nullptr) {
+    return nullptr;
+  }
+  static_cast<uint8_t*>(data)[0] = 0;
+  napi_value ta = nullptr;
+  if (napi_create_typedarray(env, napi_uint8_array, 1, ab, 0, &ta) != napi_ok || ta == nullptr) return nullptr;
+  return ta;
+}
+
+static napi_value TraceEventsCategorySetEnable(napi_env env, napi_callback_info /*info*/) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value TraceEventsCategorySetDisable(napi_env env, napi_callback_info /*info*/) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value TraceEventsCategorySetCtor(napi_env env, napi_callback_info /*info*/) {
+  napi_value obj = nullptr;
+  if (napi_create_object(env, &obj) != napi_ok || obj == nullptr) return nullptr;
+  napi_value enable_fn = nullptr;
+  napi_value disable_fn = nullptr;
+  if (napi_create_function(env, "enable", NAPI_AUTO_LENGTH, TraceEventsCategorySetEnable, nullptr, &enable_fn) == napi_ok &&
+      enable_fn != nullptr) {
+    napi_set_named_property(env, obj, "enable", enable_fn);
+  }
+  if (napi_create_function(env, "disable", NAPI_AUTO_LENGTH, TraceEventsCategorySetDisable, nullptr, &disable_fn) == napi_ok &&
+      disable_fn != nullptr) {
+    napi_set_named_property(env, obj, "disable", disable_fn);
+  }
+  return obj;
+}
+
+static napi_value TraceEventsSetTraceCategoryStateUpdateHandler(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+
+  auto& st = g_trace_events_states[env];
+  if (st.state_update_handler_ref != nullptr) {
+    napi_delete_reference(env, st.state_update_handler_ref);
+    st.state_update_handler_ref = nullptr;
+  }
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_valuetype t = napi_undefined;
+    if (napi_typeof(env, argv[0], &t) == napi_ok && t == napi_function) {
+      napi_create_reference(env, argv[0], 1, &st.state_update_handler_ref);
+      // Node calls handler upon tracing state changes; tracing is disabled in unode.
+      napi_value global = nullptr;
+      napi_get_global(env, &global);
+      napi_value fn = nullptr;
+      if (napi_get_reference_value(env, st.state_update_handler_ref, &fn) == napi_ok && fn != nullptr) {
+        napi_value arg = nullptr;
+        napi_get_boolean(env, false, &arg);
+        napi_value ignored = nullptr;
+        napi_call_function(env, global, fn, 1, &arg, &ignored);
+      }
+    }
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value GetOrCreateTraceEventsBinding(napi_env env) {
+  auto& st = g_trace_events_states[env];
+  if (st.binding_ref != nullptr) {
+    napi_value existing = nullptr;
+    if (napi_get_reference_value(env, st.binding_ref, &existing) == napi_ok && existing != nullptr) {
+      return existing;
+    }
+  }
+
+  napi_value binding = nullptr;
+  if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
+  auto define_method = [&](const char* name, napi_callback cb) -> bool {
+    napi_value fn = nullptr;
+    return napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
+           fn != nullptr &&
+           napi_set_named_property(env, binding, name, fn) == napi_ok;
+  };
+  if (!define_method("trace", TraceEventsTrace) ||
+      !define_method("isTraceCategoryEnabled", TraceEventsIsTraceCategoryEnabled) ||
+      !define_method("getEnabledCategories", TraceEventsGetEnabledCategories) ||
+      !define_method("getCategoryEnabledBuffer", TraceEventsGetCategoryEnabledBuffer) ||
+      !define_method("setTraceCategoryStateUpdateHandler", TraceEventsSetTraceCategoryStateUpdateHandler)) {
+    return nullptr;
+  }
+
+  napi_value category_set_ctor = nullptr;
+  if (napi_create_function(env,
+                           "CategorySet",
+                           NAPI_AUTO_LENGTH,
+                           TraceEventsCategorySetCtor,
+                           nullptr,
+                           &category_set_ctor) != napi_ok ||
+      category_set_ctor == nullptr ||
+      napi_set_named_property(env, binding, "CategorySet", category_set_ctor) != napi_ok) {
+    return nullptr;
+  }
+
+  if (st.binding_ref != nullptr) {
+    napi_delete_reference(env, st.binding_ref);
+    st.binding_ref = nullptr;
+  }
+  if (napi_create_reference(env, binding, 1, &st.binding_ref) != napi_ok || st.binding_ref == nullptr) {
+    return nullptr;
+  }
+  return binding;
+}
+
 static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -382,6 +755,21 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
     return undefined;
   }
   const std::string name = ValueToUtf8(env, argv[0]);
+  auto get_global_named = [&](const char* key) -> napi_value {
+    napi_value global = nullptr;
+    if (napi_get_global(env, &global) != napi_ok || global == nullptr) return undefined;
+    bool has_prop = false;
+    if (napi_has_named_property(env, global, key, &has_prop) != napi_ok || !has_prop) return undefined;
+    napi_value out = nullptr;
+    if (napi_get_named_property(env, global, key, &out) != napi_ok || out == nullptr) return undefined;
+    return out;
+  };
+  auto set_int32 = [&](napi_value obj, const char* key, int32_t value) {
+    napi_value v = nullptr;
+    if (napi_create_int32(env, value, &v) == napi_ok && v != nullptr) {
+      napi_set_named_property(env, obj, key, v);
+    }
+  };
   if (name == "builtins") {
     napi_value binding = GetOrCreateNativeBuiltinsBinding(env, state);
     return binding != nullptr ? binding : undefined;
@@ -401,6 +789,108 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
       return timers_binding;
     }
     return undefined;
+  }
+  if (name == "encoding_binding") return get_global_named("__unode_encoding");
+  if (name == "task_queue") {
+    napi_value binding = GetOrCreateTaskQueueBinding(env);
+    return binding != nullptr ? binding : undefined;
+  }
+  if (name == "errors") {
+    napi_value binding = GetOrCreateErrorsBinding(env);
+    return binding != nullptr ? binding : undefined;
+  }
+  if (name == "trace_events") {
+    napi_value binding = GetOrCreateTraceEventsBinding(env);
+    return binding != nullptr ? binding : undefined;
+  }
+  if (name == "url_pattern") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+    napi_value global = nullptr;
+    if (napi_get_global(env, &global) == napi_ok && global != nullptr) {
+      napi_value url_pattern_ctor = nullptr;
+      if (napi_get_named_property(env, global, "URLPattern", &url_pattern_ctor) == napi_ok &&
+          url_pattern_ctor != nullptr) {
+        napi_set_named_property(env, out, "URLPattern", url_pattern_ctor);
+      }
+    }
+    return out;
+  }
+  if (name == "constants") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+    napi_value os_obj = nullptr;
+    if (napi_create_object(env, &os_obj) == napi_ok && os_obj != nullptr) {
+      napi_value signals = nullptr;
+      if (napi_create_object(env, &signals) == napi_ok && signals != nullptr) {
+        napi_set_named_property(env, os_obj, "signals", signals);
+      }
+      napi_set_named_property(env, out, "os", os_obj);
+    }
+    napi_value fs_obj = nullptr;
+    if (napi_create_object(env, &fs_obj) == napi_ok && fs_obj != nullptr) {
+      set_int32(fs_obj, "F_OK", 0);
+      set_int32(fs_obj, "R_OK", 4);
+      set_int32(fs_obj, "W_OK", 2);
+      set_int32(fs_obj, "X_OK", 1);
+      napi_set_named_property(env, out, "fs", fs_obj);
+    }
+    napi_value os_constants = get_global_named("__unode_os_constants");
+    if (os_constants != undefined) napi_set_named_property(env, out, "os", os_constants);
+    napi_value fs_binding = get_global_named("__unode_fs");
+    if (fs_binding != undefined) {
+      napi_value fs_constants_obj = nullptr;
+      if (napi_create_object(env, &fs_constants_obj) == napi_ok && fs_constants_obj != nullptr) {
+        auto copy_key = [&](const char* key) {
+          bool has_prop = false;
+          if (napi_has_named_property(env, fs_binding, key, &has_prop) == napi_ok && has_prop) {
+            napi_value v = nullptr;
+            if (napi_get_named_property(env, fs_binding, key, &v) == napi_ok && v != nullptr) {
+              napi_set_named_property(env, fs_constants_obj, key, v);
+            }
+          }
+        };
+        copy_key("F_OK");
+        copy_key("R_OK");
+        copy_key("W_OK");
+        copy_key("X_OK");
+        napi_set_named_property(env, out, "fs", fs_constants_obj);
+      }
+    }
+    return out;
+  }
+  if (name == "uv") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+    set_int32(out, "UV_ENOENT", UV_ENOENT);
+    set_int32(out, "UV_EEXIST", UV_EEXIST);
+    set_int32(out, "UV_EOF", UV_EOF);
+    set_int32(out, "UV_EINVAL", UV_EINVAL);
+    set_int32(out, "UV_EBADF", UV_EBADF);
+    set_int32(out, "UV_ENOTCONN", UV_ENOTCONN);
+    set_int32(out, "UV_ECANCELED", UV_ECANCELED);
+    set_int32(out, "UV_ETIMEDOUT", UV_ETIMEDOUT);
+    set_int32(out, "UV_ENOMEM", UV_ENOMEM);
+    set_int32(out, "UV_ENOTSOCK", UV_ENOTSOCK);
+    return out;
+  }
+  if (name == "config") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+    napi_value t = nullptr;
+    napi_value f = nullptr;
+    napi_get_boolean(env, true, &t);
+    napi_get_boolean(env, false, &f);
+    napi_set_named_property(env, out, "hasIntl", f);
+    napi_set_named_property(env, out, "hasSmallICU", f);
+    napi_set_named_property(env, out, "hasInspector", f);
+    napi_set_named_property(env, out, "hasTracing", f);
+    napi_set_named_property(env, out, "hasOpenSSL", t);
+    napi_set_named_property(env, out, "fipsMode", f);
+    napi_set_named_property(env, out, "hasNodeOptions", t);
+    napi_set_named_property(env, out, "noBrowserGlobals", f);
+    napi_set_named_property(env, out, "isDebugBuild", f);
+    return out;
   }
   if (name == "types") {
     napi_value global = nullptr;
@@ -430,6 +920,26 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
     }
     return util_binding;
   }
+  if (name == "os") return get_global_named("__unode_os");
+  if (name == "fs") return get_global_named("__unode_fs");
+  if (name == "buffer") return get_global_named("__unode_buffer");
+  if (name == "crypto") {
+    napi_value out = get_global_named("__unode_crypto_binding");
+    if (out != undefined) return out;
+    return get_global_named("__unode_crypto");
+  }
+  if (name == "http_parser") return get_global_named("__unode_http_parser");
+  if (name == "stream_wrap") return get_global_named("__unode_stream_wrap");
+  if (name == "process_wrap") return get_global_named("__unode_process_wrap");
+  if (name == "tcp_wrap") return get_global_named("__unode_tcp_wrap");
+  if (name == "tty_wrap") return get_global_named("__unode_tty_wrap");
+  if (name == "pipe_wrap") return get_global_named("__unode_pipe_wrap");
+  if (name == "signal_wrap") return get_global_named("__unode_signal_wrap");
+  if (name == "cares_wrap") return get_global_named("__unode_cares_wrap");
+  if (name == "udp_wrap") return get_global_named("__unode_udp_wrap");
+  if (name == "url") return get_global_named("__unode_url");
+  if (name == "string_decoder") return get_global_named("__unode_string_decoder");
+  if (name == "spawn_sync") return get_global_named("__unode_spawn_sync");
   if (name == "process_methods") {
     napi_value global = nullptr;
     if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
@@ -667,7 +1177,8 @@ bool EvaluateJsModule(napi_env env,
   // as arguments (realm->primordials() in Node). No JS expression like globalThis.primordials at call time.
   const std::string wrapped_source =
       "(function(internalBinding, primordials) {"
-      "return function(exports, require, module, __filename, __dirname) {\n" + source + "\n};"
+      "return function(exports, require, module, __filename, __dirname) {\n" + source +
+      "\n//# sourceURL=" + resolved_path.string() + "\n};"
       "})";
   napi_value script_source = nullptr;
   if (napi_create_string_utf8(env, wrapped_source.c_str(), NAPI_AUTO_LENGTH, &script_source) != napi_ok ||
@@ -845,13 +1356,14 @@ napi_value RequireCallback(napi_env env, napi_callback_info info) {
   std::string resolved_key;
   fs::path resolved_path;
   if (ResolveBuiltinPath(specifier, context->base_dir, &resolved_path)) {
-    resolved_key = resolved_path.string();
+    resolved_key = CanonicalPathKey(resolved_path);
+    resolved_path = fs::path(resolved_key);
   } else {
     napi_value resolved_path_value = ResolveSpecifierForContext(env, context, specifier, true);
     if (resolved_path_value == nullptr) {
       return nullptr;
     }
-    resolved_key = ValueToUtf8(env, resolved_path_value);
+    resolved_key = CanonicalPathKey(fs::path(ValueToUtf8(env, resolved_path_value)));
     if (resolved_key.empty()) {
       ThrowLoaderError(env, "Failed to resolve module path");
       return nullptr;
@@ -947,7 +1459,7 @@ void RemoveCachedModule(napi_env env, ModuleLoaderState* state, const std::strin
 }
 
 bool LoadResolvedModule(napi_env env, ModuleLoaderState* state, const fs::path& resolved_path, napi_value* out_exports) {
-  const std::string resolved_key = resolved_path.string();
+  const std::string resolved_key = CanonicalPathKey(resolved_path);
   if (GetCachedModuleExports(env, state, resolved_key, out_exports)) {
     return true;
   }

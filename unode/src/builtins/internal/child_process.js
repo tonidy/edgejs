@@ -574,7 +574,6 @@ function setupChannel(target, channel, serializationMode) {
       fired = true;
       if (channel && typeof channel.close === 'function') channel.close();
       target.emit('disconnect');
-      maybeClose(target);
     };
     if (channel.buffering) {
       this.once('message', finish);
@@ -585,7 +584,6 @@ function setupChannel(target, channel, serializationMode) {
   }
 
   channel.readStart();
-  channel.unref();
   return control;
 }
 

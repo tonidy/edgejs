@@ -22,87 +22,9 @@ const unsafeProtocol = new Set(['javascript', 'javascript:']);
 const hostlessProtocol = new Set(['javascript', 'javascript:']);
 const slashedProtocol = new Set(['http', 'http:', 'https', 'https:', 'ftp', 'ftp:', 'file', 'file:', 'ws', 'ws:', 'wss', 'wss:']);
 
-class SimpleURLSearchParams {
-  constructor(init = '') {
-    this._pairs = [];
-    const input = typeof init === 'string' ? init.replace(/^\?/, '') : String(init || '');
-    if (!input) return;
-    const parts = input.split('&');
-    for (const part of parts) {
-      if (!part) continue;
-      const eq = part.indexOf('=');
-      const k = decodeURIComponent(eq >= 0 ? part.slice(0, eq) : part);
-      const v = decodeURIComponent(eq >= 0 ? part.slice(eq + 1) : '');
-      this._pairs.push([k, v]);
-    }
-  }
-
-  set(name, value) {
-    const key = String(name);
-    const val = String(value);
-    let found = false;
-    const next = [];
-    for (const [k, v] of this._pairs) {
-      if (k === key) {
-        if (!found) next.push([k, val]);
-        found = true;
-      } else {
-        next.push([k, v]);
-      }
-    }
-    if (!found) next.push([key, val]);
-    this._pairs = next;
-  }
-
-  append(name, value) {
-    this._pairs.push([String(name), String(value)]);
-  }
-
-  entries() {
-    return this._pairs[Symbol.iterator]();
-  }
-
-  [Symbol.iterator]() {
-    return this.entries();
-  }
-
-  toString() {
-    return this._pairs.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
-  }
+if (typeof NativeURL !== 'function') {
+  throw new Error('internal/url requires native URL');
 }
-
-const URLSearchParamsImpl = typeof NativeURLSearchParams === 'function' ? NativeURLSearchParams : SimpleURLSearchParams;
-
-function FallbackURL(input) {
-  if (!(this instanceof FallbackURL)) return new FallbackURL(input);
-  const href = String(input);
-  const parsed = typeof bindingUrl.parse === 'function' ? bindingUrl.parse(href) : null;
-  if (!parsed || typeof parsed !== 'object' || typeof parsed.protocol !== 'string' || parsed.protocol.length === 0) {
-    const err = new TypeError('Invalid URL');
-    err.code = 'ERR_INVALID_URL';
-    throw err;
-  }
-  const protocol = String(parsed.protocol).toLowerCase();
-  const remainder = href.slice((href.indexOf('://') + 3) >>> 0);
-  const isFile = protocol === 'file:';
-  if (!isFile && (remainder.length === 0 || remainder[0] === ':' || remainder[0] === '/')) {
-    const err = new TypeError('Invalid URL');
-    err.code = 'ERR_INVALID_URL';
-    throw err;
-  }
-  Object.defineProperty(this, 'href', { __proto__: null, value: href, enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, 'protocol', { __proto__: null, value: protocol, enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, 'hostname', { __proto__: null, value: parsed.hostname || '', enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, 'pathname', { __proto__: null, value: parsed.pathname || '/', enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, 'search', { __proto__: null, value: parsed.search || '', enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, 'hash', { __proto__: null, value: parsed.hash || '', enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, 'username', { __proto__: null, value: parsed.username || '', enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, 'password', { __proto__: null, value: parsed.password || '', enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, 'port', { __proto__: null, value: parsed.port || '', enumerable: false, configurable: true, writable: true });
-  Object.defineProperty(this, Symbol.toStringTag, { __proto__: null, value: 'URL', enumerable: false, configurable: true });
-}
-
-const URLImpl = typeof NativeURL === 'function' ? NativeURL : FallbackURL;
 
 function domainToASCII(domain) {
   return typeof bindingUrl.domainToASCII === 'function' ?
@@ -117,7 +39,7 @@ function domainToUnicode(domain) {
 }
 
 function isURL(self) {
-  if (typeof URLImpl === 'function' && self instanceof URLImpl) return true;
+  if (self instanceof NativeURL) return true;
   return self != null &&
     typeof self === 'object' &&
     self[Symbol.toStringTag] === 'URL';
@@ -178,18 +100,10 @@ function fileURLToPath(input, options = undefined) {
   const protocol = parsed.protocol;
   if (!String(protocol || '').startsWith('file')) throw new ERR_INVALID_URL_SCHEME('file');
   let inputUrl;
-  const GlobalURL = globalThis.URL;
-  if (typeof GlobalURL === 'function') {
-    try {
-      inputUrl = new GlobalURL(String(href));
-    } catch {}
-  }
-  if (!inputUrl) {
-    try {
-      inputUrl = new URLImpl(String(href));
-    } catch {
-      inputUrl = href;
-    }
+  try {
+    inputUrl = new NativeURL(String(href));
+  } catch {
+    inputUrl = href;
   }
   const url = {
     hostname: parsed.hostname || '',
@@ -224,14 +138,14 @@ function pathToFileURL(filepath, options = undefined) {
     const href = typeof bindingUrl.pathToFileURL === 'function' ?
       bindingUrl.pathToFileURL(resolved.slice(hostnameEndIndex), windows, hostname) :
       `file://${hostname}${resolved.slice(hostnameEndIndex).replace(/\\/g, '/')}`;
-    return new URLImpl(href);
+    return new NativeURL(href);
   }
   const last = filepath.charCodeAt(filepath.length - 1);
   if ((last === 47 || (windows && last === 92)) && resolved[resolved.length - 1] !== path.sep) resolved += '/';
   const href = typeof bindingUrl.pathToFileURL === 'function' ?
     bindingUrl.pathToFileURL(resolved, windows) :
     `file://${resolved.replace(/\\/g, '/')}`;
-  return new URLImpl(href);
+  return new NativeURL(href);
 }
 
 function urlToHttpOptions(urlObj) {
@@ -280,8 +194,8 @@ function urlToHttpOptions(urlObj) {
 }
 
 module.exports = {
-  URL: URLImpl,
-  URLSearchParams: URLSearchParamsImpl,
+  URL: NativeURL,
+  URLSearchParams: NativeURLSearchParams,
   domainToASCII,
   domainToUnicode,
   fileURLToPath,

@@ -321,7 +321,11 @@ function ensureTimersBootstrap() {
   try {
     const { setupTaskQueue } = require('internal/process/task_queues');
     const { nextTick, runNextTicks } = setupTaskQueue();
-    if (process && typeof process === 'object') process.nextTick = nextTick;
+    if (process && typeof process === 'object') {
+      process.nextTick = nextTick;
+      // Native runtime drains this hook each libuv turn.
+      process._tickCallback = runNextTicks;
+    }
     const { getTimerCallbacks } = require('internal/timers');
     const { processImmediate, processTimers } = getTimerCallbacks(runNextTicks);
     timersImmediateCallback = processImmediate;
@@ -564,605 +568,37 @@ function getNativeInternalBinding() {
   return ib;
 }
 const kInternalBindingCache = new Map();
-const kLazyGlobalBackedBindings = new Set([
-  'buffer',
-  'cares_wrap',
-  'fs',
-  'os',
-  'pipe_wrap',
-  'process_wrap',
-  'signal_wrap',
-  'spawn_sync',
-  'stream_wrap',
-  'tcp_wrap',
-  'tty_wrap',
-  'udp_wrap',
-  'url',
-  'util',
-]);
-
-class UnodePipeStub {}
-class UnodePipeConnectWrapStub {}
-class UnodeTTYWrap {
-  constructor(fd, ctx = undefined) {
-    this.fd = Number(fd);
-    this.reading = false;
-    this._raw = false;
-    if (!Number.isInteger(this.fd) || this.fd < 0 || this.fd > 2) {
-      if (ctx && typeof ctx === 'object') {
-        ctx.errno = UV_EINVAL;
-        ctx.code = 'EINVAL';
-        ctx.message = 'invalid argument';
-        ctx.syscall = 'uv_tty_init';
-      }
-      this._initError = UV_EINVAL;
-    }
-  }
-  setBlocking() { return 0; }
-  setRawMode(flag) {
-    this._raw = !!flag;
-    return this._initError || 0;
-  }
-  getWindowSize(size) {
-    if (this._initError) return this._initError;
-    if (Array.isArray(size)) {
-      size[0] = 80;
-      size[1] = 24;
-    }
-    return 0;
-  }
-  writeBuffer(req, buffer) {
-    if (this._initError) return this._initError;
-    try {
-      const fs = require('fs');
-      fs.writeSync(this.fd, buffer);
-    } catch {}
-    if (req && typeof req.oncomplete === 'function') req.oncomplete(0, this, req);
-    return 0;
-  }
-  writeUtf8String(req, str) {
-    return this.writeBuffer(req, Buffer.from(String(str), 'utf8'));
-  }
-  writeAsciiString(req, str) {
-    return this.writeBuffer(req, Buffer.from(String(str), 'ascii'));
-  }
-  writeUcs2String(req, str) {
-    return this.writeBuffer(req, Buffer.from(String(str), 'utf16le'));
-  }
-  readStart() { this.reading = true; return 0; }
-  readStop() { this.reading = false; return 0; }
-  close(cb) { if (typeof cb === 'function') cb(); }
-  ref() {}
-  unref() {}
-}
-
-function resolveFallbackBinding(name) {
-  if (name === 'uv') {
-    return {
-      UV_ENOENT,
-      UV_EEXIST,
-      UV_EOF,
-      UV_EINVAL,
-      UV_EBADF,
-      UV_ENOTCONN,
-      UV_ECANCELED,
-      UV_ETIMEDOUT,
-      UV_ENOMEM,
-      UV_ENOTSOCK,
-      UV_UNKNOWN,
-      UV_EAI_MEMORY,
-      getErrorMap() {
-        return getUvErrorMap();
-      },
-      getErrorMessage(err) {
-        return getUvErrorMessage(err);
-      },
-    };
-  }
-  if (name === 'constants') {
-    let fsConstants = {};
-    let osConstants = {};
-    try {
-      const fs = require('fs');
-      fsConstants = (fs && fs.constants) ? fs.constants : {};
-    } catch {}
-    try {
-      const os = require('os');
-      osConstants = (os && os.constants) ? os.constants : {};
-    } catch {}
-    return {
-      os: {
-        UV_UDP_REUSEADDR: 4,
-        signals: (() => {
-          const src = (osConstants && osConstants.signals) || {};
-          const out = Object.create(null);
-          const keys = Object.keys(src);
-          for (let i = 0; i < keys.length; i++) out[keys[i]] = src[keys[i]];
-          return out;
-        })(),
-        errno: {
-          EISDIR: 21,
-        },
-      },
-      fs: {
-        ...fsConstants,
-        F_OK: fsConstants.F_OK ?? 0,
-        R_OK: fsConstants.R_OK ?? 4,
-        W_OK: fsConstants.W_OK ?? 2,
-        X_OK: fsConstants.X_OK ?? 1,
-      },
-    };
-  }
-  if (name === 'timers') {
-    return globalThis.__unode_timers_binding_js || createTimersBinding();
-  }
-  if (name === 'task_queue') {
-    return {
-      tickInfo: kTickInfo,
-      runMicrotasks() {},
-      setTickCallback(fn) {
-        if (process && typeof process === 'object' && typeof fn === 'function') {
-          process._tickCallback = fn;
-        }
-      },
-      enqueueMicrotask(fn) {
-        if (typeof queueMicrotask === 'function') return queueMicrotask(fn);
-        if (typeof fn === 'function') fn();
-      },
-    };
-  }
-  if (name === 'trace_events') {
-    return {
-      getCategoryEnabledBuffer() {
-        return new Uint8Array(1);
-      },
-      trace() {},
-    };
-  }
-  if (name === 'mksnapshot') {
-    return {
-      setSerializeCallback() {},
-      setDeserializeCallback() {},
-      setDeserializeMainFunction() {},
-      isBuildingSnapshotBuffer: kIsBuildingSnapshotBuffer,
-    };
-  }
-  if (name === 'errors') {
-    return {
-      noSideEffectsToString(value) {
-        return String(value);
-      },
-      triggerUncaughtException(err) {
-        throw err;
-      },
-      exitCodes: {
-        kNoFailure: 0,
-        kGenericUserError: 1,
-      },
-    };
-  }
-  if (name === 'symbols') {
-    return kSharedSymbolsBinding;
-  }
-  if (name === 'os') {
-    const binding = globalThis.__unode_os || {};
-    if (typeof binding.getCIDR !== 'function') {
-      binding.getCIDR = () => null;
-    }
-    return binding;
-  }
-  if (name === 'buffer') return globalThis.__unode_buffer || {};
-  if (name === 'crypto') {
-    return globalThis.__unode_crypto_binding || globalThis.__unode_crypto || {};
-  }
-  if (name === 'http_parser') return globalThis.__unode_http_parser || {};
-  if (name === 'stream_wrap') return globalThis.__unode_stream_wrap || {};
-  if (name === 'process_wrap') {
-    if (globalThis.__unode_process_wrap && typeof globalThis.__unode_process_wrap === 'object') {
-      return globalThis.__unode_process_wrap;
-    }
-    class Process {
-      constructor() {
-        this.pid = 0;
-        this._alive = false;
-        this.onexit = null;
-      }
-
-      spawn(_options) {
-        if (this._alive) return UV_EINVAL;
-        let nextPid = typeof globalThis.__unode_process_wrap_pid === 'number' ?
-          globalThis.__unode_process_wrap_pid : 30000;
-        nextPid += 1;
-        globalThis.__unode_process_wrap_pid = nextPid;
-        this.pid = nextPid;
-        this._alive = true;
-        return 0;
-      }
-
-      kill(signal) {
-        if (!this._alive) return UV_ESRCH;
-        if (signal === 0) return 0;
-        this._alive = false;
-        const signalCode = signal == null ? 'SIGTERM' : signal;
-        process.nextTick(() => {
-          if (typeof this.onexit === 'function') this.onexit(0, signalCode);
-        });
-        return 0;
-      }
-
-      close() {
-        this._alive = false;
-      }
-
-      ref() {}
-      unref() {}
-    }
-    return { Process };
-  }
-  if (name === 'js_stream') {
-    class JSStream {
-      constructor() {
-        this._externalStream = { [kExternalStreamTag]: true };
-      }
-      close(cb) {
-        if (typeof cb === 'function') cb();
-      }
-      readBuffer() {}
-      emitEOF() {}
-      finishWrite(req, status) {
-        if (req && typeof req.oncomplete === 'function') req.oncomplete(status || 0, this, req);
-      }
-      finishShutdown(req, status) {
-        if (req && typeof req.oncomplete === 'function') req.oncomplete(status || 0, this, req);
-      }
-    }
-    return { JSStream };
-  }
-  if (name === 'contextify') {
-    return {
-      startSigintWatchdog() {
-        watchdogDepth++;
-      },
-      stopSigintWatchdog() {
-        if (watchdogDepth <= 0) return false;
-        watchdogDepth--;
-        const hadPending = watchdogPending;
-        if (watchdogDepth === 0) watchdogPending = false;
-        return hadPending;
-      },
-      watchdogHasPendingSigint() {
-        return watchdogPending;
-      },
-    };
-  }
-  if (name === 'tcp_wrap') return globalThis.__unode_tcp_wrap || {};
-  if (name === 'udp_wrap') return globalThis.__unode_udp_wrap || {};
-  if (name === 'pipe_wrap') {
-    if (globalThis.__unode_pipe_wrap) return globalThis.__unode_pipe_wrap;
-    return {
-      Pipe: UnodePipeStub,
-      PipeConnectWrap: UnodePipeConnectWrapStub,
-      constants: {
-        SOCKET: 0,
-        SERVER: 1,
-      },
-    };
-  }
-  if (name === 'signal_wrap') {
-    if (globalThis.__unode_signal_wrap && typeof globalThis.__unode_signal_wrap === 'object') {
-      return globalThis.__unode_signal_wrap;
-    }
-    class UnodeSignalWrapStub {
-      start() { return UV_EINVAL; }
-      stop() { return 0; }
-      close(cb) { if (typeof cb === 'function') cb(); }
-      ref() {}
-      unref() {}
-      hasRef() { return false; }
-      getAsyncId() { return -1; }
-    }
-    return { Signal: UnodeSignalWrapStub };
-  }
-  if (name === 'cares_wrap') {
-    if (globalThis.__unode_cares_wrap) {
-      const binding = globalThis.__unode_cares_wrap;
-      if (typeof binding.getCIDR !== 'function') {
-        binding.getCIDR = () => null;
-      }
-      return binding;
-    }
-    return {
-      convertIpv6StringToBuffer() {
-        return null;
-      },
-      getCIDR() {
-        return null;
-      },
-    };
-  }
-  if (name === 'string_decoder') {
-    if (globalThis.__unode_string_decoder) return globalThis.__unode_string_decoder;
-    const nativeInternalBinding = getNativeInternalBinding();
-    if (nativeInternalBinding) {
-      const nativeBinding = nativeInternalBinding(name) || {};
-      if (Array.isArray(nativeBinding.encodings)) return nativeBinding;
-      return {
-        ...nativeBinding,
-        encodings: ['ascii', 'utf8', 'base64', 'base64url', 'utf16le', 'hex', 'buffer', 'latin1'],
-      };
-    }
-    return {
-      encodings: ['ascii', 'utf8', 'base64', 'base64url', 'utf16le', 'hex', 'buffer', 'latin1'],
-    };
-  }
-  if (name === 'url') return globalThis.__unode_url || {};
-  if (name === 'url_pattern') {
-    return {
-      URLPattern: typeof globalThis.URLPattern === 'function' ? globalThis.URLPattern : undefined,
-    };
-  }
-  if (name === 'encoding_binding') {
-    return {
-      toASCII(input) {
-        const b = globalThis.__unode_url || {};
-        if (typeof b.domainToASCII === 'function') return b.domainToASCII(String(input));
-        return String(input || '').toLowerCase();
-      },
-    };
-  }
-  if (name === 'debug') {
-    return {
-      getV8FastApiCallCount() {
-        return 0;
-      },
-    };
-  }
-  if (name === 'types') {
-    return makeTypesBinding();
-  }
-  if (name === 'util') {
-    const nativeUtil = globalThis.__unode_util || {};
-    return {
-      ...nativeUtil,
-      constants: {
-        ALL_PROPERTIES: 0,
-        ONLY_ENUMERABLE: 1,
-        kPending: 0,
-      },
-      defineLazyProperties(target, id, keys) {
-        if (!target || typeof target !== 'object' || !Array.isArray(keys)) return;
-        for (const key of keys) {
-          Object.defineProperty(target, key, {
-            configurable: true,
-            enumerable: true,
-            get() {
-              const mod = require(String(id));
-              const value = mod ? mod[key] : undefined;
-              Object.defineProperty(target, key, {
-                configurable: true,
-                enumerable: true,
-                writable: true,
-                value,
-              });
-              return value;
-            },
-          });
-        }
-      },
-      constructSharedArrayBuffer(size) {
-        return new SharedArrayBuffer(Number(size) || 0);
-      },
-      getOwnNonIndexProperties(obj, filter) {
-        const kOnlyEnumerable = 1;
-        return Object.getOwnPropertyNames(obj).filter((n) => {
-          const index = Number(n);
-          if (Number.isInteger(index) && String(index) === n) return false;
-          // 'length' is non-enumerable; include it only when showing all properties
-          if (n === 'length') return filter !== kOnlyEnumerable;
-          if (filter === kOnlyEnumerable) {
-            const desc = Object.getOwnPropertyDescriptor(obj, n);
-            return !!(desc && desc.enumerable);
-          }
-          return true;
-        });
-      },
-      getCallSites(frameCount) {
-        const n = frameCount == null ? 8 : Math.max(0, Math.trunc(Number(frameCount) || 0));
-        if (n === 0) return [];
-        const fallbackName = (process && process.argv && process.argv[1]) || '[eval]';
-        const lines = String(new Error().stack || '').split('\n').slice(1);
-        const out = [];
-        for (const raw of lines) {
-          const line = String(raw).trim();
-          let m = /\((.*):(\d+):(\d+)\)$/.exec(line);
-          if (!m) m = /at (.*):(\d+):(\d+)$/.exec(line);
-          if (!m) continue;
-          const scriptName = m[1];
-          if (!scriptName || scriptName.includes('internal_binding.js')) continue;
-          out.push({
-            scriptName,
-            scriptId: '0',
-            lineNumber: Number(m[2]) || 1,
-            columnNumber: Number(m[3]) || 1,
-            column: Number(m[3]) || 1,
-            functionName: '',
-          });
-          if (out.length >= n) break;
-        }
-        if (out.length === 0) {
-          out.push({
-            scriptName: fallbackName,
-            scriptId: '0',
-            lineNumber: 1,
-            columnNumber: 1,
-            column: 1,
-            functionName: '',
-          });
-        }
-        while (out.length < n) {
-          const last = out[out.length - 1];
-          out.push({
-            scriptName: last.scriptName,
-            scriptId: '0',
-            lineNumber: last.lineNumber,
-            columnNumber: last.columnNumber,
-            column: last.column,
-            functionName: '',
-          });
-        }
-        return out.slice(0, n);
-      },
-      getConstructorName(value) {
-        if (kCtorNameMap.has(value)) return kCtorNameMap.get(value);
-        let obj = value;
-        while (obj && (typeof obj === 'object' || typeof obj === 'function')) {
-          const desc = Object.getOwnPropertyDescriptor(obj, 'constructor');
-          if (desc && typeof desc.value === 'function' && typeof desc.value.name === 'string' && desc.value.name) {
-            return desc.value.name;
-          }
-          obj = Object.getPrototypeOf(obj);
-        }
-        return '';
-      },
-      getPromiseDetails(promise) {
-        if (!(promise instanceof Promise)) return [0, undefined];
-        return [0, undefined];
-      },
-      previewEntries(value, pairMode) {
-        try {
-          if (value instanceof Map) {
-            const entries = Array.from(value.entries());
-            return pairMode ? [entries, true] : entries.flat();
-          }
-          if (value instanceof Set) {
-            const entries = Array.from(value.values());
-            return pairMode ? [entries, false] : entries;
-          }
-        } catch {}
-        return pairMode ? [[], false] : [];
-      },
-      getProxyDetails(value) {
-        return kProxyDetails.get(value);
-      },
-      parseEnv(src) {
-        return parseDotEnv(src);
-      },
-      sleep(msec) {
-        const n = Number(msec);
-        if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) return;
-        if (typeof Atomics === 'object' && typeof Atomics.wait === 'function' &&
-            typeof SharedArrayBuffer === 'function') {
-          const i32 = new Int32Array(new SharedArrayBuffer(4));
-          Atomics.wait(i32, 0, 0, n);
-          return;
-        }
-        const start = Date.now();
-        while ((Date.now() - start) < n) {}
-      },
-      isInsideNodeModules() {
-        const stack = String(new Error().stack || '');
-        return /(^|[\\/])node_modules([\\/]|$)/i.test(stack);
-      },
-      privateSymbols: {
-        untransferable_object_private_symbol: kUntransferable,
-        arrow_message_private_symbol: kArrowMessagePrivate,
-        decorated_private_symbol: kDecoratedPrivate,
-      },
-      arrayBufferViewHasBuffer(view) {
-        if (view == null || typeof view !== 'object') return false;
-        let byteLength = 0;
-        try {
-          byteLength = view.byteLength;
-        } catch {
-          return false;
-        }
-        if (typeof byteLength !== 'number') return false;
-        if (kHasBackingStore.has(view)) return true;
-        if (byteLength >= 96) return true;
-        kHasBackingStore.add(view);
-        return false;
-      },
-    };
-  }
-  if (name === 'tty_wrap') {
-    if (globalThis.__unode_tty_wrap && typeof globalThis.__unode_tty_wrap === 'object') {
-      return globalThis.__unode_tty_wrap;
-    }
-    return {
-      TTY: UnodeTTYWrap,
-      isTTY(fd) {
-        return Number.isInteger(fd) && fd >= 0 && fd <= 2;
-      },
-    };
-  }
-  if (name === 'spawn_sync') {
-    const nativeSpawnSync = globalThis.__unode_spawn_sync;
-    const normalizeResult = (raw) => {
-      const result = raw && typeof raw === 'object' ? raw : {};
-      const outputIn = Array.isArray(result.output) ? result.output : [null, '', ''];
-      const toBuffer = (v) => {
-        if (Buffer.isBuffer(v)) return v;
-        if (typeof v === 'string') return Buffer.from(v, 'utf8');
-        if (v && typeof v === 'object' && typeof v.byteLength === 'number') {
-          try { return Buffer.from(v.buffer, v.byteOffset || 0, v.byteLength); } catch {}
-        }
-        return Buffer.alloc(0);
-      };
-      const output = [null, toBuffer(outputIn[1]), toBuffer(outputIn[2])];
-      return {
-        pid: typeof result.pid === 'number' ? result.pid : 0,
-        output,
-        status: result.status ?? null,
-        signal: result.signal ?? null,
-        error: result.error,
-      };
-    };
-    if (nativeSpawnSync && typeof nativeSpawnSync.spawn === 'function') {
-      return {
-        spawn(options) {
-          return normalizeResult(nativeSpawnSync.spawn(options));
-        },
-      };
-    }
-    return {
-      spawn(options) {
-        const cp = require('child_process');
-        const file = options && options.file ? String(options.file) : '';
-        const args = options && Array.isArray(options.args) ? options.args.slice(1).map((v) => String(v)) : [];
-        const timeout = options && Number.isFinite(options.timeout) ? Number(options.timeout) : 0;
-        const result = cp.spawnSync(file, args, { timeout });
-        return normalizeResult({
-          pid: typeof result.pid === 'number' ? result.pid : 0,
-          output: [null, result.stdout || Buffer.alloc(0), result.stderr || Buffer.alloc(0)],
-          status: result.status ?? null,
-          signal: result.signal ?? null,
-          error: result.error ? UV_EINVAL : undefined,
-        });
-      },
-    };
-  }
-  return {};
-}
 
 function internalBinding(name) {
   const key = String(name);
   if (kInternalBindingCache.has(key)) return kInternalBindingCache.get(key);
 
-  let binding;
   const nativeInternalBinding = getNativeInternalBinding();
-  if (nativeInternalBinding) {
-    try {
-      binding = nativeInternalBinding(key);
-    } catch {
-      binding = undefined;
-    }
+  if (typeof nativeInternalBinding !== 'function') {
+    throw new Error('internalBinding native hook is not installed');
   }
-  if (binding === undefined || binding === null) {
-    binding = resolveFallbackBinding(key);
+  let binding = nativeInternalBinding(key);
+  if ((binding === undefined || binding === null) && key === 'config') {
+    binding = {
+      hasIntl: false,
+      hasSmallICU: false,
+      hasInspector: false,
+      hasTracing: false,
+      hasOpenSSL: true,
+      fipsMode: false,
+      hasNodeOptions: true,
+      noBrowserGlobals: false,
+      isDebugBuild: false,
+    };
   }
 
   if (key === 'constants' && binding && typeof binding === 'object') {
     if (!binding.os || typeof binding.os !== 'object') binding.os = {};
+    if (!binding.fs || typeof binding.fs !== 'object') binding.fs = {};
+    if (binding.fs.F_OK === undefined) binding.fs.F_OK = 0;
+    if (binding.fs.R_OK === undefined) binding.fs.R_OK = 4;
+    if (binding.fs.W_OK === undefined) binding.fs.W_OK = 2;
+    if (binding.fs.X_OK === undefined) binding.fs.X_OK = 1;
     const src = binding.os.signals;
     const normalized = Object.create(null);
     if (src && typeof src === 'object') {
@@ -1171,12 +607,17 @@ function internalBinding(name) {
     }
     binding.os.signals = normalized;
   }
-
-  if (kLazyGlobalBackedBindings.has(key) &&
-      binding && typeof binding === 'object' &&
-      Object.keys(binding).length === 0) {
-    return binding;
+  if (key === 'uv' && binding && typeof binding === 'object') {
+    if (typeof binding.getErrorMap !== 'function') {
+      binding.getErrorMap = getUvErrorMap;
+    }
+    if (typeof binding.getErrorMessage !== 'function') {
+      binding.getErrorMessage = getUvErrorMessage;
+    }
+    if (binding.UV_UNKNOWN === undefined) binding.UV_UNKNOWN = -4094;
+    if (binding.UV_EAI_MEMORY === undefined) binding.UV_EAI_MEMORY = -3001;
   }
+
   kInternalBindingCache.set(key, binding);
   return binding;
 }
