@@ -139,6 +139,26 @@
       "name": "test_wrap",
       "description": "Object wrap/unwrap/remove_wrap and add_finalizer",
       "expected_stdout": "TEST_WRAP_OK=1\n"
+    },
+    {
+      "name": "test_callback",
+      "description": "napi_create_function, napi_get_cb_info, callback dispatch",
+      "expected_stdout": "TEST_CALLBACK_OK=1\n"
+    },
+    {
+      "name": "test_define_properties",
+      "description": "Object methods via napi_create_function + set_named_property",
+      "expected_stdout": "TEST_DEFINE_PROPERTIES_OK=1\n"
+    },
+    {
+      "name": "test_constructor",
+      "description": "napi_new_instance, napi_get_new_target, instanceof",
+      "expected_stdout": "TEST_CONSTRUCTOR_OK=1\n"
+    },
+    {
+      "name": "test_define_class",
+      "description": "napi_define_class with constructor and methods",
+      "expected_stdout": "TEST_DEFINE_CLASS_OK=1\n"
     }
   ]
 }

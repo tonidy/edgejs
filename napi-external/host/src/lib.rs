@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use wasmer::{Table, Value};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+use std::cell::Cell;
 use wasmer::{
     imports, Function, FunctionEnv, FunctionEnvMut, Imports, Instance, Memory, Module, Store,
     TypedFunction,
@@ -13,6 +15,58 @@ use virtual_fs::AsyncReadExt;
 use virtual_mio::block_on;
 
 const MAX_GUEST_CSTRING_SCAN: usize = 64 * 1024;
+
+// Thread-local raw pointer to the current FunctionEnvMut, used by the
+// C++ → Rust callback trampoline. Set before any C++ FFI call that might
+// trigger V8 callbacks, cleared after. Safe because:
+// 1. Single-threaded WASM execution
+// 2. Pointer is valid for the duration of the synchronous FFI call
+// 3. Callback is strictly nested within the FFI call
+thread_local! {
+    static CB_ENV_PTR: Cell<*mut ()> = Cell::new(std::ptr::null_mut());
+}
+
+/// Rust trampoline called from C++ when a V8 callback fires.
+/// Retrieves the WASM store from the thread-local, then calls
+/// __napi_callback_dispatch in the WASM guest.
+#[no_mangle]
+extern "C" fn snapi_host_invoke_wasm_callback(wasm_fn_ptr: u32, data_val: u64) -> u32 {
+    CB_ENV_PTR.with(|cell| {
+        let ptr = cell.get();
+        if ptr.is_null() {
+            eprintln!("[callback trampoline] no env pointer available");
+            return 0;
+        }
+        // SAFETY: ptr was set from &mut FunctionEnvMut<RuntimeEnv> which is still
+        // alive on the call stack above us. Single-threaded, synchronous.
+        let env: &mut FunctionEnvMut<'_, RuntimeEnv> = unsafe { &mut *(ptr as *mut FunctionEnvMut<'_, RuntimeEnv>) };
+        let Some(table) = env.data().table.clone() else {
+            return 0;
+        };
+        {
+            let (_, mut store) = env.data_and_store_mut();
+            let Some(elem) = table.get(&mut store, wasm_fn_ptr) else {
+                return 0;
+            };
+            let func = match elem {
+                Value::FuncRef(Some(func)) => func,
+                Value::FuncRef(None) => return 0,
+                _ => return 0,
+            };
+            match func.call(&mut store, &[Value::I32(0), Value::I32(data_val as i32)]) {
+                Ok(ret_vals) => match ret_vals.first() {
+                    Some(Value::I32(v)) => *v as u32,
+                    Some(Value::I64(v)) => *v as u32,
+                    _ => 0,
+                },
+                Err(_) => {
+                    eprintln!("[callback trampoline] error calling function");
+                    0
+                },
+            }
+        }
+    })
+}
 
 // ============================================================
 // C++ bridge FFI declarations (from napi_bridge_init.cc)
@@ -157,6 +211,26 @@ unsafe extern "C" {
     fn snapi_bridge_add_finalizer(obj_id: u32, data_val: u64, ref_out: *mut u32) -> i32;
     // Constructor
     fn snapi_bridge_new_instance(ctor_id: u32, argc: u32, argv_ids: *const u32, out_id: *mut u32) -> i32;
+    // Callback system
+    fn snapi_bridge_create_function(utf8name: *const i8, name_len: u32, reg_id: u32, out_id: *mut u32) -> i32;
+    fn snapi_bridge_alloc_cb_reg_id() -> u32;
+    fn snapi_bridge_register_callback(reg_id: u32, wasm_fn_ptr: u32, data_val: u64);
+    fn snapi_bridge_get_cb_info(argc_ptr: *mut u32, argv_out: *mut u32, max_argv: u32, this_out: *mut u32, data_out: *mut u64) -> i32;
+    fn snapi_bridge_get_new_target(out_id: *mut u32) -> i32;
+    // napi_define_class
+    fn snapi_bridge_define_class(
+        utf8name: *const i8, name_len: u32,
+        ctor_reg_id: u32,
+        prop_count: u32,
+        prop_names: *const *const i8,
+        prop_types: *const u32,
+        prop_value_ids: *const u32,
+        prop_method_reg_ids: *const u32,
+        prop_getter_reg_ids: *const u32,
+        prop_setter_reg_ids: *const u32,
+        prop_attributes: *const i32,
+        out_id: *mut u32,
+    ) -> i32;
     // Cleanup
     #[allow(dead_code)]
     fn snapi_bridge_dispose();
@@ -169,6 +243,7 @@ unsafe extern "C" {
 struct RuntimeEnv {
     memory: Option<Memory>,
     malloc_fn: Option<TypedFunction<i32, i32>>,
+    table: Option<Table>,
     /// Maps value handle IDs to their guest-memory data pointers.
     /// Used for buffers/arraybuffers backed by guest linear memory,
     /// since V8 sandbox remaps external ArrayBuffer pointers.
@@ -1039,17 +1114,301 @@ fn guest_napi_call_function(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, recv: 
     } else {
         vec![]
     };
+
+    // All function calls go through V8. If the function was created by
+    // napi_create_function, V8 will invoke generic_wasm_callback which
+    // calls snapi_host_invoke_wasm_callback (Rust trampoline) → WASM dispatcher.
+    // We set CB_ENV_PTR so the trampoline can access the WASM store.
+    let env_ptr: *mut () = &mut env as *mut FunctionEnvMut<'_, RuntimeEnv> as *mut ();
+    CB_ENV_PTR.with(|cell| cell.set(env_ptr));
+
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_call_function(recv as u32, func as u32, argc_u, argv_ids.as_ptr(), &mut out) };
+
+    CB_ENV_PTR.with(|cell| cell.set(std::ptr::null_mut()));
+
     if s == 0 { write_guest_u32(&mut env, rp as u32, out); }
     s
+}
+
+// --- napi_create_function ---
+
+fn guest_napi_create_function(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, name_ptr: i32, name_len: i32, cb: i32, data: i32, rp: i32) -> i32 {
+    // Read function name
+    let wl = name_len as u32;
+    let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
+        // NAPI_AUTO_LENGTH: read null-terminated string
+        read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
+    } else if wl > 0 && name_ptr != 0 {
+        let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else { return 1; };
+        bytes
+    } else {
+        vec![]
+    };
+
+    // Allocate a registration ID in the C++ callback registry
+    let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id() };
+
+    // Register the WASM callback and data pointer in the C++ registry
+    unsafe { snapi_bridge_register_callback(reg_id, cb as u32, data as u64) };
+
+    // Create a JS function in V8 with generic_wasm_callback as its native callback.
+    // The reg_id is stored as the function's data pointer so generic_wasm_callback
+    // can look up which WASM function to invoke.
+    let c_name = CString::new(name_bytes).unwrap_or_default();
+    let mut out: u32 = 0;
+    let s = unsafe { snapi_bridge_create_function(c_name.as_ptr(), wl, reg_id, &mut out) };
+    if s != 0 { return s; }
+
+    write_guest_u32(&mut env, rp as u32, out);
+    0
+}
+
+// --- napi_get_cb_info ---
+
+fn guest_napi_get_cb_info(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, _cbinfo: i32, argc_ptr: i32, argv_ptr: i32, this_ptr: i32, data_ptr: i32) -> i32 {
+    // Read the caller's requested argc (size of their argv array)
+    let wanted: u32 = if argc_ptr > 0 {
+        let Some(bytes) = read_guest_bytes(&mut env, argc_ptr, 4) else { return 1; };
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    } else {
+        0
+    };
+
+    // Query the bridge for callback context
+    let mut actual_argc: u32 = wanted;
+    let mut argv_ids = vec![0u32; wanted as usize];
+    let mut this_id: u32 = 0;
+    let mut data_val: u64 = 0;
+
+    let s = unsafe {
+        snapi_bridge_get_cb_info(
+            &mut actual_argc,
+            if wanted > 0 { argv_ids.as_mut_ptr() } else { std::ptr::null_mut() },
+            wanted,
+            &mut this_id,
+            &mut data_val,
+        )
+    };
+    if s != 0 { return s; }
+
+    // Write actual argc back
+    if argc_ptr > 0 {
+        write_guest_u32(&mut env, argc_ptr as u32, actual_argc);
+    }
+
+    // Write argv (array of handle IDs) - only write up to min(wanted, actual)
+    if argv_ptr > 0 {
+        let to_write = std::cmp::min(wanted, actual_argc);
+        for i in 0..to_write {
+            write_guest_u32(&mut env, (argv_ptr as u32) + i * 4, argv_ids[i as usize]);
+        }
+    }
+
+    // Write this_arg
+    if this_ptr > 0 {
+        write_guest_u32(&mut env, this_ptr as u32, this_id);
+    }
+
+    // Write data pointer (as a 32-bit guest pointer)
+    if data_ptr > 0 {
+        write_guest_u32(&mut env, data_ptr as u32, data_val as u32);
+    }
+
+    0
+}
+
+// --- napi_get_new_target ---
+
+fn guest_napi_get_new_target(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, _cbinfo: i32, rp: i32) -> i32 {
+    let mut out: u32 = 0;
+    let s = unsafe { snapi_bridge_get_new_target(&mut out) };
+    if s == 0 { write_guest_u32(&mut env, rp as u32, out); }
+    s
+}
+
+// --- napi_define_class ---
+// Guest layout of napi_property_descriptor (32-bit WASM, 32 bytes):
+//   offset  0: const char* utf8name     (4 bytes, guest pointer)
+//   offset  4: napi_value name          (4 bytes, handle ID)
+//   offset  8: napi_callback method     (4 bytes, fn pointer)
+//   offset 12: napi_callback getter     (4 bytes, fn pointer)
+//   offset 16: napi_callback setter     (4 bytes, fn pointer)
+//   offset 20: napi_value value         (4 bytes, handle ID)
+//   offset 24: napi_property_attributes (4 bytes, enum)
+//   offset 28: void* data               (4 bytes, guest pointer)
+const PROP_DESC_SIZE: usize = 32;
+
+fn guest_napi_define_class(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    _e: i32,
+    name_ptr: i32,
+    name_len: i32,
+    constructor: i32,
+    ctor_data: i32,
+    prop_count: i32,
+    props_ptr: i32,
+    rp: i32,
+) -> i32 {
+    // Read class name
+    let wl = name_len as u32;
+    let name_bytes: Vec<u8> = if wl == 0xFFFFFFFFu32 {
+        read_guest_c_string(&mut env, name_ptr).unwrap_or_default()
+    } else if wl > 0 && name_ptr != 0 {
+        let Some(bytes) = read_guest_bytes(&mut env, name_ptr, wl as usize) else { return 1; };
+        bytes
+    } else {
+        vec![]
+    };
+
+    // Register the constructor callback
+    let ctor_reg_id = unsafe { snapi_bridge_alloc_cb_reg_id() };
+    unsafe { snapi_bridge_register_callback(ctor_reg_id, constructor as u32, ctor_data as u64) };
+
+    let pc = prop_count as u32;
+    let c_name = CString::new(name_bytes).unwrap_or_default();
+
+    if pc == 0 {
+        // No properties — simple case
+        let mut out: u32 = 0;
+        let s = unsafe {
+            snapi_bridge_define_class(
+                c_name.as_ptr(), wl, ctor_reg_id,
+                0,
+                std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                std::ptr::null(),
+                &mut out,
+            )
+        };
+        if s != 0 { return s; }
+        write_guest_u32(&mut env, rp as u32, out);
+        return 0;
+    }
+
+    // Read property descriptors from guest memory
+    let total_bytes = pc as usize * PROP_DESC_SIZE;
+    let Some(raw) = read_guest_bytes(&mut env, props_ptr, total_bytes) else { return 1; };
+
+    let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
+    let mut prop_names_ptrs: Vec<*const i8> = Vec::with_capacity(pc as usize);
+    let mut prop_types: Vec<u32> = Vec::with_capacity(pc as usize);
+    let mut prop_value_ids: Vec<u32> = Vec::with_capacity(pc as usize);
+    let mut prop_method_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
+    let mut prop_getter_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
+    let mut prop_setter_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
+    let mut prop_attributes: Vec<i32> = Vec::with_capacity(pc as usize);
+
+    for i in 0..pc as usize {
+        let base = i * PROP_DESC_SIZE;
+        let utf8name_guest = u32::from_le_bytes([raw[base], raw[base+1], raw[base+2], raw[base+3]]);
+        let _name_id    = u32::from_le_bytes([raw[base+4], raw[base+5], raw[base+6], raw[base+7]]);
+        let method_ptr  = u32::from_le_bytes([raw[base+8], raw[base+9], raw[base+10], raw[base+11]]);
+        let getter_ptr  = u32::from_le_bytes([raw[base+12], raw[base+13], raw[base+14], raw[base+15]]);
+        let setter_ptr  = u32::from_le_bytes([raw[base+16], raw[base+17], raw[base+18], raw[base+19]]);
+        let value_id    = u32::from_le_bytes([raw[base+20], raw[base+21], raw[base+22], raw[base+23]]);
+        let attrs       = i32::from_le_bytes([raw[base+24], raw[base+25], raw[base+26], raw[base+27]]);
+        let data_ptr    = u32::from_le_bytes([raw[base+28], raw[base+29], raw[base+30], raw[base+31]]);
+
+        // Read property name
+        let pname = if utf8name_guest != 0 {
+            read_guest_c_string(&mut env, utf8name_guest as i32).unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let c_pname = CString::new(pname).unwrap_or_default();
+
+        // Determine property type and register callbacks as needed
+        if method_ptr != 0 {
+            // Method property
+            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id() };
+            unsafe { snapi_bridge_register_callback(reg_id, method_ptr, data_ptr as u64) };
+            prop_types.push(1);
+            prop_value_ids.push(0);
+            prop_method_reg_ids.push(reg_id);
+            prop_getter_reg_ids.push(0);
+            prop_setter_reg_ids.push(0);
+        } else if getter_ptr != 0 && setter_ptr != 0 {
+            // Getter + Setter
+            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id() };
+            unsafe { snapi_bridge_register_callback(reg_id, getter_ptr, data_ptr as u64) };
+            // Note: N-API shares the data pointer between getter and setter,
+            // so we use the same reg_id for both (getter takes precedence)
+            prop_types.push(4);
+            prop_value_ids.push(0);
+            prop_method_reg_ids.push(0);
+            prop_getter_reg_ids.push(reg_id);
+            let setter_reg_id = unsafe { snapi_bridge_alloc_cb_reg_id() };
+            unsafe { snapi_bridge_register_callback(setter_reg_id, setter_ptr, data_ptr as u64) };
+            prop_setter_reg_ids.push(setter_reg_id);
+        } else if getter_ptr != 0 {
+            // Getter only
+            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id() };
+            unsafe { snapi_bridge_register_callback(reg_id, getter_ptr, data_ptr as u64) };
+            prop_types.push(2);
+            prop_value_ids.push(0);
+            prop_method_reg_ids.push(0);
+            prop_getter_reg_ids.push(reg_id);
+            prop_setter_reg_ids.push(0);
+        } else if setter_ptr != 0 {
+            // Setter only
+            let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id() };
+            unsafe { snapi_bridge_register_callback(reg_id, setter_ptr, data_ptr as u64) };
+            prop_types.push(3);
+            prop_value_ids.push(0);
+            prop_method_reg_ids.push(0);
+            prop_getter_reg_ids.push(0);
+            prop_setter_reg_ids.push(reg_id);
+        } else {
+            // Value property
+            prop_types.push(0);
+            prop_value_ids.push(value_id);
+            prop_method_reg_ids.push(0);
+            prop_getter_reg_ids.push(0);
+            prop_setter_reg_ids.push(0);
+        }
+
+        prop_attributes.push(attrs);
+        prop_names_c.push(c_pname);
+    }
+
+    // Build pointer array (must live as long as the FFI call)
+    for cn in &prop_names_c {
+        prop_names_ptrs.push(cn.as_ptr());
+    }
+
+    let mut out: u32 = 0;
+    let s = unsafe {
+        snapi_bridge_define_class(
+            c_name.as_ptr(), wl, ctor_reg_id,
+            pc,
+            prop_names_ptrs.as_ptr(),
+            prop_types.as_ptr(),
+            prop_value_ids.as_ptr(),
+            prop_method_reg_ids.as_ptr(),
+            prop_getter_reg_ids.as_ptr(),
+            prop_setter_reg_ids.as_ptr(),
+            prop_attributes.as_ptr(),
+            &mut out,
+        )
+    };
+    if s != 0 { return s; }
+    write_guest_u32(&mut env, rp as u32, out);
+    0
 }
 
 // --- Script execution ---
 
 fn guest_napi_run_script(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, sh: i32, rp: i32) -> i32 {
+    // Set CB_ENV_PTR so scripts that trigger callbacks can trampoline back to WASM
+    let env_ptr: *mut () = &mut env as *mut FunctionEnvMut<'_, RuntimeEnv> as *mut ();
+    CB_ENV_PTR.with(|cell| cell.set(env_ptr));
+
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_run_script(sh as u32, &mut out) };
+
+    CB_ENV_PTR.with(|cell| cell.set(std::ptr::null_mut()));
+
     if s == 0 { write_guest_u32(&mut env, rp as u32, out); }
     s
 }
@@ -1401,8 +1760,16 @@ fn guest_napi_new_instance(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, ctor: i
     } else {
         vec![]
     };
+
+    // Set CB_ENV_PTR so constructor callbacks can trampoline back to WASM
+    let env_ptr: *mut () = &mut env as *mut FunctionEnvMut<'_, RuntimeEnv> as *mut ();
+    CB_ENV_PTR.with(|cell| cell.set(env_ptr));
+
     let mut out: u32 = 0;
     let s = unsafe { snapi_bridge_new_instance(ctor as u32, argc_u, argv_ids.as_ptr(), &mut out) };
+
+    CB_ENV_PTR.with(|cell| cell.set(std::ptr::null_mut()));
+
     if s == 0 { write_guest_u32(&mut env, rp as u32, out); }
     s
 }
@@ -1555,6 +1922,9 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
     reg!("napi_check_object_type_tag", guest_napi_check_object_type_tag);
     // Function calling
     reg!("napi_call_function", guest_napi_call_function);
+    reg!("napi_create_function", guest_napi_create_function);
+    reg!("napi_get_cb_info", guest_napi_get_cb_info);
+    reg!("napi_get_new_target", guest_napi_get_new_target);
     // Script execution
     reg!("napi_run_script", guest_napi_run_script);
     // UTF-16 strings
@@ -1579,8 +1949,9 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
     reg!("napi_unwrap", guest_napi_unwrap);
     reg!("napi_remove_wrap", guest_napi_remove_wrap);
     reg!("napi_add_finalizer", guest_napi_add_finalizer);
-    // Constructor
+    // Constructor / Class
     reg!("napi_new_instance", guest_napi_new_instance);
+    reg!("napi_define_class", guest_napi_define_class);
     // Fatal error
     reg!("napi_fatal_error", guest_napi_fatal_error);
     // Misc
@@ -1614,6 +1985,7 @@ pub fn run_wasm_main_i32(wasm_path: &Path) -> Result<i32> {
     let func_env = FunctionEnv::new(&mut store, RuntimeEnv {
         memory: Some(memory.clone()),
         malloc_fn: None,
+        table: None,
         guest_data_ptrs: std::collections::HashMap::new(),
     });
 
@@ -1679,6 +2051,7 @@ pub fn run_wasix_main_capture_stdout(wasm_path: &Path, args: &[&str]) -> Result<
         let func_env = FunctionEnv::new(&mut store, RuntimeEnv {
             memory: Some(memory),
             malloc_fn: None,
+            table: None,
             guest_data_ptrs: std::collections::HashMap::new(),
         });
         register_napi_imports(&mut store, &func_env, &mut import_object);
@@ -1690,6 +2063,8 @@ pub fn run_wasix_main_capture_stdout(wasm_path: &Path, args: &[&str]) -> Result<
         if let Ok(malloc) = instance.exports.get_typed_function::<i32, i32>(&store, "malloc") {
             func_env.as_mut(&mut store).malloc_fn = Some(malloc);
         }
+
+        func_env.as_mut(&mut store).table = instance.exports.get_table("__indirect_function_table").ok().cloned();
 
         wasi_env
             .initialize(&mut store, instance.clone())

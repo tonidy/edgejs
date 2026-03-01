@@ -1395,6 +1395,228 @@ extern "C" int snapi_bridge_define_properties(uint32_t obj_id,
   return napi_define_properties(g_env, obj, prop_count, descs.data());
 }
 
+// Forward declaration (defined below in callback system section)
+static napi_value generic_wasm_callback(napi_env env, napi_callback_info info);
+
+// ============================================================
+// napi_define_class
+// ============================================================
+
+// Property descriptor layout passed from Rust:
+// For each property (i), we pass:
+//   utf8names[i]   - property name (C string)
+//   types[i]       - 0=value, 1=method, 2=getter, 3=setter, 4=getter+setter
+//   value_ids[i]   - if type==0, the value handle ID
+//   method_reg_ids[i]  - if type==1, the callback reg_id for the method
+//   getter_reg_ids[i]  - if type==2 or 4, the callback reg_id for getter
+//   setter_reg_ids[i]  - if type==3 or 4, the callback reg_id for setter
+//   attributes[i]  - napi_property_attributes
+
+extern "C" int snapi_bridge_define_class(
+    const char* utf8name, uint32_t name_len,
+    uint32_t ctor_reg_id,
+    uint32_t prop_count,
+    const char** prop_names,
+    const uint32_t* prop_types,
+    const uint32_t* prop_value_ids,
+    const uint32_t* prop_method_reg_ids,
+    const uint32_t* prop_getter_reg_ids,
+    const uint32_t* prop_setter_reg_ids,
+    const int32_t* prop_attributes,
+    uint32_t* out_id) {
+
+  // Build property descriptors
+  std::vector<napi_property_descriptor> descs(prop_count);
+  for (uint32_t i = 0; i < prop_count; i++) {
+    memset(&descs[i], 0, sizeof(napi_property_descriptor));
+    descs[i].utf8name = prop_names[i];
+    descs[i].attributes = (napi_property_attributes)prop_attributes[i];
+
+    switch (prop_types[i]) {
+      case 0: // value
+        descs[i].value = LoadValue(prop_value_ids[i]);
+        break;
+      case 1: // method
+        descs[i].method = generic_wasm_callback;
+        descs[i].data = (void*)(uintptr_t)prop_method_reg_ids[i];
+        break;
+      case 2: // getter only
+        descs[i].getter = generic_wasm_callback;
+        descs[i].data = (void*)(uintptr_t)prop_getter_reg_ids[i];
+        break;
+      case 3: // setter only
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data = (void*)(uintptr_t)prop_setter_reg_ids[i];
+        break;
+      case 4: // getter + setter
+        descs[i].getter = generic_wasm_callback;
+        descs[i].setter = generic_wasm_callback;
+        descs[i].data = (void*)(uintptr_t)prop_getter_reg_ids[i];
+        // Note: N-API uses the same data pointer for both getter and setter.
+        // The setter_reg_id is stored in the getter_reg_id for now.
+        break;
+    }
+  }
+
+  napi_value result;
+  napi_status s = napi_define_class(
+      g_env, utf8name,
+      name_len == 0xFFFFFFFFu ? NAPI_AUTO_LENGTH : (size_t)name_len,
+      generic_wasm_callback,
+      (void*)(uintptr_t)ctor_reg_id,
+      prop_count, descs.data(),
+      &result);
+  if (s != napi_ok) return s;
+  *out_id = StoreValue(result);
+  return napi_ok;
+}
+
+// ============================================================
+// Callback system (napi_create_function + napi_get_cb_info)
+// ============================================================
+
+// ---- Callback context stack (supports re-entrant / nested callbacks) ----
+struct CbContext {
+  uint32_t this_id;
+  uint32_t argc;
+  uint32_t argv_ids[64];
+  uint64_t data_val;
+  napi_callback_info original_info;  // For napi_get_new_target
+};
+static std::vector<CbContext> g_cb_stack;
+
+extern "C" void snapi_bridge_set_cb_context(uint32_t this_id, uint32_t argc,
+                                            const uint32_t* argv_ids,
+                                            uint64_t data_val) {
+  CbContext ctx;
+  ctx.this_id = this_id;
+  ctx.argc = argc;
+  for (uint32_t i = 0; i < argc && i < 64; i++) ctx.argv_ids[i] = argv_ids[i];
+  ctx.data_val = data_val;
+  ctx.original_info = nullptr;
+  g_cb_stack.push_back(ctx);
+}
+
+extern "C" void snapi_bridge_clear_cb_context() {
+  if (!g_cb_stack.empty()) g_cb_stack.pop_back();
+}
+
+extern "C" int snapi_bridge_get_cb_info(uint32_t* argc_ptr, uint32_t* argv_out,
+                                        uint32_t max_argv,
+                                        uint32_t* this_out, uint64_t* data_out) {
+  if (g_cb_stack.empty()) return napi_generic_failure;
+  const CbContext& ctx = g_cb_stack.back();
+  uint32_t actual = ctx.argc;
+  uint32_t wanted = *argc_ptr;
+  *argc_ptr = actual;
+  if (this_out) *this_out = ctx.this_id;
+  if (data_out) *data_out = ctx.data_val;
+  uint32_t to_copy = (wanted < actual) ? wanted : actual;
+  if (argv_out) {
+    for (uint32_t i = 0; i < to_copy; i++) argv_out[i] = ctx.argv_ids[i];
+  }
+  return napi_ok;
+}
+
+// napi_get_new_target — only valid inside a constructor callback
+extern "C" int snapi_bridge_get_new_target(uint32_t* out_id) {
+  if (g_cb_stack.empty()) return napi_generic_failure;
+  const CbContext& ctx = g_cb_stack.back();
+  if (!ctx.original_info) {
+    // Not inside a V8-triggered callback (shouldn't happen with trampoline)
+    *out_id = 0;
+    return napi_ok;
+  }
+  napi_value result;
+  napi_status s = napi_get_new_target(g_env, ctx.original_info, &result);
+  if (s != napi_ok) return s;
+  *out_id = result ? StoreValue(result) : 0;
+  return napi_ok;
+}
+
+// ---- Callback registry and V8 trampoline ----
+// Each registered callback maps reg_id → (wasm_fn_ptr, data_val).
+struct CbRegistration {
+  uint32_t wasm_fn_ptr;
+  uint64_t data_val;
+};
+static std::unordered_map<uint32_t, CbRegistration> g_cb_registry;
+static uint32_t g_next_cb_reg_id = 1;
+
+// Forward-declare the Rust trampoline (defined in lib.rs via #[no_mangle] extern "C")
+extern "C" uint32_t snapi_host_invoke_wasm_callback(uint32_t wasm_fn_ptr, uint64_t data_val);
+
+// Generic C++ callback invoked by V8 for all napi_create_function functions.
+// Stores the V8 call args in the context stack, then calls the Rust trampoline
+// which dispatches to the WASM callback.
+static napi_value generic_wasm_callback(napi_env env, napi_callback_info info) {
+  void* raw_data;
+  size_t argc = 64;
+  napi_value argv[64];
+  napi_value this_arg;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, &raw_data);
+
+  uint32_t reg_id = (uint32_t)(uintptr_t)raw_data;
+  auto it = g_cb_registry.find(reg_id);
+  if (it == g_cb_registry.end()) {
+    napi_value undef;
+    napi_get_undefined(env, &undef);
+    return undef;
+  }
+
+  // Push context onto stack
+  CbContext ctx;
+  ctx.this_id = StoreValue(this_arg);
+  ctx.argc = (uint32_t)argc;
+  for (uint32_t i = 0; i < argc && i < 64; i++) {
+    ctx.argv_ids[i] = StoreValue(argv[i]);
+  }
+  ctx.data_val = it->second.data_val;
+  ctx.original_info = info;  // Store for napi_get_new_target
+  g_cb_stack.push_back(ctx);
+
+  // Call Rust trampoline → WASM callback
+  uint32_t result_id = snapi_host_invoke_wasm_callback(
+      it->second.wasm_fn_ptr, it->second.data_val);
+
+  g_cb_stack.pop_back();
+
+  napi_value result = LoadValue(result_id);
+  if (!result) {
+    napi_get_undefined(env, &result);
+  }
+  return result;
+}
+
+// Allocate a registration ID for a new callback
+extern "C" uint32_t snapi_bridge_alloc_cb_reg_id() {
+  return g_next_cb_reg_id++;
+}
+
+// Register callback data for a registration ID
+extern "C" void snapi_bridge_register_callback(uint32_t reg_id,
+                                               uint32_t wasm_fn_ptr,
+                                               uint64_t data_val) {
+  g_cb_registry[reg_id] = { wasm_fn_ptr, data_val };
+}
+
+// Create a JS function with generic_wasm_callback as its native callback.
+// The reg_id is passed as the data pointer so the callback can look up
+// which WASM function to invoke.
+extern "C" int snapi_bridge_create_function(const char* utf8name, uint32_t name_len,
+                                            uint32_t reg_id,
+                                            uint32_t* out_id) {
+  napi_value result;
+  napi_status s = napi_create_function(g_env, utf8name,
+                                       name_len == 0xFFFFFFFFu ? NAPI_AUTO_LENGTH : (size_t)name_len,
+                                       generic_wasm_callback,
+                                       (void*)(uintptr_t)reg_id,
+                                       &result);
+  if (s != napi_ok) return s;
+  *out_id = StoreValue(result);
+  return napi_ok;
+}
+
 // ============================================================
 // Cleanup
 // ============================================================
