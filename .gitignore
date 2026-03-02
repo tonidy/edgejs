@@ -8,3 +8,4 @@
 /napi/target
 /napi/wasmer/target
 /napi/cmake
+v8-*.tar.xz

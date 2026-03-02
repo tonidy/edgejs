@@ -7,7 +7,7 @@ set(UNODE_CTEST_RESOURCE_LOCK_BUCKETS "24" CACHE STRING
 set(UNODE_CTEST_RESOURCE_LOCK_PREFIX "unode_gtest_slot" CACHE STRING
     "Prefix used for generated CTest RESOURCE_LOCK buckets.")
 
-if(NAPI_V8_V8_LIBRARY)
+if(NAPI_V8_LIBRARY)
   add_library(unode_gtest STATIC
     "${NAPI_V8_GTEST_ROOT}/src/gtest-all.cc"
     "${NAPI_V8_GTEST_ROOT}/src/gtest_main.cc"
@@ -46,8 +46,8 @@ if(NAPI_V8_V8_LIBRARY)
         PROJECT_ROOT_PATH="${PROJECT_ROOT}"
         NAPI_V8_ROOT_PATH="${UNODE_ROOT}"
     )
-    if(NAPI_V8_V8_DEFINES)
-      target_compile_definitions(${target_name} PRIVATE ${NAPI_V8_V8_DEFINES})
+    if(NAPI_V8_DEFINES)
+      target_compile_definitions(${target_name} PRIVATE ${NAPI_V8_DEFINES})
     endif()
     # Keep a stable path to the generated CTest manifest for this target.
     set(_gtest_tests_manifest "${CMAKE_CURRENT_BINARY_DIR}/${target_name}[1]_tests.cmake")
@@ -85,5 +85,5 @@ if(NAPI_V8_V8_LIBRARY)
     "${UNODE_ROOT}/tests/runners/test_3_node_dropin_subset_phase02.cc"
   )
 else()
-  message(STATUS "Skipping unode node-api tests: set NAPI_V8_V8_LIBRARY for napi-v8 runtime linkage")
+  message(STATUS "Skipping unode node-api tests: set NAPI_V8_LIBRARY for napi-v8 runtime linkage")
 endif()

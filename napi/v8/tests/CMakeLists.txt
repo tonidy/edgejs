@@ -1,26 +1,22 @@
-set(NAPI_V8_V8_MONOLITH_LIB_DEFAULT "")
-if(DEFINED ENV{NAPI_V8_V8_LIBRARY})
-  set(NAPI_V8_V8_MONOLITH_LIB_DEFAULT "$ENV{NAPI_V8_V8_LIBRARY}")
-elseif(DEFINED ENV{NAPI_V8_V8_MONOLITH_LIB})
-  set(NAPI_V8_V8_MONOLITH_LIB_DEFAULT "$ENV{NAPI_V8_V8_MONOLITH_LIB}")
+if(NOT NAPI_V8_INCLUDE_DIR AND NAPI_V8_V8_INCLUDE_DIR)
+  set(NAPI_V8_INCLUDE_DIR "${NAPI_V8_V8_INCLUDE_DIR}")
 endif()
-set(NAPI_V8_V8_MONOLITH_LIB
-  "${NAPI_V8_V8_MONOLITH_LIB_DEFAULT}"
-  CACHE FILEPATH "Path to V8 runtime library (monolith or dylib)"
-)
-set(NAPI_V8_V8_EXTRA_LIBS_DEFAULT "")
-if(DEFINED ENV{NAPI_V8_V8_EXTRA_LIBS})
-  set(NAPI_V8_V8_EXTRA_LIBS_DEFAULT "$ENV{NAPI_V8_V8_EXTRA_LIBS}")
+if(NOT NAPI_V8_LIBRARY AND NAPI_V8_V8_LIBRARY)
+  set(NAPI_V8_LIBRARY "${NAPI_V8_V8_LIBRARY}")
+elseif(NOT NAPI_V8_LIBRARY AND NAPI_V8_V8_MONOLITH_LIB)
+  set(NAPI_V8_LIBRARY "${NAPI_V8_V8_MONOLITH_LIB}")
 endif()
-set(NAPI_V8_V8_EXTRA_LIBS
-  "${NAPI_V8_V8_EXTRA_LIBS_DEFAULT}"
-  CACHE STRING "Semicolon-separated extra V8 libraries (e.g. libplatform/libbase)"
-)
+if(NOT NAPI_V8_EXTRA_LIBS AND NAPI_V8_V8_EXTRA_LIBS)
+  set(NAPI_V8_EXTRA_LIBS "${NAPI_V8_V8_EXTRA_LIBS}")
+endif()
+if(NOT NAPI_V8_DEFINES AND NAPI_V8_V8_DEFINES)
+  set(NAPI_V8_DEFINES "${NAPI_V8_V8_DEFINES}")
+endif()
 set(NAPI_V8_GTEST_ROOT "${PROJECT_ROOT}/deps/googletest")
 include(GoogleTest)
 option(NAPI_V8_BUILD_NODE_API_TESTS "Build node-api fixture tests in napi-v8" OFF)
 
-if(NAPI_V8_V8_MONOLITH_LIB)
+if(NAPI_V8_LIBRARY)
   add_library(napi_v8_gtest STATIC
     "${NAPI_V8_GTEST_ROOT}/src/gtest-all.cc"
     "${NAPI_V8_GTEST_ROOT}/src/gtest_main.cc"
@@ -34,7 +30,7 @@ if(NAPI_V8_V8_MONOLITH_LIB)
       "${NAPI_TESTS_ROOT}/node-api"
       "${CMAKE_CURRENT_SOURCE_DIR}/runners"
       "${NAPI_INCLUDE_ROOT}"
-      "${NAPI_V8_V8_INCLUDE_DIR}"
+      "${NAPI_V8_INCLUDE_DIR}"
   )
 
   function(add_fixture_test target_name)
@@ -52,13 +48,13 @@ if(NAPI_V8_V8_MONOLITH_LIB)
         "${NAPI_TESTS_ROOT}/node-api"
         "${CMAKE_CURRENT_SOURCE_DIR}/runners"
         "${NAPI_INCLUDE_ROOT}"
-        "${NAPI_V8_V8_INCLUDE_DIR}"
+        "${NAPI_V8_INCLUDE_DIR}"
     )
     target_link_libraries(${target_name}
       PRIVATE
         napi_v8_gtest
         napi_v8
-        "${NAPI_V8_V8_MONOLITH_LIB}"
+        "${NAPI_V8_LIBRARY}"
     )
     target_compile_definitions(${target_name}
       PRIVATE
@@ -71,16 +67,16 @@ if(NAPI_V8_V8_MONOLITH_LIB)
         "-DNAPI_MODULE(modname,regfunc)="
         "-DNODE_GYP_MODULE_NAME=napi_test_module"
     )
-    if(NAPI_V8_V8_DEFINES)
-      target_compile_definitions(${target_name} PRIVATE ${NAPI_V8_V8_DEFINES})
+    if(NAPI_V8_DEFINES)
+      target_compile_definitions(${target_name} PRIVATE ${NAPI_V8_DEFINES})
     endif()
-    if(NAPI_V8_V8_EXTRA_LIBS)
-      target_link_libraries(${target_name} PRIVATE ${NAPI_V8_V8_EXTRA_LIBS})
+    if(NAPI_V8_EXTRA_LIBS)
+      target_link_libraries(${target_name} PRIVATE ${NAPI_V8_EXTRA_LIBS})
     endif()
-    get_filename_component(NAPI_V8_V8_LIB_DIR "${NAPI_V8_V8_MONOLITH_LIB}" DIRECTORY)
+    get_filename_component(NAPI_V8_LIB_DIR "${NAPI_V8_LIBRARY}" DIRECTORY)
     set_target_properties(${target_name} PROPERTIES
-      BUILD_RPATH "${NAPI_V8_V8_LIB_DIR}"
-      INSTALL_RPATH "${NAPI_V8_V8_LIB_DIR}"
+      BUILD_RPATH "${NAPI_V8_LIB_DIR}"
+      INSTALL_RPATH "${NAPI_V8_LIB_DIR}"
     )
     gtest_discover_tests(
       ${target_name}
@@ -372,5 +368,5 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     ${NAPI_TESTS_ROOT}/node-api/test_worker_terminate_finalization/test_worker_terminate_finalization.c
   )
 else()
-  message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
+  message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_LIBRARY to link V8 runtime")
 endif()

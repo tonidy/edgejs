@@ -76,3 +76,20 @@ Exit criteria:
 
 - Initial implementation references Node's existing N-API files and their dependencies.
 - This README focuses on goals and direction; implementation docs can be added as the codebase grows.
+
+## V8 Build Modes
+
+`napi/v8` and `unode` support deterministic V8 resolution through:
+
+- `NAPI_V8_BUILD_METHOD=prebuilt` (default)
+- `NAPI_V8_BUILD_METHOD=source`
+- `NAPI_V8_BUILD_METHOD=local`
+
+Canonical configuration variables:
+
+- `NAPI_V8_INCLUDE_DIR`
+- `NAPI_V8_LIBRARY`
+- `NAPI_V8_EXTRA_LIBS`
+- `NAPI_V8_DEFINES`
+
+Compatibility aliases (`NAPI_V8_V8_*`) are still accepted during migration.

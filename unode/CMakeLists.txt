@@ -187,8 +187,8 @@ if(UNODE_BUILD_CLI)
     PRIVATE
       unode_cli
   )
-  if(NAPI_V8_V8_DEFINES)
-    target_compile_definitions(unode PRIVATE ${NAPI_V8_V8_DEFINES})
+  if(NAPI_V8_DEFINES)
+    target_compile_definitions(unode PRIVATE ${NAPI_V8_DEFINES})
   endif()
   if(UNODE_ALLOW_UNDEFINED_IMPORTS)
     target_link_options(unode PRIVATE
