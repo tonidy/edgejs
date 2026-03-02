@@ -106,7 +106,7 @@ jobs:
           tar -xJf "$V8_ROOT/${ASSET}" -C "$V8_ROOT"
 
           # napi/wasmer links dynamic V8 libs.
-          clang++ -dynamiclib \
+          /usr/bin/clang++ -dynamiclib \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-all_load "$V8_ROOT/lib/libv8.a" \
             -framework CoreFoundation \
@@ -114,11 +114,11 @@ jobs:
           cat > "$V8_ROOT/lib/v8_libplatform_stub.cc" <<'EOF'
           extern "C" void __dummy_v8_libplatform() {}
           EOF
-          clang++ -dynamiclib "$V8_ROOT/lib/v8_libplatform_stub.cc" -o "$V8_ROOT/lib/libv8_libplatform.dylib"
+          /usr/bin/clang++ -dynamiclib "$V8_ROOT/lib/v8_libplatform_stub.cc" -o "$V8_ROOT/lib/libv8_libplatform.dylib"
           cat > "$V8_ROOT/lib/v8_libbase_stub.cc" <<'EOF'
           extern "C" void __dummy_v8_libbase() {}
           EOF
-          clang++ -dynamiclib "$V8_ROOT/lib/v8_libbase_stub.cc" -o "$V8_ROOT/lib/libv8_libbase.dylib"
+          /usr/bin/clang++ -dynamiclib "$V8_ROOT/lib/v8_libbase_stub.cc" -o "$V8_ROOT/lib/libv8_libbase.dylib"
 
           echo "V8_INCLUDE_DIR=$V8_ROOT/include" >> "$GITHUB_ENV"
           echo "V8_LIB_DIR=$V8_ROOT/lib" >> "$GITHUB_ENV"
