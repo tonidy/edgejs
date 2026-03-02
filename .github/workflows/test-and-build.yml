@@ -13,8 +13,24 @@ jobs:
       NAPI_V8_BUILD_METHOD: prebuilt
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure googletest dependency exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "deps/googletest/src/gtest-all.cc" ]]; then
+            exit 0
+          fi
+          echo "deps/googletest missing, bootstrapping from upstream..."
+          rm -rf /tmp/googletest
+          git clone --depth 1 https://github.com/google/googletest.git /tmp/googletest
+          rm -rf deps/googletest
+          mkdir -p deps/googletest
+          cp -R /tmp/googletest/googletest/. deps/googletest/
 
       - name: Setup Prebuilt V8 For Wasmer
         shell: bash
@@ -47,7 +63,7 @@ jobs:
 
       - name: Validate public N-API headers stay V8-agnostic
         run: |
-          ! rg -n "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
+          ! grep -nE "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
 
       - name: Build napi-v8
         run: cmake -S napi/v8 -B napi/v8/build
@@ -102,8 +118,24 @@ jobs:
       NAPI_V8_BUILD_METHOD: prebuilt
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure googletest dependency exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "deps/googletest/src/gtest-all.cc" ]]; then
+            exit 0
+          fi
+          echo "deps/googletest missing, bootstrapping from upstream..."
+          rm -rf /tmp/googletest
+          git clone --depth 1 https://github.com/google/googletest.git /tmp/googletest
+          rm -rf deps/googletest
+          mkdir -p deps/googletest
+          cp -R /tmp/googletest/googletest/. deps/googletest/
 
       - name: Setup Prebuilt V8 For Wasmer
         shell: bash
@@ -137,7 +169,7 @@ jobs:
 
       - name: Validate public N-API headers stay V8-agnostic
         run: |
-          ! rg -n "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
+          ! grep -nE "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
 
       - name: Build napi-v8
         run: cmake -S napi/v8 -B napi/v8/build
