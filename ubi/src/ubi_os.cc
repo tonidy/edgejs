@@ -320,8 +320,21 @@ napi_value BindingGetInterfaceAddresses(napi_env env, napi_callback_info info) {
 
 #ifdef DUMMY_UV_STUBS
   napi_value out = nullptr;
-  if (napi_create_array_with_length(env, static_cast<size_t>(count) * 7, &out) != napi_ok || out == nullptr) {
+  if (napi_create_array_with_length(env, 7, &out) != napi_ok || out == nullptr) {
     return nullptr;
+  }
+  uint32_t i = 0;
+  SetElementString(env, out, i++, "lo");
+  SetElementString(env, out, i++, "127.0.0.1");
+  SetElementString(env, out, i++, "255.0.0.0");
+  SetElementString(env, out, i++, "IPv4");
+  SetElementString(env, out, i++, "00:00:00:00:00:00");
+  SetElementBool(env, out, i++, true);
+  napi_value scope = nullptr;
+  if (napi_create_int32(env, -1, &scope) == napi_ok && scope != nullptr) {
+    napi_set_element(env, out, i++, scope);
+  } else {
+    i++;
   }
 #else
   const int err = uv_interface_addresses(&interfaces, &count);
