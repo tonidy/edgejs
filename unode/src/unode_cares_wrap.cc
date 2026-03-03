@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <uv.h>
@@ -23,6 +25,10 @@ struct CaresReqWrap {
   uv_getnameinfo_t gn{};
   bool used_ga = false;
   bool used_gn = false;
+  bool in_flight = false;
+  bool pinned_ref = false;
+  bool finalized = false;
+  bool orphaned = false;
   std::string hostname;
 };
 
@@ -33,6 +39,67 @@ struct ChannelWrap {
   std::string local_ipv6;
   bool query_in_flight = false;
 };
+
+std::unordered_map<napi_env, std::unordered_set<CaresReqWrap*>> g_pending_reqs_by_env;
+std::unordered_set<napi_env> g_cleanup_hook_registered;
+
+void UntrackPendingReq(CaresReqWrap* req) {
+  if (req == nullptr || req->env == nullptr) return;
+  auto it = g_pending_reqs_by_env.find(req->env);
+  if (it == g_pending_reqs_by_env.end()) return;
+  it->second.erase(req);
+  if (it->second.empty()) {
+    g_pending_reqs_by_env.erase(it);
+  }
+}
+
+void MarkReqComplete(CaresReqWrap* req) {
+  if (req == nullptr) return;
+  req->in_flight = false;
+  req->used_ga = false;
+  req->used_gn = false;
+}
+
+void OnCaresEnvCleanup(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  auto it = g_pending_reqs_by_env.find(env);
+  if (it == g_pending_reqs_by_env.end()) {
+    g_cleanup_hook_registered.erase(env);
+    return;
+  }
+
+  for (CaresReqWrap* req : it->second) {
+    if (req == nullptr) continue;
+    req->orphaned = true;
+    req->finalized = true;
+    if (req->used_ga) {
+      (void)uv_cancel(reinterpret_cast<uv_req_t*>(&req->ga));
+    }
+    if (req->used_gn) {
+      (void)uv_cancel(reinterpret_cast<uv_req_t*>(&req->gn));
+    }
+    if (req->pinned_ref && req->req_obj_ref != nullptr) {
+      uint32_t ref_count = 0;
+      (void)napi_reference_unref(env, req->req_obj_ref, &ref_count);
+      req->pinned_ref = false;
+    }
+    req->env = nullptr;
+  }
+
+  g_pending_reqs_by_env.erase(it);
+  g_cleanup_hook_registered.erase(env);
+}
+
+void TrackPendingReq(napi_env env, CaresReqWrap* req) {
+  if (env == nullptr || req == nullptr) return;
+  auto [it, inserted] = g_cleanup_hook_registered.emplace(env);
+  if (inserted) {
+    if (napi_add_env_cleanup_hook(env, OnCaresEnvCleanup, env) != napi_ok) {
+      g_cleanup_hook_registered.erase(it);
+    }
+  }
+  g_pending_reqs_by_env[env].insert(req);
+}
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
   if (ref == nullptr) return nullptr;
@@ -63,7 +130,21 @@ napi_value MakeInt32(napi_env env, int32_t v) {
 void ReqFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* req = static_cast<CaresReqWrap*>(data);
   if (!req) return;
-  if (req->req_obj_ref) napi_delete_reference(env, req->req_obj_ref);
+  req->finalized = true;
+  if (req->pinned_ref && req->req_obj_ref != nullptr) {
+    uint32_t ref_count = 0;
+    (void)napi_reference_unref(env, req->req_obj_ref, &ref_count);
+    req->pinned_ref = false;
+  }
+  if (req->req_obj_ref) {
+    napi_delete_reference(env, req->req_obj_ref);
+    req->req_obj_ref = nullptr;
+  }
+  if (req->in_flight) {
+    req->orphaned = true;
+    req->env = nullptr;
+    return;
+  }
   delete req;
 }
 
@@ -109,6 +190,13 @@ void OnGetAddrInfo(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
   auto* r = static_cast<CaresReqWrap*>(req->data);
   if (r == nullptr) return;
   napi_env env = r->env;
+  UntrackPendingReq(r);
+  MarkReqComplete(r);
+  if (env == nullptr) {
+    if (res) uv_freeaddrinfo(res);
+    if (r->orphaned || r->finalized) delete r;
+    return;
+  }
   napi_value req_obj = GetRefValue(env, r->req_obj_ref);
   napi_value status_v = MakeInt32(env, status);
 
@@ -130,13 +218,25 @@ void OnGetAddrInfo(uv_getaddrinfo_t* req, int status, struct addrinfo* res) {
   }
   napi_value argv[2] = {status_v, arr};
   InvokeOnComplete(env, req_obj, 2, argv);
+  if (r->pinned_ref && r->req_obj_ref != nullptr) {
+    uint32_t ref_count = 0;
+    (void)napi_reference_unref(env, r->req_obj_ref, &ref_count);
+    r->pinned_ref = false;
+  }
   if (res) uv_freeaddrinfo(res);
+  if (r->orphaned || r->finalized) delete r;
 }
 
 void OnGetNameInfo(uv_getnameinfo_t* req, int status, const char* hostname, const char* service) {
   auto* r = static_cast<CaresReqWrap*>(req->data);
   if (r == nullptr) return;
   napi_env env = r->env;
+  UntrackPendingReq(r);
+  MarkReqComplete(r);
+  if (env == nullptr) {
+    if (r->orphaned || r->finalized) delete r;
+    return;
+  }
   napi_value req_obj = GetRefValue(env, r->req_obj_ref);
   napi_value status_v = MakeInt32(env, status);
   napi_value host_v = nullptr;
@@ -145,6 +245,12 @@ void OnGetNameInfo(uv_getnameinfo_t* req, int status, const char* hostname, cons
   napi_create_string_utf8(env, service ? service : "", NAPI_AUTO_LENGTH, &service_v);
   napi_value argv[3] = {status_v, host_v, service_v};
   InvokeOnComplete(env, req_obj, 3, argv);
+  if (r->pinned_ref && r->req_obj_ref != nullptr) {
+    uint32_t ref_count = 0;
+    (void)napi_reference_unref(env, r->req_obj_ref, &ref_count);
+    r->pinned_ref = false;
+  }
+  if (r->orphaned || r->finalized) delete r;
 }
 
 napi_value CaresGetAddrInfo(napi_env env, napi_callback_info info) {
@@ -156,9 +262,20 @@ napi_value CaresGetAddrInfo(napi_env env, napi_callback_info info) {
   CaresReqWrap* req = nullptr;
   napi_unwrap(env, argv[0], reinterpret_cast<void**>(&req));
   if (!req) return MakeInt32(env, UV_EINVAL);
+  if (req->in_flight) return MakeInt32(env, UV_EBUSY);
   req->used_ga = true;
   req->ga.data = req;
   req->hostname = ValueToUtf8(env, argv[1]);
+  req->env = env;
+  req->in_flight = true;
+  req->orphaned = false;
+  if (req->req_obj_ref != nullptr) {
+    uint32_t ref_count = 0;
+    if (napi_reference_ref(env, req->req_obj_ref, &ref_count) == napi_ok) {
+      req->pinned_ref = true;
+    }
+  }
+  TrackPendingReq(env, req);
   int32_t family = 0;
   int32_t hints_bits = 0;
   napi_get_value_int32(env, argv[2], &family);
@@ -169,6 +286,15 @@ napi_value CaresGetAddrInfo(napi_env env, napi_callback_info info) {
   hints.ai_family = family == 4 ? AF_INET : (family == 6 ? AF_INET6 : AF_UNSPEC);
   hints.ai_flags = hints_bits;
   int rc = uv_getaddrinfo(uv_default_loop(), &req->ga, OnGetAddrInfo, req->hostname.c_str(), nullptr, &hints);
+  if (rc != 0) {
+    UntrackPendingReq(req);
+    MarkReqComplete(req);
+    if (req->pinned_ref && req->req_obj_ref != nullptr) {
+      uint32_t ref_count = 0;
+      (void)napi_reference_unref(env, req->req_obj_ref, &ref_count);
+      req->pinned_ref = false;
+    }
+  }
   return MakeInt32(env, rc);
 }
 
@@ -181,8 +307,19 @@ napi_value CaresGetNameInfo(napi_env env, napi_callback_info info) {
   CaresReqWrap* req = nullptr;
   napi_unwrap(env, argv[0], reinterpret_cast<void**>(&req));
   if (!req) return MakeInt32(env, UV_EINVAL);
+  if (req->in_flight) return MakeInt32(env, UV_EBUSY);
   req->used_gn = true;
   req->gn.data = req;
+  req->env = env;
+  req->in_flight = true;
+  req->orphaned = false;
+  if (req->req_obj_ref != nullptr) {
+    uint32_t ref_count = 0;
+    if (napi_reference_ref(env, req->req_obj_ref, &ref_count) == napi_ok) {
+      req->pinned_ref = true;
+    }
+  }
+  TrackPendingReq(env, req);
   std::string host = ValueToUtf8(env, argv[1]);
   int32_t port = 0;
   napi_get_value_int32(env, argv[2], &port);
@@ -206,6 +343,15 @@ napi_value CaresGetNameInfo(napi_env env, napi_callback_info info) {
                       OnGetNameInfo,
                       reinterpret_cast<const sockaddr*>(&storage),
                       NI_NAMEREQD);
+  if (rc != 0) {
+    UntrackPendingReq(req);
+    MarkReqComplete(req);
+    if (req->pinned_ref && req->req_obj_ref != nullptr) {
+      uint32_t ref_count = 0;
+      (void)napi_reference_unref(env, req->req_obj_ref, &ref_count);
+      req->pinned_ref = false;
+    }
+  }
   return MakeInt32(env, rc);
 }
 
