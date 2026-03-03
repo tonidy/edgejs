@@ -1,6 +1,7 @@
 #include "crypto/unode_crypto_binding.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -98,6 +99,16 @@ ncrypto::Digest ResolveDigest(const std::string& name) {
 
 ncrypto::Cipher ResolveCipher(const std::string& name) {
   return ncrypto::Cipher::FromName(name.c_str());
+}
+
+std::string CanonicalizeDigestName(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  for (char ch : in) {
+    if (ch == '-') continue;
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  return out;
 }
 
 struct SecureContextHolder {
@@ -459,7 +470,13 @@ napi_value CryptoGetHashes(napi_env env, napi_callback_info info) {
         const char* name = EVP_MD_get0_name(md);
         if (name == nullptr) return;
         auto* out = static_cast<std::unordered_set<std::string>*>(arg);
-        out->emplace(name);
+        const std::string raw_name(name);
+        const std::string canonical = CanonicalizeDigestName(raw_name);
+        // Keep only names we can resolve through the same digest path used by
+        // hashing APIs, so getHashes() round-trips with createHash()/hash().
+        if (!canonical.empty() && ResolveDigest(canonical)) {
+          out->emplace(canonical);
+        }
       },
       &unique_hashes);
 #endif
