@@ -35,7 +35,7 @@ clone_or_update() {
 }
 
 mkdir -p "${DEPS_DIR}"
-clone_or_update "${DEPS_DIR}/libuv-wasix" "https://github.com/wasix-org/libuv.git" "wasix-1.51.0"
+clone_or_update "${DEPS_DIR}/libuv-wasix" "https://github.com/wasix-org/libuv.git" "ubi"
 clone_or_update "${DEPS_DIR}/openssl-wasix" "https://github.com/wasix-org/openssl.git" "master"
 
 echo "WASIX deps are ready under ${DEPS_DIR}"

@@ -47,6 +47,8 @@ extern char** environ;
 extern char** environ;
 #endif
 
+#define DUMMY_UV_STUBS 1
+
 namespace {
 
 const auto g_process_start_time = std::chrono::steady_clock::now();
@@ -1252,11 +1254,19 @@ napi_value ProcessMethodsEmptyArrayCallback(napi_env env, napi_callback_info inf
   return out;
 }
 
-napi_value ProcessMethodsRssCallback(napi_env env, napi_callback_info info) {
+static size_t get_rss() {
+#ifdef DUMMY_UV_STUBS
+  return 0;
+#else
   size_t rss = 0;
   uv_resident_set_memory(&rss);
+  return rss;
+#endif
+}
+
+napi_value ProcessMethodsRssCallback(napi_env env, napi_callback_info info) {
   napi_value out = nullptr;
-  napi_create_double(env, static_cast<double>(rss), &out);
+  napi_create_double(env, static_cast<double>(get_rss()), &out);
   return out;
 }
 
@@ -1312,9 +1322,7 @@ napi_value ProcessMethodsMemoryUsageBufferCallback(napi_env env, napi_callback_i
   }
   if (ta_type != napi_float64_array || length < 5) return nullptr;
   double* values = static_cast<double*>(data);
-  size_t rss = 0;
-  uv_resident_set_memory(&rss);
-  values[0] = static_cast<double>(rss);
+  values[0] = static_cast<double>(get_rss());
   values[1] = 16.0 * 1024.0 * 1024.0;
   values[2] = 8.0 * 1024.0 * 1024.0;
   values[3] = 0.0;
