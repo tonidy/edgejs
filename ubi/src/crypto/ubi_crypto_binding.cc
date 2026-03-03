@@ -8,8 +8,10 @@
 #include <vector>
 
 #include "ncrypto.h"
+#include <openssl/core_names.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/params.h>
 #include <openssl/pem.h>
 #include <openssl/pkcs12.h>
 #include <openssl/rsa.h>
@@ -1284,8 +1286,8 @@ napi_value CryptoCipherTransformAead(napi_env env, napi_callback_info info) {
 }
 
 napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
-  size_t argc = 5;
-  napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  size_t argc = 6;
+  napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 3) return nullptr;
 
   bool null_digest = false;
@@ -1317,6 +1319,21 @@ napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
       salt_type == napi_number) {
     napi_get_value_int32(env, argv[4], &salt_len);
   }
+  uint8_t* context = nullptr;
+  size_t context_len = 0;
+  bool has_context = false;
+  if (argc >= 6 && argv[5] != nullptr) {
+    napi_valuetype context_type = napi_undefined;
+    if (napi_typeof(env, argv[5], &context_type) == napi_ok &&
+        context_type != napi_null &&
+        context_type != napi_undefined) {
+      if (!GetBufferBytes(env, argv[5], &context, &context_len)) {
+        ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a Buffer");
+        return nullptr;
+      }
+      has_context = true;
+    }
+  }
 
   EVP_PKEY* pkey = ParsePrivateKey(key_pem, key_len);
   if (pkey == nullptr) {
@@ -1336,11 +1353,52 @@ napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to create digest context");
     return nullptr;
   }
-  EVP_PKEY_CTX* pctx = nullptr;
-  bool ok = EVP_DigestSignInit(mctx, &pctx, null_digest ? nullptr : md.get(), nullptr, pkey) == 1;
   const int pkey_type = EVP_PKEY_base_id(pkey);
   const bool is_rsa_family = (pkey_type == EVP_PKEY_RSA || pkey_type == EVP_PKEY_RSA_PSS);
   const bool is_ed_key = (pkey_type == EVP_PKEY_ED25519 || pkey_type == EVP_PKEY_ED448);
+  const bool is_ed448 = (pkey_type == EVP_PKEY_ED448);
+  if (has_context && context_len > 0 && !is_ed448) {
+    EVP_MD_CTX_free(mctx);
+    EVP_PKEY_free(pkey);
+    ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
+    return nullptr;
+  }
+  EVP_PKEY_CTX* pctx = nullptr;
+  bool ok = false;
+#ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
+  if (has_context && context_len > 0) {
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_octet_string(
+            OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
+            const_cast<unsigned char*>(context),
+            context_len),
+        OSSL_PARAM_END};
+    ok = EVP_DigestSignInit_ex(
+             mctx,
+             &pctx,
+             nullptr,
+             nullptr,
+             nullptr,
+             pkey,
+             params) == 1;
+    if (!ok) {
+      EVP_MD_CTX_free(mctx);
+      EVP_PKEY_free(pkey);
+      ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
+      return nullptr;
+    }
+  } else {
+    ok = EVP_DigestSignInit(mctx, &pctx, null_digest ? nullptr : md.get(), nullptr, pkey) == 1;
+  }
+#else
+  if (has_context && context_len > 0) {
+    EVP_MD_CTX_free(mctx);
+    EVP_PKEY_free(pkey);
+    ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
+    return nullptr;
+  }
+  ok = EVP_DigestSignInit(mctx, &pctx, null_digest ? nullptr : md.get(), nullptr, pkey) == 1;
+#endif
   int effective_padding = padding;
   if (is_rsa_family && effective_padding == 0 && pkey_type == EVP_PKEY_RSA_PSS) {
     // RSA-PSS keys require PSS padding even when callers omit padding.
@@ -1384,8 +1442,8 @@ napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
 }
 
 napi_value CryptoVerifyOneShot(napi_env env, napi_callback_info info) {
-  size_t argc = 6;
-  napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  size_t argc = 7;
+  napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 4) return nullptr;
 
   bool null_digest = false;
@@ -1420,6 +1478,21 @@ napi_value CryptoVerifyOneShot(napi_env env, napi_callback_info info) {
       salt_type == napi_number) {
     napi_get_value_int32(env, argv[5], &salt_len);
   }
+  uint8_t* context = nullptr;
+  size_t context_len = 0;
+  bool has_context = false;
+  if (argc >= 7 && argv[6] != nullptr) {
+    napi_valuetype context_type = napi_undefined;
+    if (napi_typeof(env, argv[6], &context_type) == napi_ok &&
+        context_type != napi_null &&
+        context_type != napi_undefined) {
+      if (!GetBufferBytes(env, argv[6], &context, &context_len)) {
+        ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a Buffer");
+        return nullptr;
+      }
+      has_context = true;
+    }
+  }
 
   EVP_PKEY* pkey = ParsePublicKeyOrCert(key_pem, key_len);
   if (pkey == nullptr) pkey = ParsePrivateKey(key_pem, key_len);
@@ -1440,11 +1513,52 @@ napi_value CryptoVerifyOneShot(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to create digest context");
     return nullptr;
   }
-  EVP_PKEY_CTX* pctx = nullptr;
-  bool ok = EVP_DigestVerifyInit(mctx, &pctx, null_digest ? nullptr : md.get(), nullptr, pkey) == 1;
   const int pkey_type = EVP_PKEY_base_id(pkey);
   const bool is_rsa_family = (pkey_type == EVP_PKEY_RSA || pkey_type == EVP_PKEY_RSA_PSS);
   const bool is_ed_key = (pkey_type == EVP_PKEY_ED25519 || pkey_type == EVP_PKEY_ED448);
+  const bool is_ed448 = (pkey_type == EVP_PKEY_ED448);
+  if (has_context && context_len > 0 && !is_ed448) {
+    EVP_MD_CTX_free(mctx);
+    EVP_PKEY_free(pkey);
+    ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
+    return nullptr;
+  }
+  EVP_PKEY_CTX* pctx = nullptr;
+  bool ok = false;
+#ifdef OSSL_SIGNATURE_PARAM_CONTEXT_STRING
+  if (has_context && context_len > 0) {
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_octet_string(
+            OSSL_SIGNATURE_PARAM_CONTEXT_STRING,
+            const_cast<unsigned char*>(context),
+            context_len),
+        OSSL_PARAM_END};
+    ok = EVP_DigestVerifyInit_ex(
+             mctx,
+             &pctx,
+             nullptr,
+             nullptr,
+             nullptr,
+             pkey,
+             params) == 1;
+    if (!ok) {
+      EVP_MD_CTX_free(mctx);
+      EVP_PKEY_free(pkey);
+      ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
+      return nullptr;
+    }
+  } else {
+    ok = EVP_DigestVerifyInit(mctx, &pctx, null_digest ? nullptr : md.get(), nullptr, pkey) == 1;
+  }
+#else
+  if (has_context && context_len > 0) {
+    EVP_MD_CTX_free(mctx);
+    EVP_PKEY_free(pkey);
+    ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Context parameter is unsupported");
+    return nullptr;
+  }
+  ok = EVP_DigestVerifyInit(mctx, &pctx, null_digest ? nullptr : md.get(), nullptr, pkey) == 1;
+#endif
   int effective_padding = padding;
   if (is_rsa_family && effective_padding == 0 && pkey_type == EVP_PKEY_RSA_PSS) {
     effective_padding = RSA_PKCS1_PSS_PADDING;

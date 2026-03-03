@@ -1985,6 +1985,35 @@ napi_status UbiInstallProcessObject(napi_env env,
   if (status != napi_ok || release_name == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   status = napi_set_named_property(env, release_obj, "name", release_name);
   if (status != napi_ok) return status;
+#if NODE_VERSION_IS_LTS
+  napi_value release_lts = nullptr;
+  status = napi_create_string_utf8(env, NODE_VERSION_LTS_CODENAME, NAPI_AUTO_LENGTH, &release_lts);
+  if (status != napi_ok || release_lts == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  status = napi_set_named_property(env, release_obj, "lts", release_lts);
+  if (status != napi_ok) return status;
+#endif
+  const std::string release_url_prefix =
+      std::string("https://nodejs.org/download/release/v") + NODE_VERSION_STRING + "/";
+  const std::string release_file_prefix =
+      release_url_prefix + "node-v" + NODE_VERSION_STRING;
+  napi_value source_url = nullptr;
+  status = napi_create_string_utf8(
+      env,
+      (release_file_prefix + ".tar.gz").c_str(),
+      NAPI_AUTO_LENGTH,
+      &source_url);
+  if (status != napi_ok || source_url == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  status = napi_set_named_property(env, release_obj, "sourceUrl", source_url);
+  if (status != napi_ok) return status;
+  napi_value headers_url = nullptr;
+  status = napi_create_string_utf8(
+      env,
+      (release_file_prefix + "-headers.tar.gz").c_str(),
+      NAPI_AUTO_LENGTH,
+      &headers_url);
+  if (status != napi_ok || headers_url == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  status = napi_set_named_property(env, release_obj, "headersUrl", headers_url);
+  if (status != napi_ok) return status;
   status = napi_set_named_property(env, process_obj, "release", release_obj);
   if (status != napi_ok) return status;
 

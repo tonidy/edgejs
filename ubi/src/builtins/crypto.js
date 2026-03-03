@@ -1183,9 +1183,7 @@ function signSyncImpl(algorithm, data, key) {
     if (context.length > 255) {
       throw makeRangeError('ERR_OUT_OF_RANGE', 'context string must be at most 255 bytes');
     }
-    if (context.length > 0) {
-      throw makeError('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Context parameter is unsupported');
-    }
+    opts.context = context;
   }
   try {
     let out = nativeToBuffer(binding.signOneShot(
@@ -1193,7 +1191,8 @@ function signSyncImpl(algorithm, data, key) {
       input,
       keyData,
       opts.padding,
-      opts.saltLength
+      opts.saltLength,
+      opts.context ?? null
     ));
     if (opts.dsaEncoding === 'ieee-p1363') {
       try {
@@ -1242,9 +1241,7 @@ function verifySyncImpl(algorithm, data, key, signature) {
     if (context.length > 255) {
       throw makeRangeError('ERR_OUT_OF_RANGE', 'context string must be at most 255 bytes');
     }
-    if (context.length > 0) {
-      throw makeError('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Context parameter is unsupported');
-    }
+    opts.context = context;
   }
   try {
     const verifyNative = (candidateSig) => !!binding.verifyOneShot(
@@ -1253,7 +1250,8 @@ function verifySyncImpl(algorithm, data, key, signature) {
       keyData,
       candidateSig,
       opts.padding,
-      opts.saltLength
+      opts.saltLength,
+      opts.context ?? null
     );
     let ok = verifyNative(sig);
     if (!ok && opts.dsaEncoding === 'ieee-p1363') {
