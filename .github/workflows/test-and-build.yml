@@ -129,3 +129,39 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
+
+  build-wasix-linux:
+    name: build-wasix-linux
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install wasixcc
+        uses: wasix-org/wasixcc@v0.4.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          sysroot-tag: v2026-02-16.1
+          version: v0.4.1
+
+      - name: Install wasm-tools
+        run: |
+          cargo install --locked wasm-tools
+
+      - name: Build ubi (WASIX)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./ubi/scripts/build-wasix.sh
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

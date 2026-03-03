@@ -22,7 +22,7 @@ set(NAPI_V8_NODE_ROOT
   CACHE PATH "Path to Node source root (for raw Node tests/fixtures)"
 )
 option(UBI_EXTERNAL_NAPI_V8
-  "Treat napi-v8 as an external dependency (do not build/bundle it in this tree)"
+  "Deprecated alias. Use UBI_NAPI_PROVIDER=imports."
   OFF
 )
 option(UBI_ALLOW_UNDEFINED_IMPORTS
@@ -30,11 +30,37 @@ option(UBI_ALLOW_UNDEFINED_IMPORTS
   OFF
 )
 
+set(UBI_IS_WASIX_TARGET OFF)
 if(CMAKE_SYSTEM_NAME MATCHES "WASI|WASIX" OR
    CMAKE_C_COMPILER MATCHES "wasixcc" OR
    CMAKE_CXX_COMPILER MATCHES "wasixcc\\+\\+")
+  set(UBI_IS_WASIX_TARGET ON)
   set(UBI_ALLOW_UNDEFINED_IMPORTS ON CACHE BOOL "" FORCE)
 endif()
+
+set(_ubi_napi_provider_default "bundled-v8")
+if(UBI_IS_WASIX_TARGET)
+  set(_ubi_napi_provider_default "imports")
+endif()
+set(UBI_NAPI_PROVIDER
+  "${_ubi_napi_provider_default}"
+  CACHE STRING "N-API provider backend: bundled-v8|imports"
+)
+set_property(CACHE UBI_NAPI_PROVIDER PROPERTY STRINGS bundled-v8 imports)
+if(UBI_EXTERNAL_NAPI_V8)
+  message(WARNING
+    "UBI_EXTERNAL_NAPI_V8 is deprecated; use UBI_NAPI_PROVIDER=imports.")
+  set(UBI_NAPI_PROVIDER "imports" CACHE STRING
+    "N-API provider backend: bundled-v8|imports" FORCE)
+endif()
+string(TOLOWER "${UBI_NAPI_PROVIDER}" UBI_NAPI_PROVIDER)
+if(NOT UBI_NAPI_PROVIDER MATCHES "^(bundled-v8|imports)$")
+  message(FATAL_ERROR
+    "Invalid UBI_NAPI_PROVIDER='${UBI_NAPI_PROVIDER}'. "
+    "Valid values: bundled-v8, imports.")
+endif()
+set(UBI_NAPI_PROVIDER "${UBI_NAPI_PROVIDER}" CACHE STRING
+  "N-API provider backend: bundled-v8|imports" FORCE)
 
 # Hard gate: ubi runtime/library sources must never directly reference V8.
 file(GLOB_RECURSE UBI_PURE_SRC_FILES
@@ -53,19 +79,82 @@ foreach(UBI_CODE_FILE IN LISTS UBI_PURE_SRC_FILES)
   endif()
 endforeach()
 
-# Build napi-v8 runtime only; node-api logic is owned by ubi.
-if(NOT UBI_EXTERNAL_NAPI_V8)
+if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
   set(NAPI_V8_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${NAPI_V8_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/napi-v8")
-else()
-  add_library(napi_v8 INTERFACE)
-  target_include_directories(napi_v8 INTERFACE "${NAPI_INCLUDE_ROOT}")
+elseif(UBI_NAPI_PROVIDER STREQUAL "imports")
+  add_library(ubi_napi_headers INTERFACE)
+  target_include_directories(ubi_napi_headers INTERFACE "${NAPI_INCLUDE_ROOT}")
 endif()
 
-# Use Node's bundled libuv (same as Node) for consistent behavior (e.g. mkdtemp).
+if(UBI_IS_WASIX_TARGET)
+  set(UBI_LIBUV_ROOT "${PROJECT_ROOT}/deps/libuv-wasix")
+else()
+  set(UBI_LIBUV_ROOT "${PROJECT_ROOT}/deps/uv")
+endif()
+if(NOT EXISTS "${UBI_LIBUV_ROOT}/CMakeLists.txt")
+  message(FATAL_ERROR
+    "libuv CMake project not found at ${UBI_LIBUV_ROOT}. "
+    "For WASIX, run ubi/scripts/setup-wasix-deps.sh first.")
+endif()
+
 set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-add_subdirectory("${PROJECT_ROOT}/deps/uv" "${CMAKE_CURRENT_BINARY_DIR}/deps/uv")
-find_package(OpenSSL REQUIRED)
+set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBUV_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+add_subdirectory("${UBI_LIBUV_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/deps/uv")
+
+if(UBI_IS_WASIX_TARGET)
+  set(UBI_OPENSSL_WASIX_ROOT
+    "${PROJECT_ROOT}/deps/openssl-wasix"
+    CACHE PATH "Path to wasix-org OpenSSL source/build tree"
+  )
+  set(_ubi_openssl_include_dir "${UBI_OPENSSL_WASIX_ROOT}/include")
+  if(NOT EXISTS "${_ubi_openssl_include_dir}")
+    message(FATAL_ERROR
+      "OpenSSL include directory not found: ${_ubi_openssl_include_dir}. "
+      "For WASIX, clone deps with ubi/scripts/setup-wasix-deps.sh.")
+  endif()
+
+  set(_ubi_openssl_crypto "")
+  foreach(_candidate
+      "${UBI_OPENSSL_WASIX_ROOT}/lib/libcrypto.a"
+      "${UBI_OPENSSL_WASIX_ROOT}/libcrypto.a")
+    if(EXISTS "${_candidate}")
+      set(_ubi_openssl_crypto "${_candidate}")
+      break()
+    endif()
+  endforeach()
+
+  set(_ubi_openssl_ssl "")
+  foreach(_candidate
+      "${UBI_OPENSSL_WASIX_ROOT}/lib/libssl.a"
+      "${UBI_OPENSSL_WASIX_ROOT}/libssl.a")
+    if(EXISTS "${_candidate}")
+      set(_ubi_openssl_ssl "${_candidate}")
+      break()
+    endif()
+  endforeach()
+
+  if(_ubi_openssl_crypto STREQUAL "" OR _ubi_openssl_ssl STREQUAL "")
+    message(FATAL_ERROR
+      "WASIX OpenSSL static libraries not found under ${UBI_OPENSSL_WASIX_ROOT}. "
+      "Expected libcrypto.a and libssl.a (either root or lib/).")
+  endif()
+
+  add_library(OpenSSL::Crypto STATIC IMPORTED GLOBAL)
+  set_target_properties(OpenSSL::Crypto PROPERTIES
+    IMPORTED_LOCATION "${_ubi_openssl_crypto}"
+    INTERFACE_INCLUDE_DIRECTORIES "${_ubi_openssl_include_dir}"
+  )
+  add_library(OpenSSL::SSL STATIC IMPORTED GLOBAL)
+  set_target_properties(OpenSSL::SSL PROPERTIES
+    IMPORTED_LOCATION "${_ubi_openssl_ssl}"
+    INTERFACE_INCLUDE_DIRECTORIES "${_ubi_openssl_include_dir}"
+  )
+  target_link_libraries(OpenSSL::SSL INTERFACE OpenSSL::Crypto)
+else()
+  find_package(OpenSSL REQUIRED)
+endif()
 
 set(UBI_EMBEDDED_V8_VERSION "0.0.0-node.0")
 if(DEFINED NAPI_V8_INCLUDE_DIR AND EXISTS "${NAPI_V8_INCLUDE_DIR}/v8-version.h")
@@ -95,6 +184,10 @@ add_library(ubi_node_api STATIC
   src/node_api.cc
   src/unofficial_napi_testing_until_gc.cc
 )
+if(UBI_NAPI_PROVIDER STREQUAL "imports")
+  set_source_files_properties(src/node_api.cc PROPERTIES
+    COMPILE_DEFINITIONS "NAPI_EXTERN=")
+endif()
 
 add_library(ubi_ncrypto STATIC
   "${PROJECT_ROOT}/deps/ncrypto/ncrypto.cc"
@@ -131,12 +224,10 @@ target_include_directories(ubi_node_api
     "${NAPI_INCLUDE_ROOT}"
 )
 
-target_link_libraries(ubi_node_api
-  PUBLIC
-    napi_v8
-  PRIVATE
-    uv_a
-)
+target_link_libraries(ubi_node_api PRIVATE uv_a)
+if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
+  target_link_libraries(ubi_node_api PUBLIC napi_v8)
+endif()
 
 add_library(ubi_runtime STATIC
   src/ubi_runtime.cc
@@ -178,7 +269,6 @@ target_include_directories(ubi_runtime
 )
 target_link_libraries(ubi_runtime
   PUBLIC
-    napi_v8
     ubi_node_api
   PRIVATE
     ubi_simdutf
@@ -187,6 +277,9 @@ target_link_libraries(ubi_runtime
     uv_a
     OpenSSL::Crypto
 )
+if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
+  target_link_libraries(ubi_runtime PUBLIC napi_v8)
+endif()
 target_compile_definitions(ubi_runtime
   PRIVATE
     UBI_EMBEDDED_V8_VERSION="${UBI_EMBEDDED_V8_VERSION}"
@@ -220,7 +313,7 @@ if(UBI_BUILD_CLI)
     PRIVATE
       ubi_cli
   )
-  if(NAPI_V8_DEFINES)
+  if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8" AND NAPI_V8_DEFINES)
     target_compile_definitions(ubi PRIVATE ${NAPI_V8_DEFINES})
   endif()
   if(UBI_ALLOW_UNDEFINED_IMPORTS)
@@ -231,5 +324,7 @@ if(UBI_BUILD_CLI)
   endif()
 endif()
 
-enable_testing()
-add_subdirectory(tests)
+if(NOT UBI_IS_WASIX_TARGET)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

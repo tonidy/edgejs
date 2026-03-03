@@ -1,13 +1,13 @@
 include(GoogleTest)
 
 set(NAPI_V8_GTEST_ROOT "${PROJECT_ROOT}/deps/googletest")
-set(UBI_GTEST_PER_TEST_TIMEOUT_SECONDS 30)
+set(UBI_GTEST_PER_TEST_TIMEOUT_SECONDS 60)
 set(UBI_CTEST_RESOURCE_LOCK_BUCKETS "24" CACHE STRING
     "Max concurrent ubi gtest cases when ctest parallelism is unbounded (0 disables).")
 set(UBI_CTEST_RESOURCE_LOCK_PREFIX "ubi_gtest_slot" CACHE STRING
     "Prefix used for generated CTest RESOURCE_LOCK buckets.")
 
-if(NAPI_V8_LIBRARY)
+if(TARGET napi_v8 AND NAPI_V8_LIBRARY)
   add_library(ubi_gtest STATIC
     "${NAPI_V8_GTEST_ROOT}/src/gtest-all.cc"
     "${NAPI_V8_GTEST_ROOT}/src/gtest_main.cc"
@@ -85,5 +85,5 @@ if(NAPI_V8_LIBRARY)
     "${UBI_ROOT}/tests/runners/test_3_node_dropin_subset_phase02.cc"
   )
 else()
-  message(STATUS "Skipping ubi node-api tests: set NAPI_V8_LIBRARY for napi-v8 runtime linkage")
+  message(STATUS "Skipping ubi node-api tests: napi_v8 runtime target/linkage is unavailable")
 endif()

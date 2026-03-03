@@ -66,3 +66,11 @@ Every roadmap step requires:
 
 No phase should be marked complete without passing its defined test gate.
 
+## WASIX Build
+
+- Use `UBI_NAPI_PROVIDER=imports` to compile `ubi` with N-API imports only
+  (no bundled `napi/v8` linkage).
+- WASIX toolchain file: `ubi/cmake/wasix-toolchain.cmake`.
+- Setup + build helper:
+  - `ubi/scripts/setup-wasix-deps.sh`
+  - `ubi/scripts/build-wasix.sh`

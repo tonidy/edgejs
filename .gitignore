@@ -9,3 +9,5 @@
 /napi/wasmer/target
 /napi/cmake
 v8-*.tar.xz
+/deps/libuv-wasix
+/deps/openssl-wasix
