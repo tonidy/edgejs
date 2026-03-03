@@ -74,14 +74,20 @@ bool GetBool(napi_env env, napi_value value, bool* out) {
   return value != nullptr && out != nullptr && napi_get_value_bool(env, value, out) == napi_ok;
 }
 
+uint8_t* ZeroLengthDataSentinel() {
+  static uint8_t sentinel = 0;
+  return &sentinel;
+}
+
 bool ExtractBytesFromValue(napi_env env, napi_value value, uint8_t** data, size_t* len) {
   if (value == nullptr || data == nullptr || len == nullptr) return false;
   bool is_buffer = false;
   if (napi_is_buffer(env, value, &is_buffer) != napi_ok) return false;
   if (is_buffer) {
     void* ptr = nullptr;
-    if (napi_get_buffer_info(env, value, &ptr, len) != napi_ok || ptr == nullptr) return false;
-    *data = static_cast<uint8_t*>(ptr);
+    if (napi_get_buffer_info(env, value, &ptr, len) != napi_ok) return false;
+    if (ptr == nullptr && *len != 0) return false;
+    *data = (ptr != nullptr) ? static_cast<uint8_t*>(ptr) : ZeroLengthDataSentinel();
     return true;
   }
 
@@ -93,8 +99,7 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, uint8_t** data, size_
   napi_value arraybuffer = nullptr;
   size_t byte_offset = 0;
   if (napi_get_typedarray_info(
-          env, value, &type, &element_len, &ptr, &arraybuffer, &byte_offset) != napi_ok ||
-      ptr == nullptr) {
+          env, value, &type, &element_len, &ptr, &arraybuffer, &byte_offset) != napi_ok) {
     return false;
   }
 
@@ -116,6 +121,12 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, uint8_t** data, size_
       bytes_per_element = 1;
       break;
   }
+  *len = element_len * bytes_per_element;
+  if (*len == 0) {
+    *data = ZeroLengthDataSentinel();
+    return true;
+  }
+
   void* ab_data = nullptr;
   size_t ab_len = 0;
   if (arraybuffer != nullptr &&
@@ -123,10 +134,11 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, uint8_t** data, size_
       ab_data != nullptr &&
       byte_offset <= ab_len) {
     *data = static_cast<uint8_t*>(ab_data) + byte_offset;
-  } else {
+  } else if (ptr != nullptr) {
     *data = static_cast<uint8_t*>(ptr);
+  } else {
+    return false;
   }
-  *len = element_len * bytes_per_element;
   return true;
 }
 
@@ -137,8 +149,9 @@ bool ExtractArrayBufferParts(napi_env env, napi_value value, uint8_t** data, siz
   if (napi_is_arraybuffer(env, value, &is_ab) == napi_ok && is_ab) {
     void* ptr = nullptr;
     size_t byte_len = 0;
-    if (napi_get_arraybuffer_info(env, value, &ptr, &byte_len) != napi_ok || ptr == nullptr) return false;
-    *data = static_cast<uint8_t*>(ptr);
+    if (napi_get_arraybuffer_info(env, value, &ptr, &byte_len) != napi_ok) return false;
+    if (ptr == nullptr && byte_len != 0) return false;
+    *data = (ptr != nullptr) ? static_cast<uint8_t*>(ptr) : ZeroLengthDataSentinel();
     *len = byte_len;
     return true;
   }

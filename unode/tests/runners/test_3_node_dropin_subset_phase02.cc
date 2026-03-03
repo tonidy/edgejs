@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
+#else
+#include <process.h>
 #endif
 
 #include "test_env.h"
@@ -18,10 +20,23 @@ class Test3NodeDropinSubsetPhase02 : public FixtureTestBase {};
 
 namespace {
 
+uint64_t CurrentProcessId() {
+#if defined(_WIN32)
+  return static_cast<uint64_t>(_getpid());
+#else
+  return static_cast<uint64_t>(getpid());
+#endif
+}
+
 std::string MakeTestSerialId(std::string_view key) {
-  // Stable FNV-1a hash so the same test path maps to the same isolated tmpdir suffix.
+  std::string material(key);
+  material.push_back(':');
+  material += std::to_string(CurrentProcessId());
+
+  // Stable FNV-1a hash over script key + process id so concurrent invocations
+  // of the same script do not collide on Node test temp paths/ports.
   uint64_t h = 1469598103934665603ull;
-  for (char c : key) {
+  for (char c : material) {
     h ^= static_cast<unsigned char>(c);
     h *= 1099511628211ull;
   }

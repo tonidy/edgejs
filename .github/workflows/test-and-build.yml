@@ -45,7 +45,7 @@ jobs:
           cmake --build build-unode -j4
 
       - name: Test unode
-        run: ctest --test-dir build-unode --output-on-failure -j0
+        run: ctest --test-dir build-unode --output-on-failure -j4
 
       - name: Generate dist
         shell: bash
@@ -107,7 +107,7 @@ jobs:
           cmake --build build-unode -j4
 
       - name: Test unode
-        run: ctest --test-dir build-unode --output-on-failure -j0
+        run: ctest --test-dir build-unode --output-on-failure -j4
 
       - name: Generate dist
         shell: bash
