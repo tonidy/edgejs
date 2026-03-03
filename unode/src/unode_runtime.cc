@@ -2477,7 +2477,12 @@ int UnodeRunScriptFileWithLoop(napi_env env,
   const std::string source = ReadTextFile(script_path);
   if (source.empty()) {
     if (error_out != nullptr) {
-      *error_out = "Failed to read script file";
+      std::string details = "Failed to read script file";
+      if (script_path != nullptr && script_path[0] != '\0') {
+        details += ": ";
+        details += script_path;
+      }
+      *error_out = std::move(details);
     }
     return 1;
   }
