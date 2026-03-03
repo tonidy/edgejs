@@ -6,8 +6,13 @@ const kUvErrMap = new Map([
   [-12, ['ENOMEM', 'out of memory']],
   [-13, ['EACCES', 'permission denied']],
   [-22, ['EINVAL', 'invalid argument']],
+  [-38, ['ENOSYS', 'function not implemented']],
   [-55, ['ENOBUFS', 'no buffer space available']],
   [-60, ['ETIMEDOUT', 'connection timed out']],
+  [-105, ['ENOBUFS', 'no buffer space available']],
+  [-110, ['ETIMEDOUT', 'connection timed out']],
+  [-3007, ['ENOTFOUND', 'name does not resolve']],
+  [-3008, ['ENOTFOUND', 'name does not resolve']],
 ]);
 
 function getUvErrorEntry(err) {

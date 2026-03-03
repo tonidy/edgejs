@@ -141,10 +141,13 @@ X509_CRL* ParseX509Crl(const uint8_t* data, size_t len);
 napi_value CreateBufferCopy(napi_env env, const uint8_t* data, size_t len) {
   napi_value ab = nullptr;
   void* out_data = nullptr;
-  if (napi_create_arraybuffer(env, len, &out_data, &ab) != napi_ok || out_data == nullptr || ab == nullptr) {
+  if (napi_create_arraybuffer(env, len, &out_data, &ab) != napi_ok || ab == nullptr) {
     return nullptr;
   }
-  if (len > 0) std::memcpy(out_data, data, len);
+  if (len > 0) {
+    if (out_data == nullptr) return nullptr;
+    std::memcpy(out_data, data, len);
+  }
   napi_value out = nullptr;
   if (napi_create_typedarray(env, napi_uint8_array, len, ab, 0, &out) != napi_ok) return nullptr;
   return out;

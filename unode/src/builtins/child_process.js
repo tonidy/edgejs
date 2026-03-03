@@ -427,7 +427,11 @@ function spawnSync(_file, args, _options) {
       [-13]: 'EACCES',
       [-22]: 'EINVAL',
       [-55]: 'ENOBUFS',
+      [-105]: 'ENOBUFS',
       [-60]: 'ETIMEDOUT',
+      [-110]: 'ETIMEDOUT',
+      [-3007]: 'ENOTFOUND',
+      [-3008]: 'ENOTFOUND',
     };
     error.code = knownErrnoNames[errno];
     try {

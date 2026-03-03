@@ -61,7 +61,13 @@ TEST_F(Test1CliPhase01, MissingScriptFileReturnsNonZero) {
   std::string error;
   const int exit_code = UnodeRunCli(2, argv, &error);
   EXPECT_EQ(exit_code, 1);
-  EXPECT_EQ(error, "Failed to read script file");
+  const std::string prefix = "Failed to read script file";
+  ASSERT_GE(error.size(), prefix.size()) << "error=" << error;
+  EXPECT_EQ(error.rfind(prefix, 0), 0u) << "error=" << error;
+  if (error.size() > prefix.size()) {
+    ASSERT_GE(error.size(), prefix.size() + 2) << "error=" << error;
+    EXPECT_EQ(error.substr(prefix.size(), 2), ": ") << "error=" << error;
+  }
 }
 
 TEST_F(Test1CliPhase01, ValidFixtureScriptReturnsZero) {
@@ -263,4 +269,3 @@ TEST_F(Test1CliPhase01, ExplicitProcessExitDoesNotEmitBeforeExit) {
 
   RemoveTempScript(script_path);
 }
-

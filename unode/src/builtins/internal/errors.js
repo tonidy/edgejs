@@ -330,6 +330,7 @@ class ERR_STREAM_NULL_VALUES extends TypeError {
 function mapDnsCode(code) {
   if (typeof code === 'string') return code;
   if (code === -3006 || code === -3001) return 'EAI_MEMORY';
+  if (code === -3008 || code === -3007) return 'ENOTFOUND';
   if (code === -2) return 'ENOENT';
   if (code === -78) return 'ENOTFOUND';
   if (code === -12) return 'ENOMEM';

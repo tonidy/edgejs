@@ -372,11 +372,16 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
   std::vector<uint8_t> out_stderr;
 
   const auto start_time = std::chrono::steady_clock::now();
+  const auto io_grace_after_exit = std::chrono::milliseconds(200);
+  bool child_exit_time_set = false;
+  std::chrono::steady_clock::time_point child_exit_time = start_time;
   while (stdout_open || stderr_open || child_running) {
     if (child_running) {
       pid_t waited = waitpid(pid, &status, WNOHANG);
       if (waited == pid) {
         child_running = false;
+        child_exit_time = std::chrono::steady_clock::now();
+        child_exit_time_set = true;
       }
     }
 
@@ -393,7 +398,9 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
     }
 
     struct timeval tv{};
-    struct timeval* tv_ptr = nullptr;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+    struct timeval* tv_ptr = &tv;
     if (options.timeout_ms > 0) {
       const auto now = std::chrono::steady_clock::now();
       const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
@@ -403,19 +410,15 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
           (void)waitpid(pid, &status, 0);
           child_running = false;
           timed_out = true;
+          child_exit_time = std::chrono::steady_clock::now();
+          child_exit_time_set = true;
         }
-      } else {
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000;
-        tv_ptr = &tv;
       }
-    } else if (child_running) {
-      tv.tv_sec = 0;
-      tv.tv_usec = 100000;
-      tv_ptr = &tv;
     }
 
     if (maxfd >= 0) {
+      const size_t stdout_size_before = out_stdout.size();
+      const size_t stderr_size_before = out_stderr.size();
       const int selected = select(maxfd + 1, &rfds, nullptr, nullptr, tv_ptr);
       if (selected > 0) {
         if (stdout_open && FD_ISSET(stdout_pipe[0], &rfds)) {
@@ -427,7 +430,11 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
       } else if (selected == 0) {
         if (stdout_open) AppendFromFd(stdout_pipe[0], &out_stdout, &stdout_open);
         if (stderr_open) AppendFromFd(stderr_pipe[0], &out_stderr, &stderr_open);
+      } else if (selected < 0 && errno == EINTR) {
+        continue;
       }
+      const bool io_progress =
+          out_stdout.size() != stdout_size_before || out_stderr.size() != stderr_size_before;
       if (options.max_buffer >= 0 &&
           (static_cast<int64_t>(out_stdout.size()) > options.max_buffer ||
            static_cast<int64_t>(out_stderr.size()) > options.max_buffer)) {
@@ -436,6 +443,21 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
           kill(pid, options.kill_signal);
           (void)waitpid(pid, &status, 0);
           child_running = false;
+          child_exit_time = std::chrono::steady_clock::now();
+          child_exit_time_set = true;
+        }
+      }
+      if (!child_running && !io_progress && child_exit_time_set) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - child_exit_time >= io_grace_after_exit) {
+          if (stdout_open) {
+            close(stdout_pipe[0]);
+            stdout_open = false;
+          }
+          if (stderr_open) {
+            close(stderr_pipe[0]);
+            stderr_open = false;
+          }
         }
       }
     } else if (!child_running) {

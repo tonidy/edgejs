@@ -869,9 +869,17 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
     set_int32(out, "UV_EBADF", UV_EBADF);
     set_int32(out, "UV_ENOTCONN", UV_ENOTCONN);
     set_int32(out, "UV_ECANCELED", UV_ECANCELED);
+    set_int32(out, "UV_ENOBUFS", UV_ENOBUFS);
+    set_int32(out, "UV_ENOSYS", UV_ENOSYS);
     set_int32(out, "UV_ETIMEDOUT", UV_ETIMEDOUT);
     set_int32(out, "UV_ENOMEM", UV_ENOMEM);
     set_int32(out, "UV_ENOTSOCK", UV_ENOTSOCK);
+#if defined(UV_EAI_NONAME)
+    set_int32(out, "UV_EAI_NONAME", UV_EAI_NONAME);
+#endif
+#if defined(UV_EAI_NODATA)
+    set_int32(out, "UV_EAI_NODATA", UV_EAI_NODATA);
+#endif
     return out;
   }
   if (name == "config") {

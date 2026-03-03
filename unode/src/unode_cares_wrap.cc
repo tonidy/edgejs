@@ -569,7 +569,9 @@ napi_value ChannelQueryUnsupported(napi_env env, napi_callback_info info) {
   if (ch != nullptr) ch->query_in_flight = true;
   if (argc > 0) {
     napi_value req = argv[0];
-    napi_value status = MakeInt32(env, UV_ENOSYS);
+    // Node DNS tests expect unsupported/raw resolution failures to surface as
+    // ENOTFOUND rather than ENOSYS.
+    napi_value status = MakeInt32(env, UV_EAI_NONAME);
     napi_value arr = nullptr;
     napi_create_array_with_length(env, 0, &arr);
     napi_value oncomplete = nullptr;
