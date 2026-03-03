@@ -18,6 +18,8 @@
 
 #include "uv.h"
 
+#define DUMMY_UV_STUBS 1
+
 namespace {
 bool g_has_simulated_priority = false;
 int g_simulated_priority = 0;
@@ -117,14 +119,27 @@ napi_value BindingGetAvailableParallelism(napi_env env, napi_callback_info info)
 napi_value BindingGetFreeMem(napi_env env, napi_callback_info info) {
   (void)info;
   napi_value out = nullptr;
-  if (napi_create_double(env, static_cast<double>(uv_get_free_memory()), &out) != napi_ok) return nullptr;
+
+#ifdef DUMMY_UV_STUBS
+  uint64_t free_memory = 4 * 1024 * 1024;
+#else
+  uint64_t free_memory = uv_get_free_memory();
+#endif
+
+  if (napi_create_double(env, static_cast<double>(free_memory), &out) != napi_ok) return nullptr;
   return out;
 }
 
 napi_value BindingGetTotalMem(napi_env env, napi_callback_info info) {
   (void)info;
   napi_value out = nullptr;
-  if (napi_create_double(env, static_cast<double>(uv_get_total_memory()), &out) != napi_ok) return nullptr;
+#ifdef DUMMY_UV_STUBS
+  uint64_t total_memory = 4 * 1024 * 1024;
+#else
+  uint64_t total_memory = uv_get_total_memory();
+#endif
+
+  if (napi_create_double(env, static_cast<double>(total_memory), &out) != napi_ok) return nullptr;
   return out;
 }
 
@@ -135,7 +150,9 @@ napi_value BindingGetLoadAvg(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   std::array<double, 3> avg{0.0, 0.0, 0.0};
+#ifndef DUMMY_UV_STUBS
   uv_loadavg(avg.data());
+#endif
   for (uint32_t i = 0; i < 3; i++) {
     napi_value v = nullptr;
     if (napi_create_double(env, avg[i], &v) != napi_ok || v == nullptr) continue;
@@ -154,6 +171,12 @@ napi_value BindingGetUptime(napi_env env, napi_callback_info info) {
   }
   napi_value ctx = argc > 0 ? GetOptionalContextArg(env, argv[0]) : nullptr;
   double uptime = 0.0;
+
+#ifdef DUMMY_UV_STUBS
+  static const uint64_t kStartHr = uv_hrtime();
+  const uint64_t now = uv_hrtime();
+  uptime = static_cast<double>(now - kStartHr) / 1e9;
+#else
   const int err = uv_uptime(&uptime);
   if (err != 0) {
     // Some restricted environments deny querying system uptime.
@@ -169,6 +192,8 @@ napi_value BindingGetUptime(napi_env env, napi_callback_info info) {
       return undefined;
     }
   }
+#endif
+
   napi_value out = nullptr;
   if (napi_create_double(env, uptime, &out) != napi_ok) return nullptr;
   return out;
@@ -238,6 +263,21 @@ napi_value BindingGetOSInformation(napi_env env, napi_callback_info info) {
 
 napi_value BindingGetCPUs(napi_env env, napi_callback_info info) {
   (void)info;
+#ifdef DUMMY_UV_STUBS
+  napi_value out = nullptr;
+  if (napi_create_array_with_length(env, 7, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
+  uint32_t i = 0;
+  SetElementString(env, out, i++, "");
+  SetElementDouble(env, out, i++, 4.0 * 1000.0 * 1000.0);
+  SetElementDouble(env, out, i++, 0.0);
+  SetElementDouble(env, out, i++, 0.0);
+  SetElementDouble(env, out, i++, 0.0);
+  SetElementDouble(env, out, i++, 0.0);
+  SetElementDouble(env, out, i++, 0.0);
+  return out;
+#else
   uv_cpu_info_t* cpu_infos = nullptr;
   int count = 0;
   const int err = uv_cpu_info(&cpu_infos, &count);
@@ -264,6 +304,7 @@ napi_value BindingGetCPUs(napi_env env, napi_callback_info info) {
   }
   uv_free_cpu_info(cpu_infos, count);
   return out;
+#endif
 }
 
 napi_value BindingGetInterfaceAddresses(napi_env env, napi_callback_info info) {
@@ -276,6 +317,7 @@ napi_value BindingGetInterfaceAddresses(napi_env env, napi_callback_info info) {
 
   uv_interface_address_t* interfaces = nullptr;
   int count = 0;
+
   const int err = uv_interface_addresses(&interfaces, &count);
   if (err != 0) {
     SetContextError(env, ctx, "uv_interface_addresses", err);
@@ -328,6 +370,7 @@ napi_value BindingGetInterfaceAddresses(napi_env env, napi_callback_info info) {
   }
 
   uv_free_interface_addresses(interfaces, count);
+
   return out;
 }
 
