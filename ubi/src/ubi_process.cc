@@ -151,16 +151,16 @@ std::string GetUndiciVersion() {
   return version;
 }
 
-std::string GetAmaroVersion() {
-  namespace fs = std::filesystem;
-  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-  static const std::string version = ReadPackageVersionFromCandidates({
-      source_root / "node" / "deps" / "amaro" / "package.json",
-      fs::current_path() / "node" / "deps" / "amaro" / "package.json",
-      fs::current_path().parent_path() / "node" / "deps" / "amaro" / "package.json",
-  });
-  return version;
-}
+// std::string GetAmaroVersion() {
+//   namespace fs = std::filesystem;
+//   const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+//   static const std::string version = ReadPackageVersionFromCandidates({
+//       source_root / "node" / "deps" / "amaro" / "package.json",
+//       fs::current_path() / "node" / "deps" / "amaro" / "package.json",
+//       fs::current_path().parent_path() / "node" / "deps" / "amaro" / "package.json",
+//   });
+//   return version;
+// }
 
 std::string MaybePreferSiblingUbiBinary(const std::string& detected_exec_path) {
   if (detected_exec_path.empty()) return detected_exec_path;
@@ -2142,7 +2142,7 @@ napi_status UbiInstallProcessObject(napi_env env,
       {"node", NODE_VERSION_STRING},
       {"acorn", ACORN_VERSION},
       {"ada", ADA_VERSION},
-      {"amaro", GetAmaroVersion()},
+      // {"amaro", GetAmaroVersion()},
       {"ares", ARES_VERSION_STR},
       {"brotli", GetBrotliVersion()},
       {"cjs_module_lexer", CJS_MODULE_LEXER_VERSION},
