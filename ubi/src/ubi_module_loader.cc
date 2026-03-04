@@ -69,12 +69,28 @@ std::string LoadBuiltinsConfigJson() {
   static std::string cached;
   if (!cached.empty()) return cached;
 
-  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-  const std::vector<fs::path> candidates = {
-      source_root / "node" / "config.gypi",
-      fs::current_path() / "node" / "config.gypi",
-      fs::current_path().parent_path() / "node" / "config.gypi",
+  auto append_candidate = [](std::vector<fs::path>* out, const fs::path& p) {
+    if (out == nullptr) return;
+    if (p.empty()) return;
+    out->push_back(p);
   };
+
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  std::vector<fs::path> candidates;
+  append_candidate(&candidates, source_root / "node" / "config.gypi");
+
+  std::error_code ec;
+  fs::path cwd = fs::current_path(ec);
+  if (!ec && !cwd.empty()) {
+    append_candidate(&candidates, cwd / "node" / "config.gypi");
+    fs::path probe = cwd;
+    for (int depth = 0; depth < 8; depth++) {
+      append_candidate(&candidates, probe / "node" / "config.gypi");
+      fs::path parent = probe.parent_path();
+      if (parent.empty() || parent == probe) break;
+      probe = parent;
+    }
+  }
 
   for (const fs::path& candidate : candidates) {
     const std::string raw = ReadTextFile(candidate);
@@ -90,7 +106,21 @@ std::string LoadBuiltinsConfigJson() {
     if (!cached.empty()) return cached;
   }
 
-  cached = "{\"variables\":{\"node_use_amaro\":false}}";
+  // Keep this fallback aligned with what Node's bootstrap expects from
+  // config.gypi on modern releases.
+  cached =
+      "{"
+      "\"variables\":{"
+      "\"node_use_amaro\":true,"
+      "\"node_builtin_shareable_builtins\":["
+      "\"deps/cjs-module-lexer/lexer.js\","
+      "\"deps/cjs-module-lexer/dist/lexer.js\","
+      "\"deps/undici/undici.js\","
+      "\"deps/amaro/dist/index.js\""
+      "],"
+      "\"napi_build_version\":\"10\""
+      "}"
+      "}";
   return cached;
 }
 
@@ -413,6 +443,78 @@ static napi_value ReturnFirstArgCallback(napi_env env, napi_callback_info info) 
 static napi_value ReturnTrueCallback(napi_env env, napi_callback_info /*info*/) {
   napi_value out = nullptr;
   napi_get_boolean(env, true, &out);
+  return out;
+}
+
+static bool AddUvErrorMapEntry(napi_env env, napi_value map, int32_t code, const char* name, const char* message) {
+  napi_value code_key = nullptr;
+  napi_value name_val = nullptr;
+  napi_value message_val = nullptr;
+  napi_value tuple = nullptr;
+  if (napi_create_int32(env, code, &code_key) != napi_ok || code_key == nullptr) return false;
+  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &name_val) != napi_ok || name_val == nullptr) {
+    return false;
+  }
+  if (napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &message_val) != napi_ok ||
+      message_val == nullptr) {
+    return false;
+  }
+  if (napi_create_array_with_length(env, 2, &tuple) != napi_ok || tuple == nullptr) return false;
+  if (napi_set_element(env, tuple, 0, name_val) != napi_ok) return false;
+  if (napi_set_element(env, tuple, 1, message_val) != napi_ok) return false;
+
+  napi_value set_fn = nullptr;
+  if (napi_get_named_property(env, map, "set", &set_fn) != napi_ok || set_fn == nullptr) return false;
+  napi_value argv[2] = {code_key, tuple};
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, map, set_fn, 2, argv, &ignored) != napi_ok) return false;
+  return true;
+}
+
+static napi_value UvGetErrorMapCallback(napi_env env, napi_callback_info /*info*/) {
+  napi_value map_script = nullptr;
+  if (napi_create_string_utf8(env, "new Map()", NAPI_AUTO_LENGTH, &map_script) != napi_ok ||
+      map_script == nullptr) {
+    return nullptr;
+  }
+  napi_value err_map = nullptr;
+  if (napi_run_script(env, map_script, &err_map) != napi_ok || err_map == nullptr) return nullptr;
+#define UBI_SET_UV_ERRMAP_ENTRY(name, message)                                                   \
+  if (!AddUvErrorMapEntry(env, err_map, static_cast<int32_t>(UV_##name), #name, message)) {     \
+    return nullptr;                                                                               \
+  }
+  UV_ERRNO_MAP(UBI_SET_UV_ERRMAP_ENTRY);
+#undef UBI_SET_UV_ERRMAP_ENTRY
+  return err_map;
+}
+
+static napi_value UvGetErrorMessageCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  int32_t err = 0;
+  if (napi_get_value_int32(env, argv[0], &err) != napi_ok) return nullptr;
+  const char* message = uv_strerror(static_cast<int>(err));
+  if (message == nullptr) message = "unknown error";
+  napi_value out = nullptr;
+  if (napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
+  return out;
+}
+
+static napi_value UvErrNameCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  int32_t err = 0;
+  if (napi_get_value_int32(env, argv[0], &err) != napi_ok) return nullptr;
+  const char* name = uv_err_name(static_cast<int>(err));
+  if (name == nullptr) name = "UNKNOWN";
+  napi_value out = nullptr;
+  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
   return out;
 }
 
@@ -1587,24 +1689,22 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
   if (name == "uv") {
     napi_value out = nullptr;
     if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
-    set_int32(out, "UV_ENOENT", UV_ENOENT);
-    set_int32(out, "UV_EEXIST", UV_EEXIST);
-    set_int32(out, "UV_EOF", UV_EOF);
-    set_int32(out, "UV_EINVAL", UV_EINVAL);
-    set_int32(out, "UV_EBADF", UV_EBADF);
-    set_int32(out, "UV_ENOTCONN", UV_ENOTCONN);
-    set_int32(out, "UV_ECANCELED", UV_ECANCELED);
-    set_int32(out, "UV_ENOBUFS", UV_ENOBUFS);
-    set_int32(out, "UV_ENOSYS", UV_ENOSYS);
-    set_int32(out, "UV_ETIMEDOUT", UV_ETIMEDOUT);
-    set_int32(out, "UV_ENOMEM", UV_ENOMEM);
-    set_int32(out, "UV_ENOTSOCK", UV_ENOTSOCK);
-#if defined(UV_EAI_NONAME)
-    set_int32(out, "UV_EAI_NONAME", UV_EAI_NONAME);
-#endif
-#if defined(UV_EAI_NODATA)
-    set_int32(out, "UV_EAI_NODATA", UV_EAI_NODATA);
-#endif
+#define UBI_SET_UV_CONSTANT(name, message) \
+    set_int32(out, "UV_" #name, static_cast<int32_t>(UV_##name));
+    UV_ERRNO_MAP(UBI_SET_UV_CONSTANT);
+#undef UBI_SET_UV_CONSTANT
+
+    auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
+      napi_value fn = nullptr;
+      return napi_create_function(env, method_name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
+             fn != nullptr &&
+             napi_set_named_property(env, out, method_name, fn) == napi_ok;
+    };
+    if (!define_method("getErrorMap", UvGetErrorMapCallback) ||
+        !define_method("getErrorMessage", UvGetErrorMessageCallback) ||
+        !define_method("errname", UvErrNameCallback)) {
+      return undefined;
+    }
     return out;
   }
   if (name == "config") {

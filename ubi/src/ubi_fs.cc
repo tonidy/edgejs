@@ -9,6 +9,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 #include <sys/stat.h>
@@ -1472,6 +1473,9 @@ void UbiInstallFsBinding(napi_env env) {
   SetInt32Constant(env, binding, "O_APPEND", UV_FS_O_APPEND);
   SetInt32Constant(env, binding, "O_EXCL", UV_FS_O_EXCL);
   SetInt32Constant(env, binding, "O_SYNC", UV_FS_O_SYNC);
+#if defined(O_NOATIME)
+  SetInt32Constant(env, binding, "O_NOATIME", static_cast<int32_t>(O_NOATIME));
+#endif
 
   SetInt32Constant(env, binding, "UV_DIRENT_UNKNOWN", UV_DIRENT_UNKNOWN);
   SetInt32Constant(env, binding, "UV_DIRENT_FILE", UV_DIRENT_FILE);
