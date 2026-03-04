@@ -9,6 +9,15 @@ const {
   },
 } = require('internal/errors');
 
+const kValidateObjectNone = 0;
+const kValidateObjectAllowNullable = 1 << 0;
+const kValidateObjectAllowArray = 1 << 1;
+const kValidateObjectAllowFunction = 1 << 2;
+const kValidateObjectAllowObjects = kValidateObjectAllowArray | kValidateObjectAllowFunction;
+const kValidateObjectAllowObjectsAndNull = kValidateObjectAllowNullable |
+  kValidateObjectAllowArray |
+  kValidateObjectAllowFunction;
+
 function validateFunction(value, name) {
   if (typeof value !== 'function') {
     throw new ERR_INVALID_ARG_TYPE(name, 'function', value);
@@ -42,10 +51,20 @@ function validateUint32(value, name, positive) {
   }
 }
 
-function validateObject(value, name, options = undefined) {
-  const allowArray = options?.allowArray === true;
-  const allowFunction = options?.allowFunction === true;
-  const nullable = options?.nullable === true;
+function validateObject(value, name, options = kValidateObjectNone) {
+  let allowArray = false;
+  let allowFunction = false;
+  let nullable = false;
+
+  if (typeof options === 'number') {
+    allowArray = (options & kValidateObjectAllowArray) !== 0;
+    allowFunction = (options & kValidateObjectAllowFunction) !== 0;
+    nullable = (options & kValidateObjectAllowNullable) !== 0;
+  } else {
+    allowArray = options?.allowArray === true;
+    allowFunction = options?.allowFunction === true;
+    nullable = options?.nullable === true;
+  }
 
   if ((!nullable && value === null) ||
       (!allowArray && Array.isArray(value)) ||
@@ -146,13 +165,19 @@ function validatePort(value, name = 'Port', allowZero = true) {
 }
 
 module.exports = {
+  isInt32,
+  kValidateObjectNone,
+  kValidateObjectAllowNullable,
+  kValidateObjectAllowArray,
+  kValidateObjectAllowFunction,
+  kValidateObjectAllowObjects,
+  kValidateObjectAllowObjectsAndNull,
   validateArray,
   validateObject,
   validateAbortSignal,
   validateBoolean,
   validateBuffer,
   validateFunction,
-  isInt32,
   validateInt32,
   validateInteger,
   validateNumber,

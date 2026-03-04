@@ -1,11 +1,5 @@
 'use strict';
 
-function emitWarningSync(message, type, code) {
-  if (typeof process.emitWarning === 'function') {
-    process.emitWarning(message, type, code);
-  }
-}
+const path = require('path');
 
-module.exports = {
-  emitWarningSync,
-};
+module.exports = require(path.resolve(__dirname, '../../../../../node-lib/internal/process/warning.js'));

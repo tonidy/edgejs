@@ -1462,6 +1462,93 @@ napi_value ProcessMethodsNoopUndefinedCallback(napi_env env, napi_callback_info 
   return undefined;
 }
 
+napi_value RunScriptOrEmptyArray(napi_env env, const char* source) {
+  napi_value script = nullptr;
+  if (napi_create_string_utf8(env, source, NAPI_AUTO_LENGTH, &script) != napi_ok || script == nullptr) {
+    napi_value out = nullptr;
+    napi_create_array(env, &out);
+    return out;
+  }
+  napi_value result = nullptr;
+  if (napi_run_script(env, script, &result) != napi_ok || result == nullptr) {
+    bool has_pending = false;
+    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+      napi_value ignored = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored);
+    }
+    napi_value out = nullptr;
+    napi_create_array(env, &out);
+    return out;
+  }
+  return result;
+}
+
+napi_value ProcessMethodsGetActiveRequestsCallback(napi_env env, napi_callback_info info) {
+  static constexpr const char* kScript =
+      "(function(){"
+      "  try {"
+      "    const reqs = globalThis.__ubi_active_requests;"
+      "    return Array.isArray(reqs) ? reqs.slice() : [];"
+      "  } catch {"
+      "    return [];"
+      "  }"
+      "})()";
+  return RunScriptOrEmptyArray(env, kScript);
+}
+
+napi_value ProcessMethodsGetActiveHandlesCallback(napi_env env, napi_callback_info info) {
+  static constexpr const char* kScript =
+      "(function(){"
+      "  try {"
+      "    const handles = globalThis.__ubi_active_handles;"
+      "    return Array.isArray(handles) ? handles.slice() : [];"
+      "  } catch {"
+      "    return [];"
+      "  }"
+      "})()";
+  return RunScriptOrEmptyArray(env, kScript);
+}
+
+napi_value ProcessMethodsGetActiveResourcesInfoCallback(napi_env env, napi_callback_info info) {
+  static constexpr const char* kScript =
+      "(function(){"
+      "  const out = [];"
+      "  try {"
+      "    const resources = globalThis.__ubi_active_resources;"
+      "    if (resources && typeof resources.values === 'function') {"
+      "      for (const type of resources.values()) {"
+      "        out.push(String(type));"
+      "      }"
+      "    }"
+      "    const reqs = globalThis.__ubi_active_requests;"
+      "    if (Array.isArray(reqs)) {"
+      "      for (let i = 0; i < reqs.length; i++) {"
+      "        const req = reqs[i];"
+      "        if (req && typeof req.type === 'string') out.push(req.type);"
+      "      }"
+      "    }"
+      "  } catch {}"
+      "  return out;"
+      "})()";
+  return RunScriptOrEmptyArray(env, kScript);
+}
+
+napi_value ProcessMethodsDlopenCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
+    return nullptr;
+  }
+  std::string filename = "(unknown)";
+  if (argc >= 2 && argv[1] != nullptr) {
+    const std::string maybe_name = NapiValueToUtf8(env, argv[1]);
+    if (!maybe_name.empty()) filename = maybe_name;
+  }
+  const std::string message = "Module did not self-register: '" + filename + "'.";
+  ThrowErrorWithCode(env, "ERR_DLOPEN_FAILED", message.c_str());
+  return nullptr;
+}
+
 napi_value ProcessMethodsEmptyArrayCallback(napi_env env, napi_callback_info info) {
   napi_value out = nullptr;
   napi_create_array(env, &out);
@@ -2071,30 +2158,6 @@ napi_status UbiInstallProcessObject(napi_env env,
   status = napi_set_named_property(env, process_obj, "hrtime", hrtime_fn);
   if (status != napi_ok) return status;
 
-  napi_value on_fn = nullptr;
-  status = napi_create_function(env, "on", NAPI_AUTO_LENGTH, [](napi_env env, napi_callback_info info) {
-    napi_value undefined = nullptr;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-  }, nullptr, &on_fn);
-  if (status != napi_ok || on_fn == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  status = napi_set_named_property(env, process_obj, "on", on_fn);
-  if (status != napi_ok) return status;
-  status = napi_set_named_property(env, process_obj, "addListener", on_fn);
-  if (status != napi_ok) return status;
-  status = napi_set_named_property(env, process_obj, "once", on_fn);
-  if (status != napi_ok) return status;
-
-  napi_value remove_listener_fn = nullptr;
-  status = napi_create_function(env, "removeListener", NAPI_AUTO_LENGTH, [](napi_env env, napi_callback_info info) {
-    napi_value undefined = nullptr;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-  }, nullptr, &remove_listener_fn);
-  if (status != napi_ok || remove_listener_fn == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  status = napi_set_named_property(env, process_obj, "removeListener", remove_listener_fn);
-  if (status != napi_ok) return status;
-
   status = InstallProcessStream(env, process_obj, "stdout", 1, ProcessStdoutWriteCallback);
   if (status != napi_ok) return status;
   status = InstallProcessStream(env, process_obj, "stderr", 2, ProcessStderrWriteCallback);
@@ -2270,7 +2333,9 @@ napi_status UbiInstallProcessObject(napi_env env,
   napi_property_descriptor config_desc = {};
   config_desc.utf8name = "config";
   config_desc.value = config_obj;
-  config_desc.attributes = napi_enumerable;
+  // Node bootstrap redefines process.config with specific descriptors.
+  config_desc.attributes = static_cast<napi_property_attributes>(
+      napi_writable | napi_enumerable | napi_configurable);
   status = napi_define_properties(env, process_obj, 1, &config_desc);
   if (status != napi_ok) return status;
 
@@ -2328,13 +2393,13 @@ napi_status UbiInstallProcessObject(napi_env env,
         {"threadCpuUsage", ProcessMethodsThreadCpuUsageBufferCallback},
         {"resourceUsage", ProcessMethodsResourceUsageBufferCallback},
         {"_debugEnd", ProcessMethodsNoopUndefinedCallback},
-        {"_getActiveRequests", ProcessMethodsEmptyArrayCallback},
-        {"_getActiveHandles", ProcessMethodsEmptyArrayCallback},
-        {"getActiveResourcesInfo", ProcessMethodsEmptyArrayCallback},
+        {"_getActiveRequests", ProcessMethodsGetActiveRequestsCallback},
+        {"_getActiveHandles", ProcessMethodsGetActiveHandlesCallback},
+        {"getActiveResourcesInfo", ProcessMethodsGetActiveResourcesInfoCallback},
         {"_kill", ProcessMethodsKillCallback},
         {"_rawDebug", ProcessMethodsRawDebugCallback},
         {"cwd", ProcessCwdCallback},
-        {"dlopen", ProcessMethodsNoopUndefinedCallback},
+        {"dlopen", ProcessMethodsDlopenCallback},
         {"reallyExit", ProcessExitCallback},
         {"execve", ProcessMethodsNoopUndefinedCallback},
         {"uptime", ProcessUptimeCallback},

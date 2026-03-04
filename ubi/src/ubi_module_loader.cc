@@ -56,6 +56,44 @@ std::string ReadTextFile(const fs::path& path) {
   return ss.str();
 }
 
+void ReplaceAll(std::string* text, const std::string& from, const std::string& to) {
+  if (text == nullptr || from.empty()) return;
+  size_t pos = 0;
+  while ((pos = text->find(from, pos)) != std::string::npos) {
+    text->replace(pos, from.size(), to);
+    pos += to.size();
+  }
+}
+
+std::string LoadBuiltinsConfigJson() {
+  static std::string cached;
+  if (!cached.empty()) return cached;
+
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  const std::vector<fs::path> candidates = {
+      source_root / "node" / "config.gypi",
+      fs::current_path() / "node" / "config.gypi",
+      fs::current_path().parent_path() / "node" / "config.gypi",
+  };
+
+  for (const fs::path& candidate : candidates) {
+    const std::string raw = ReadTextFile(candidate);
+    if (raw.empty()) continue;
+
+    // Drop the generated comment header line and normalize bool-like strings
+    // to booleans so JSON.parse() in bootstrap/node matches process.config.
+    const size_t newline = raw.find('\n');
+    std::string body = (newline == std::string::npos) ? raw : raw.substr(newline + 1);
+    ReplaceAll(&body, "\"true\"", "true");
+    ReplaceAll(&body, "\"false\"", "false");
+    cached = body;
+    if (!cached.empty()) return cached;
+  }
+
+  cached = "{\"variables\":{\"node_use_amaro\":false}}";
+  return cached;
+}
+
 std::string ValueToUtf8(napi_env env, napi_value value) {
   napi_value string_value = nullptr;
   if (napi_coerce_to_string(env, value, &string_value) != napi_ok || string_value == nullptr) {
@@ -356,6 +394,435 @@ static napi_value NoopCallback(napi_env env, napi_callback_info /*info*/) {
   return undefined;
 }
 
+static napi_value ReturnFalseCallback(napi_env env, napi_callback_info /*info*/) {
+  napi_value out = nullptr;
+  napi_get_boolean(env, false, &out);
+  return out;
+}
+
+static napi_value ReturnFirstArgCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+  if (argc >= 1 && argv[0] != nullptr) return argv[0];
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value ReturnTrueCallback(napi_env env, napi_callback_info /*info*/) {
+  napi_value out = nullptr;
+  napi_get_boolean(env, true, &out);
+  return out;
+}
+
+static napi_value RunScriptAndReturnValue(napi_env env, const char* source) {
+  if (env == nullptr || source == nullptr) return nullptr;
+  napi_value script = nullptr;
+  if (napi_create_string_utf8(env, source, NAPI_AUTO_LENGTH, &script) != napi_ok || script == nullptr) {
+    return nullptr;
+  }
+  napi_value out = nullptr;
+  if (napi_run_script(env, script, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
+  return out;
+}
+
+static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback_info /*info*/) {
+  static constexpr const char* kScript = R"JS((function() {
+  const kArrayOptions = new Set([
+    '--conditions',
+    '--disable-warning',
+    '--env-file',
+    '--env-file-if-exists',
+    '--experimental-loader',
+    '--import',
+    '--require',
+    '--test-coverage-exclude',
+    '--test-coverage-include',
+    '--test-name-pattern',
+    '--test-reporter',
+    '--test-reporter-destination',
+    '--test-skip-pattern',
+    '--watch-path',
+  ]);
+
+  const values = Object.assign(Object.create(null), {
+    '--abort-on-uncaught-exception': false,
+    '--async-context-frame': false,
+    '--conditions': [],
+    '--diagnostic-dir': '',
+    '--disable-warning': [],
+    '--dns-result-order': 'verbatim',
+    '--enable-source-maps': false,
+    '--entry-url': false,
+    '--env-file': [],
+    '--env-file-if-exists': [],
+    '--es-module-specifier-resolution': '',
+    '--eval': '',
+    '--experimental-addon-modules': false,
+    '--experimental-config-file': false,
+    '--experimental-default-config-file': false,
+    '--experimental-detect-module': false,
+    '--experimental-eventsource': false,
+    '--experimental-fetch': false,
+    '--experimental-global-customevent': false,
+    '--experimental-global-webcrypto': false,
+    '--experimental-import-meta-resolve': false,
+    '--experimental-inspector-network-resource': false,
+    '--experimental-loader': [],
+    '--experimental-network-inspection': false,
+    '--experimental-print-required-tla': false,
+    '--experimental-quic': false,
+    '--no-experimental-quic': false,
+    '--experimental-require-module': false,
+    '--experimental-report': false,
+    '--experimental-sqlite': false,
+    '--no-experimental-sqlite': false,
+    '--experimental-test-coverage': false,
+    '--experimental-test-module-mocks': false,
+    '--experimental-transform-types': false,
+    '--experimental-vm-modules': false,
+    '--experimental-wasm-modules': false,
+    '--experimental-webstorage': false,
+    '--experimental-worker': false,
+    '--expose-internals': false,
+    '--force-fips': false,
+    '--frozen-intrinsics': false,
+    '--heapsnapshot-near-heap-limit': 0,
+    '--heapsnapshot-signal': '',
+    '--icu-data-dir': '',
+    '--import': [],
+    '--insecure-http-parser': false,
+    '--input-type': '',
+    '--inspect-brk': false,
+    '--loader': [],
+    '--localstorage-file': '',
+    '--max-http-header-size': 16 * 1024,
+    '--network-family-autoselection': true,
+    '--network-family-autoselection-attempt-timeout': 2500,
+    '--no-addons': false,
+    '--no-deprecation': false,
+    '--no-experimental-global-navigator': false,
+    '--no-experimental-websocket': false,
+    '--node-snapshot': false,
+    '--no-node-snapshot': false,
+    '--openssl-config': '',
+    '--openssl-legacy-provider': false,
+    '--openssl-shared-config': false,
+    '--pending-deprecation': false,
+    '--permission': false,
+    '--preserve-symlinks': false,
+    '--preserve-symlinks-main': false,
+    '--print': false,
+    '--redirect-warnings': '',
+    '--report-on-signal': false,
+    '--require': [],
+    '--secure-heap': 0,
+    '--secure-heap-min': 0,
+    '--stack-trace-limit': 10,
+    '--strip-types': false,
+    '--test': false,
+    '--test-concurrency': 0,
+    '--test-coverage-branches': 0,
+    '--test-coverage-exclude': [],
+    '--test-coverage-functions': 0,
+    '--test-coverage-include': [],
+    '--test-coverage-lines': 0,
+    '--test-force-exit': false,
+    '--test-global-setup': '',
+    '--test-isolation': 'process',
+    '--test-name-pattern': [],
+    '--test-only': false,
+    '--test-reporter': [],
+    '--test-reporter-destination': [],
+    '--test-rerun-failures': '',
+    '--test-shard': '',
+    '--test-skip-pattern': [],
+    '--test-timeout': 0,
+    '--test-update-snapshots': false,
+    '--throw-deprecation': false,
+    '--tls-cipher-list': '',
+    '--tls-keylog': '',
+    '--tls-max-v1.2': false,
+    '--tls-max-v1.3': false,
+    '--tls-min-v1.0': false,
+    '--tls-min-v1.1': false,
+    '--tls-min-v1.2': false,
+    '--tls-min-v1.3': false,
+    '--trace-deprecation': false,
+    '--trace-require-module': false,
+    '--trace-sigint': false,
+    '--trace-tls': false,
+    '--trace-warnings': false,
+    '--unhandled-rejections': 'throw',
+    '--use-bundled-ca': false,
+    '--use-env-proxy': false,
+    '--use-openssl-ca': false,
+    '--use-system-ca': false,
+    '--verify-base-objects': false,
+    '--no-verify-base-objects': false,
+    '--watch': false,
+    '--watch-kill-signal': 'SIGTERM',
+    '--watch-path': [],
+    '--watch-preserve-output': false,
+    '--warnings': true,
+    '[has_eval_string]': false,
+  });
+
+  const lists = [
+    Array.isArray(process && process.execArgv) ? process.execArgv : [],
+    Array.isArray(process && process.argv) ? process.argv : [],
+  ];
+
+  for (const list of lists) {
+    for (let i = 0; i < list.length; i++) {
+      const token = list[i];
+      if (typeof token !== 'string' || token.length === 0 || token[0] !== '-') continue;
+
+      const eq = token.indexOf('=');
+      let key = eq === -1 ? token : token.slice(0, eq);
+      const raw = eq === -1 ? true : token.slice(eq + 1);
+
+      if (key === '-r') key = '--require';
+      if (key === '--loader') key = '--experimental-loader';
+
+      if (kArrayOptions.has(key)) {
+        if (!Array.isArray(values[key])) values[key] = [];
+        if (eq !== -1) {
+          values[key].push(raw);
+        } else if (i + 1 < list.length) {
+          const next = list[i + 1];
+          if (typeof next === 'string' && next.length > 0 && next[0] !== '-') {
+            values[key].push(next);
+            i++;
+          }
+        }
+        continue;
+      }
+
+      if (eq === -1) {
+        values[key] = true;
+      } else {
+        const maybeNum = Number(raw);
+        values[key] = Number.isNaN(maybeNum) ? raw : maybeNum;
+      }
+
+      if (key === '--eval' || key === '-e') {
+        values['[has_eval_string]'] = true;
+      }
+    }
+  }
+
+  return values;
+})())JS";
+  napi_value out = RunScriptAndReturnValue(env, kScript);
+  if (out != nullptr) return out;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_info /*info*/) {
+  static constexpr const char* kScript = R"JS((function() {
+  const kAllowedInEnvvar = 0;
+  const kString = 5;
+
+  function readCliMarkdown() {
+    const fs = require('fs');
+    const path = require('path');
+    const candidates = [
+      path.resolve(process.cwd(), 'node/doc/api/cli.md'),
+      path.resolve(process.cwd(), '../node/doc/api/cli.md'),
+      path.resolve(process.cwd(), '../../node/doc/api/cli.md'),
+    ];
+    for (const file of candidates) {
+      try {
+        return fs.readFileSync(file, 'utf8');
+      } catch {}
+    }
+    return '';
+  }
+
+  function parseAllowedFlagsFromDocs() {
+    const text = readCliMarkdown();
+    if (!text) return new Set();
+    const sections = [
+      ['<!-- node-options-node start -->', '<!-- node-options-node end -->'],
+      ['<!-- node-options-v8 start -->', '<!-- node-options-v8 end -->'],
+    ];
+    const out = new Set();
+    for (const section of sections) {
+      const start = section[0];
+      const end = section[1];
+      const re = new RegExp(start + '\\r?\\n([^]*)\\r?\\n' + end);
+      const match = text.match(re);
+      if (!match) continue;
+      const lines = match[1].split(/\\r?\\n/);
+      for (const line of lines) {
+        if (!line || !line.trim()) continue;
+        for (const m of line.matchAll(/`(-[^`]+)`/g)) {
+          out.add(m[1].replace('--no-', '--'));
+        }
+      }
+    }
+    return out;
+  }
+
+  const options = new Map();
+  const aliases = new Map();
+  const documented = parseAllowedFlagsFromDocs();
+  const extras = [
+    '--debug-arraybuffer-allocations',
+    '--no-debug-arraybuffer-allocations',
+    '--es-module-specifier-resolution',
+    '--experimental-fetch',
+    '--experimental-wasm-modules',
+    '--experimental-global-customevent',
+    '--experimental-global-webcrypto',
+    '--experimental-report',
+    '--experimental-worker',
+    '--node-snapshot',
+    '--no-node-snapshot',
+    '--loader',
+    '--verify-base-objects',
+    '--no-verify-base-objects',
+    '--trace-promises',
+    '--no-trace-promises',
+    '--experimental-quic',
+  ];
+
+  for (const opt of documented) {
+    options.set(opt, { envVarSettings: kAllowedInEnvvar, type: kString });
+  }
+  for (const opt of extras) {
+    options.set(opt, { envVarSettings: kAllowedInEnvvar, type: kString });
+  }
+  if (process && process.config && process.config.variables && process.config.variables.node_quic) {
+    options.set('--no-experimental-quic', { envVarSettings: kAllowedInEnvvar, type: kString });
+  }
+
+  if (!(process && process.features && process.features.inspector)) {
+    const inspectorOnly = [
+      '--cpu-prof-dir',
+      '--cpu-prof-interval',
+      '--cpu-prof-name',
+      '--cpu-prof',
+      '--heap-prof-dir',
+      '--heap-prof-interval',
+      '--heap-prof-name',
+      '--heap-prof',
+      '--inspect-brk',
+      '--inspect-port',
+      '--debug-port',
+      '--inspect-publish-uid',
+      '--inspect-wait',
+      '--inspect',
+    ];
+    for (const opt of inspectorOnly) options.delete(opt);
+  }
+
+  options.set('--perf-basic-prof', { envVarSettings: kAllowedInEnvvar, type: kString });
+  options.set('--stack-trace-limit', { envVarSettings: kAllowedInEnvvar, type: kString });
+  options.set('-r', { envVarSettings: kAllowedInEnvvar, type: kString });
+  options.delete('--icu-data-dir');
+
+  aliases.set('-r', ['--require']);
+  return { options, aliases };
+})())JS";
+  napi_value out = RunScriptAndReturnValue(env, kScript);
+  if (out != nullptr) return out;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value OptionsGetOptionsAsFlagsCallback(napi_env env, napi_callback_info /*info*/) {
+  static constexpr const char* kScript = R"JS((function() {
+  return Array.isArray(process && process.execArgv) ? process.execArgv.slice() : [];
+})())JS";
+  napi_value out = RunScriptAndReturnValue(env, kScript);
+  if (out != nullptr) return out;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value OptionsGetEmbedderOptionsCallback(napi_env env, napi_callback_info /*info*/) {
+  static constexpr const char* kScript = R"JS(({
+  hasEmbedderPreload: false,
+  noBrowserGlobals: false,
+  noGlobalSearchPaths: false,
+}))JS";
+  napi_value out = RunScriptAndReturnValue(env, kScript);
+  if (out != nullptr) return out;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value OptionsGetEnvOptionsInputTypeCallback(napi_env env, napi_callback_info /*info*/) {
+  static constexpr const char* kScript = R"JS((function() {
+  const map = new Map();
+  const stringOpts = [
+    '--conditions',
+    '--disable-warning',
+    '--diagnostic-dir',
+    '--dns-result-order',
+    '--env-file',
+    '--env-file-if-exists',
+    '--experimental-loader',
+    '--import',
+    '--input-type',
+    '--max-http-header-size',
+    '--network-family-autoselection-attempt-timeout',
+    '--redirect-warnings',
+    '--require',
+    '--secure-heap',
+    '--secure-heap-min',
+    '--stack-trace-limit',
+    '--test-concurrency',
+    '--test-coverage-branches',
+    '--test-coverage-exclude',
+    '--test-coverage-functions',
+    '--test-coverage-include',
+    '--test-coverage-lines',
+    '--test-global-setup',
+    '--test-name-pattern',
+    '--test-reporter',
+    '--test-reporter-destination',
+    '--test-rerun-failures',
+    '--test-shard',
+    '--test-skip-pattern',
+    '--test-timeout',
+    '--tls-cipher-list',
+    '--tls-keylog',
+    '--unhandled-rejections',
+    '--watch-kill-signal',
+    '--watch-path',
+  ];
+  for (const opt of stringOpts) {
+    map.set(opt, 'string');
+  }
+  return map;
+})())JS";
+  napi_value out = RunScriptAndReturnValue(env, kScript);
+  if (out != nullptr) return out;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+static napi_value OptionsGetNamespaceOptionsInputTypeCallback(napi_env env, napi_callback_info /*info*/) {
+  static constexpr const char* kScript = R"JS((new Map()))JS";
+  napi_value out = RunScriptAndReturnValue(env, kScript);
+  if (out != nullptr) return out;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderState* state) {
   if (state == nullptr) return nullptr;
   if (state->native_builtins_binding_ref != nullptr) {
@@ -384,6 +851,22 @@ static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderSta
     }
   }
   if (napi_set_named_property(env, binding, "builtinIds", builtin_ids_array) != napi_ok) {
+    return nullptr;
+  }
+
+  napi_value config_json = nullptr;
+  const std::string builtins_config_json = LoadBuiltinsConfigJson();
+  if (napi_create_string_utf8(env, builtins_config_json.c_str(), NAPI_AUTO_LENGTH, &config_json) != napi_ok ||
+      config_json == nullptr ||
+      napi_set_named_property(env, binding, "config", config_json) != napi_ok) {
+    return nullptr;
+  }
+
+  napi_value has_cached_builtins_fn = nullptr;
+  if (napi_create_function(env, "hasCachedBuiltins", NAPI_AUTO_LENGTH, ReturnTrueCallback, nullptr,
+                           &has_cached_builtins_fn) != napi_ok ||
+      has_cached_builtins_fn == nullptr ||
+      napi_set_named_property(env, binding, "hasCachedBuiltins", has_cached_builtins_fn) != napi_ok) {
     return nullptr;
   }
 
@@ -760,6 +1243,24 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
     napi_value binding = GetOrCreateTraceEventsBinding(env);
     return binding != nullptr ? binding : undefined;
   }
+  if (name == "credentials") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+    napi_value f = nullptr;
+    napi_get_boolean(env, false, &f);
+    napi_set_named_property(env, out, "implementsPosixCredentials", f);
+    return out;
+  }
+  if (name == "async_wrap") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+    napi_value setup_hooks = nullptr;
+    if (napi_create_function(env, "setupHooks", NAPI_AUTO_LENGTH, NoopCallback, nullptr, &setup_hooks) == napi_ok &&
+        setup_hooks != nullptr) {
+      napi_set_named_property(env, out, "setupHooks", setup_hooks);
+    }
+    return out;
+  }
   if (name == "url_pattern") {
     napi_value out = nullptr;
     if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
@@ -855,10 +1356,83 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
     napi_set_named_property(env, out, "hasInspector", f);
     napi_set_named_property(env, out, "hasTracing", f);
     napi_set_named_property(env, out, "hasOpenSSL", t);
+    napi_set_named_property(env, out, "openSSLIsBoringSSL", f);
     napi_set_named_property(env, out, "fipsMode", f);
     napi_set_named_property(env, out, "hasNodeOptions", t);
     napi_set_named_property(env, out, "noBrowserGlobals", f);
     napi_set_named_property(env, out, "isDebugBuild", f);
+    return out;
+  }
+  if (name == "contextify") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+    napi_value contains_module_syntax = nullptr;
+    if (napi_create_function(env,
+                             "containsModuleSyntax",
+                             NAPI_AUTO_LENGTH,
+                             ReturnFalseCallback,
+                             nullptr,
+                             &contains_module_syntax) == napi_ok &&
+        contains_module_syntax != nullptr) {
+      napi_set_named_property(env, out, "containsModuleSyntax", contains_module_syntax);
+    }
+    return out;
+  }
+  if (name == "module_wrap") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+    set_int32(out, "kSourcePhase", 0);
+    set_int32(out, "kEvaluationPhase", 1);
+    set_int32(out, "kEvaluated", 2);
+    napi_value create_required_module_facade = nullptr;
+    if (napi_create_function(env,
+                             "createRequiredModuleFacade",
+                             NAPI_AUTO_LENGTH,
+                             ReturnFirstArgCallback,
+                             nullptr,
+                             &create_required_module_facade) == napi_ok &&
+        create_required_module_facade != nullptr) {
+      napi_set_named_property(env, out, "createRequiredModuleFacade", create_required_module_facade);
+    }
+    return out;
+  }
+  if (name == "options") {
+    napi_value out = nullptr;
+    if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
+
+    napi_value env_settings = nullptr;
+    if (napi_create_object(env, &env_settings) != napi_ok || env_settings == nullptr) return undefined;
+    set_int32(env_settings, "kAllowedInEnvvar", 0);
+    set_int32(env_settings, "kDisallowedInEnvvar", 1);
+    if (napi_set_named_property(env, out, "envSettings", env_settings) != napi_ok) return undefined;
+
+    napi_value types = nullptr;
+    if (napi_create_object(env, &types) != napi_ok || types == nullptr) return undefined;
+    set_int32(types, "kNoOp", 0);
+    set_int32(types, "kV8Option", 1);
+    set_int32(types, "kBoolean", 2);
+    set_int32(types, "kInteger", 3);
+    set_int32(types, "kUInteger", 4);
+    set_int32(types, "kString", 5);
+    set_int32(types, "kHostPort", 6);
+    set_int32(types, "kStringList", 7);
+    if (napi_set_named_property(env, out, "types", types) != napi_ok) return undefined;
+
+    auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
+      napi_value fn = nullptr;
+      return napi_create_function(env, method_name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
+             fn != nullptr &&
+             napi_set_named_property(env, out, method_name, fn) == napi_ok;
+    };
+    if (!define_method("getCLIOptionsValues", OptionsGetCLIOptionsValuesCallback) ||
+        !define_method("getCLIOptionsInfo", OptionsGetCLIOptionsInfoCallback) ||
+        !define_method("getOptionsAsFlags", OptionsGetOptionsAsFlagsCallback) ||
+        !define_method("getEmbedderOptions", OptionsGetEmbedderOptionsCallback) ||
+        !define_method("getEnvOptionsInputType", OptionsGetEnvOptionsInputTypeCallback) ||
+        !define_method("getNamespaceOptionsInputType", OptionsGetNamespaceOptionsInputTypeCallback)) {
+      return undefined;
+    }
+
     return out;
   }
   if (name == "types") {

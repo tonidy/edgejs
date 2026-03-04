@@ -5,54 +5,6 @@ require('internal/event_target');
 
 const exported = require('../../../node-lib/events.js');
 
-// Provide a lightweight process event emitter surface in runtimes where process
-// does not expose Node's full EventEmitter behavior.
-if (typeof process === 'object' && process != null && typeof process.emit !== 'function') {
-  const listeners = new Map();
-  process.on = process.addListener = function on(name, listener) {
-    const key = String(name);
-    const arr = listeners.get(key) || [];
-    arr.push(listener);
-    listeners.set(key, arr);
-    return process;
-  };
-  process.removeListener = function removeListener(name, listener) {
-    const key = String(name);
-    const arr = listeners.get(key);
-    if (!arr) return process;
-    const idx = arr.lastIndexOf(listener);
-    if (idx >= 0) arr.splice(idx, 1);
-    listeners.set(key, arr);
-    return process;
-  };
-  process.once = function once(name, listener) {
-    function wrapped(...args) {
-      process.removeListener(name, wrapped);
-      return listener.apply(this, args);
-    }
-    return process.on(name, wrapped);
-  };
-  process.emit = function emit(name, ...args) {
-    const arr = (listeners.get(String(name)) || []).slice();
-    for (const fn of arr) {
-      fn.apply(process, args);
-    }
-    return arr.length > 0;
-  };
-  process.removeAllListeners = function removeAllListeners(name) {
-    if (name === undefined) {
-      listeners.clear();
-    } else {
-      listeners.delete(String(name));
-    }
-    return process;
-  };
-  process.listenerCount = function listenerCount(name) {
-    const arr = listeners.get(String(name));
-    return arr ? arr.length : 0;
-  };
-}
-
 // Node marks AbortSignal max listeners as 0 by default.
 if (typeof AbortSignal === 'function' &&
     AbortSignal.prototype &&
