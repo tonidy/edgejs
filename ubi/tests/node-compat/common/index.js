@@ -4,6 +4,7 @@ const assert = require('assert');
 const childProcess = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { inspect } = require('util');
 const tmpdir = require('./tmpdir');
 try { require('internal/event_target'); } catch {}
 const processRef = globalThis.process;
@@ -97,18 +98,19 @@ function invalidArgTypeHelper(input) {
     return ` Received ${input}`;
   }
   if (typeof input === 'function') {
-    return ` Received function ${input.name || '<anonymous>'}`;
+    return ` Received function ${input.name}`;
   }
   if (typeof input === 'object') {
-    if (input.constructor && input.constructor.name) {
+    if (input.constructor?.name) {
       return ` Received an instance of ${input.constructor.name}`;
     }
-    return ` Received ${typeof input}`;
+    return ` Received ${inspect(input, { depth: -1 })}`;
   }
-  let shown = String(input).slice(0, 25);
-  if (String(input).length > 25) shown += '...';
-  if (typeof input === 'string') shown = `'${shown}'`;
-  return ` Received type ${typeof input} (${shown})`;
+
+  let inspected = inspect(input, { colors: false });
+  if (inspected.length > 28) { inspected = `${inspected.slice(inspected, 0, 25)}...`; }
+
+  return ` Received type ${typeof input} (${inspected})`;
 }
 
 // Node test harness: wrap options so tests can assert they are not mutated (no-op here).

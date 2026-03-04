@@ -50,4 +50,55 @@ const BuiltinModule = {
   },
 };
 
+function setupPrepareStackTrace() {
+  try {
+    const errorsBinding = internalBinding('errors');
+    if (!errorsBinding || typeof errorsBinding !== 'object') return;
+
+    const {
+      setEnhanceStackForFatalException,
+      setPrepareStackTraceCallback,
+    } = errorsBinding;
+    if (typeof setPrepareStackTraceCallback !== 'function' ||
+        typeof setEnhanceStackForFatalException !== 'function') {
+      return;
+    }
+
+    const {
+      prepareStackTraceCallback,
+      ErrorPrepareStackTrace,
+      fatalExceptionStackEnhancers,
+    } = require('internal/errors');
+
+    if (typeof prepareStackTraceCallback === 'function') {
+      setPrepareStackTraceCallback(prepareStackTraceCallback);
+    }
+
+    const beforeInspector =
+      fatalExceptionStackEnhancers &&
+      fatalExceptionStackEnhancers.beforeInspector;
+    const afterInspector =
+      fatalExceptionStackEnhancers &&
+      fatalExceptionStackEnhancers.afterInspector;
+    if (typeof beforeInspector === 'function' &&
+        typeof afterInspector === 'function') {
+      setEnhanceStackForFatalException(beforeInspector, afterInspector);
+    }
+
+    if (typeof ErrorPrepareStackTrace === 'function') {
+      Object.defineProperty(Error, 'prepareStackTrace', {
+        __proto__: null,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+        value: ErrorPrepareStackTrace,
+      });
+    }
+  } catch {
+    // Keep bootstrap resilient in subprocess/minimal startup modes.
+  }
+}
+
+setupPrepareStackTrace();
+
 module.exports = { internalBinding, primordials, BuiltinModule };

@@ -1,19 +1,3 @@
 'use strict';
 
-function getSourceMapsSupport() {
-  return { enabled: true };
-}
-
-function findSourceMap() {
-  return undefined;
-}
-
-function getSourceLine() {
-  return undefined;
-}
-
-module.exports = {
-  getSourceMapsSupport,
-  findSourceMap,
-  getSourceLine,
-};
+module.exports = require('../../../../../node-lib/internal/source_map/source_map_cache.js');

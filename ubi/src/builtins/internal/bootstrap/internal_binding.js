@@ -609,21 +609,6 @@ function internalBinding(name) {
     if (binding.UV_UNKNOWN === undefined) binding.UV_UNKNOWN = -4094;
     if (binding.UV_EAI_MEMORY === undefined) binding.UV_EAI_MEMORY = -3001;
   }
-  if (key === 'errors') {
-    if (!binding || typeof binding !== 'object') {
-      binding = {};
-    }
-    if (typeof binding.getErrorSourcePositions !== 'function') {
-      binding.getErrorSourcePositions = function getErrorSourcePositions() {
-        return {
-          sourceLine: '',
-          scriptResourceName: '',
-          lineNumber: 0,
-          startColumn: 0,
-        };
-      };
-    }
-  }
 
   kInternalBindingCache.set(key, binding);
   return binding;

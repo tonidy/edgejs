@@ -249,6 +249,7 @@ add_library(ubi_runtime STATIC
   src/ubi_runtime_platform_v8.cc
   src/ubi_process.cc
   src/ubi_module_loader.cc
+  src/ubi_errors_binding.cc
   "${PROJECT_ROOT}/deps/llhttp/src/api.c"
   "${PROJECT_ROOT}/deps/llhttp/src/http.c"
   "${PROJECT_ROOT}/deps/llhttp/src/llhttp.c"

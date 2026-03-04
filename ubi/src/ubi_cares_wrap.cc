@@ -129,6 +129,7 @@ using AresStringPtr = std::unique_ptr<char, AresStringDeleter>;
 
 std::unordered_map<napi_env, std::unordered_set<ChannelWrap*>> g_channels_by_env;
 std::unordered_set<napi_env> g_cleanup_hook_registered;
+std::unordered_set<napi_env> g_cleanup_in_progress;
 int g_cares_library_refcount = 0;
 
 void OnCaresEnvCleanup(void* arg);
@@ -150,6 +151,7 @@ void RegisterChannelForEnv(ChannelWrap* channel) {
 
 void UnregisterChannelForEnv(ChannelWrap* channel) {
   if (channel == nullptr || channel->env == nullptr) return;
+  if (g_cleanup_in_progress.find(channel->env) != g_cleanup_in_progress.end()) return;
   auto it = g_channels_by_env.find(channel->env);
   if (it == g_channels_by_env.end()) return;
   it->second.erase(channel);
@@ -579,6 +581,11 @@ void ModifyActivityQueryCount(ChannelWrap* channel, int delta) {
     uint32_t ref_count = 0;
     (void)napi_reference_ref(channel->env, channel->wrapper_ref, &ref_count);
   } else if (prev > 0 && channel->active_query_count == 0) {
+    // During env cleanup, avoid dropping the last ref from inside c-ares
+    // callbacks; ChannelFinalize will run as part of env teardown.
+    if (g_cleanup_in_progress.find(channel->env) != g_cleanup_in_progress.end()) {
+      return;
+    }
     uint32_t ref_count = 0;
     (void)napi_reference_unref(channel->env, channel->wrapper_ref, &ref_count);
   }
@@ -1273,82 +1280,87 @@ void CompleteQuery(CaresReqWrap* req,
   ChannelWrap* channel = req->channel;
   if (channel != nullptr) {
     channel->query_last_ok = (status != ARES_ECONNREFUSED);
-    ModifyActivityQueryCount(channel, -1);
   }
 
   napi_env env = req->env;
+  const bool env_cleaning = (env != nullptr && g_cleanup_in_progress.find(env) != g_cleanup_in_progress.end());
   UntrackPendingReq(req);
 
   if (env == nullptr) {
     MarkReqComplete(req);
     MaybeDeleteReq(req);
-    return;
-  }
-
-  if (status != ARES_SUCCESS) {
-    CallOnCompleteError(req, status);
+  } else if (status != ARES_SUCCESS) {
+    // Do not invoke JS callbacks once env teardown has started.
+    if (!env_cleaning) {
+      CallOnCompleteError(req, status);
+    }
     MarkReqComplete(req);
     CleanupReqAfterAsync(req);
-    return;
-  }
-
-  napi_value result = nullptr;
-  napi_value extra = nullptr;
-  int parse_status = ARES_SUCCESS;
-
-  switch (req->query_kind) {
-    case QueryKind::kAny:
-      parse_status = ParseAnyReply(env, buf, len, &result);
-      break;
-    case QueryKind::kA:
-      parse_status = ParseAReply(env, buf, len, &result, &extra);
-      break;
-    case QueryKind::kAaaa:
-      parse_status = ParseAaaaReply(env, buf, len, &result, &extra);
-      break;
-    case QueryKind::kCaa:
-      parse_status = ParseCaaOnlyReply(env, buf, len, &result);
-      break;
-    case QueryKind::kCname:
-      parse_status = ParseCnameReply(env, buf, len, &result);
-      break;
-    case QueryKind::kMx:
-      parse_status = ParseMxOnlyReply(env, buf, len, &result);
-      break;
-    case QueryKind::kNs:
-      parse_status = ParseNsReply(env, buf, len, &result);
-      break;
-    case QueryKind::kTlsa:
-      parse_status = ParseTlsaOnlyReply(env, buf, len, &result);
-      break;
-    case QueryKind::kTxt:
-      parse_status = ParseTxtOnlyReply(env, buf, len, &result);
-      break;
-    case QueryKind::kSrv:
-      parse_status = ParseSrvOnlyReply(env, buf, len, &result);
-      break;
-    case QueryKind::kPtr:
-      parse_status = ParsePtrReply(env, buf, len, &result);
-      break;
-    case QueryKind::kNaptr:
-      parse_status = ParseNaptrOnlyReply(env, buf, len, &result);
-      break;
-    case QueryKind::kSoa:
-      parse_status = ParseSoaOnlyReply(env, buf, len, &result);
-      break;
-    case QueryKind::kReverse:
-      parse_status = from_host ? ParseReverseHost(env, host, &result) : ARES_EBADRESP;
-      break;
-  }
-
-  if (parse_status != ARES_SUCCESS) {
-    CallOnCompleteError(req, parse_status);
   } else {
-    CallOnCompleteSuccess(req, result, extra);
+    napi_value result = nullptr;
+    napi_value extra = nullptr;
+    int parse_status = ARES_SUCCESS;
+
+    switch (req->query_kind) {
+      case QueryKind::kAny:
+        parse_status = ParseAnyReply(env, buf, len, &result);
+        break;
+      case QueryKind::kA:
+        parse_status = ParseAReply(env, buf, len, &result, &extra);
+        break;
+      case QueryKind::kAaaa:
+        parse_status = ParseAaaaReply(env, buf, len, &result, &extra);
+        break;
+      case QueryKind::kCaa:
+        parse_status = ParseCaaOnlyReply(env, buf, len, &result);
+        break;
+      case QueryKind::kCname:
+        parse_status = ParseCnameReply(env, buf, len, &result);
+        break;
+      case QueryKind::kMx:
+        parse_status = ParseMxOnlyReply(env, buf, len, &result);
+        break;
+      case QueryKind::kNs:
+        parse_status = ParseNsReply(env, buf, len, &result);
+        break;
+      case QueryKind::kTlsa:
+        parse_status = ParseTlsaOnlyReply(env, buf, len, &result);
+        break;
+      case QueryKind::kTxt:
+        parse_status = ParseTxtOnlyReply(env, buf, len, &result);
+        break;
+      case QueryKind::kSrv:
+        parse_status = ParseSrvOnlyReply(env, buf, len, &result);
+        break;
+      case QueryKind::kPtr:
+        parse_status = ParsePtrReply(env, buf, len, &result);
+        break;
+      case QueryKind::kNaptr:
+        parse_status = ParseNaptrOnlyReply(env, buf, len, &result);
+        break;
+      case QueryKind::kSoa:
+        parse_status = ParseSoaOnlyReply(env, buf, len, &result);
+        break;
+      case QueryKind::kReverse:
+        parse_status = from_host ? ParseReverseHost(env, host, &result) : ARES_EBADRESP;
+        break;
+    }
+
+    if (!env_cleaning) {
+      if (parse_status != ARES_SUCCESS) {
+        CallOnCompleteError(req, parse_status);
+      } else {
+        CallOnCompleteSuccess(req, result, extra);
+      }
+    }
+
+    MarkReqComplete(req);
+    CleanupReqAfterAsync(req);
   }
 
-  MarkReqComplete(req);
-  CleanupReqAfterAsync(req);
+  if (channel != nullptr) {
+    ModifyActivityQueryCount(channel, -1);
+  }
 }
 
 void OnDnsQueryComplete(void* arg,
@@ -1439,16 +1451,40 @@ int DispatchQuery(ChannelWrap* channel, CaresReqWrap* req, const QueryMethodData
 
 void OnCaresEnvCleanup(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
+  g_cleanup_in_progress.emplace(env);
 
+  std::vector<ChannelWrap*> channels;
   auto channel_it = g_channels_by_env.find(env);
   if (channel_it != g_channels_by_env.end()) {
+    channels.reserve(channel_it->second.size());
     for (ChannelWrap* channel : channel_it->second) {
-      if (channel == nullptr || channel->channel == nullptr) continue;
-      ares_cancel(channel->channel);
+      channels.push_back(channel);
     }
     g_channels_by_env.erase(channel_it);
   }
 
+  std::vector<ChannelWrap*> pinned_channels;
+  pinned_channels.reserve(channels.size());
+  for (ChannelWrap* channel : channels) {
+    if (channel == nullptr || channel->env != env || channel->wrapper_ref == nullptr) continue;
+    uint32_t ref_count = 0;
+    if (napi_reference_ref(env, channel->wrapper_ref, &ref_count) == napi_ok) {
+      pinned_channels.push_back(channel);
+    }
+  }
+
+  for (ChannelWrap* channel : channels) {
+    if (channel == nullptr || channel->channel == nullptr) continue;
+    ares_cancel(channel->channel);
+  }
+
+  for (ChannelWrap* channel : pinned_channels) {
+    if (channel == nullptr || channel->env != env || channel->wrapper_ref == nullptr) continue;
+    uint32_t ref_count = 0;
+    (void)napi_reference_unref(env, channel->wrapper_ref, &ref_count);
+  }
+
+  g_cleanup_in_progress.erase(env);
   g_cleanup_hook_registered.erase(env);
 }
 

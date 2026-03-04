@@ -1,4 +1,5 @@
 #include "ubi_module_loader.h"
+#include "ubi_errors_binding.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -35,9 +36,6 @@ struct TaskQueueBindingState {
   napi_ref tick_callback_ref = nullptr;
   napi_ref promise_reject_callback_ref = nullptr;
 };
-struct ErrorsBindingState {
-  napi_ref binding_ref = nullptr;
-};
 struct TraceEventsBindingState {
   napi_ref binding_ref = nullptr;
   napi_ref state_update_handler_ref = nullptr;
@@ -45,7 +43,6 @@ struct TraceEventsBindingState {
 
 std::unordered_map<napi_env, ModuleLoaderState> g_loader_states;
 std::unordered_map<napi_env, TaskQueueBindingState> g_task_queue_states;
-std::unordered_map<napi_env, ErrorsBindingState> g_errors_states;
 std::unordered_map<napi_env, TraceEventsBindingState> g_trace_events_states;
 std::vector<RequireContext*> g_require_contexts;
 
@@ -544,76 +541,6 @@ static napi_value GetOrCreateTaskQueueBinding(napi_env env) {
   return binding;
 }
 
-static napi_value ErrorsNoSideEffectsToString(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
-  napi_value out = nullptr;
-  if (napi_coerce_to_string(env, argv[0], &out) != napi_ok || out == nullptr) {
-    napi_get_undefined(env, &out);
-  }
-  return out;
-}
-
-static napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
-  if (argc >= 1 && argv[0] != nullptr) {
-    napi_throw(env, argv[0]);
-  }
-  napi_value undefined = nullptr;
-  napi_get_undefined(env, &undefined);
-  return undefined;
-}
-
-static napi_value GetOrCreateErrorsBinding(napi_env env) {
-  auto& st = g_errors_states[env];
-  if (st.binding_ref != nullptr) {
-    napi_value existing = nullptr;
-    if (napi_get_reference_value(env, st.binding_ref, &existing) == napi_ok && existing != nullptr) {
-      return existing;
-    }
-  }
-
-  napi_value binding = nullptr;
-  if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
-  auto define_method = [&](const char* name, napi_callback cb) -> bool {
-    napi_value fn = nullptr;
-    return napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&
-           fn != nullptr &&
-           napi_set_named_property(env, binding, name, fn) == napi_ok;
-  };
-  if (!define_method("noSideEffectsToString", ErrorsNoSideEffectsToString) ||
-      !define_method("triggerUncaughtException", ErrorsTriggerUncaughtException)) {
-    return nullptr;
-  }
-
-  napi_value exit_codes = nullptr;
-  if (napi_create_object(env, &exit_codes) != napi_ok || exit_codes == nullptr) return nullptr;
-  auto set_const = [&](const char* name, int32_t value) -> bool {
-    napi_value v = nullptr;
-    return napi_create_int32(env, value, &v) == napi_ok &&
-           v != nullptr &&
-           napi_set_named_property(env, exit_codes, name, v) == napi_ok;
-  };
-  if (!set_const("kNoFailure", 0) ||
-      !set_const("kGenericUserError", 1) ||
-      !set_const("kInvalidArgument", 9)) {
-    return nullptr;
-  }
-  if (napi_set_named_property(env, binding, "exitCodes", exit_codes) != napi_ok) return nullptr;
-
-  if (st.binding_ref != nullptr) {
-    napi_delete_reference(env, st.binding_ref);
-    st.binding_ref = nullptr;
-  }
-  if (napi_create_reference(env, binding, 1, &st.binding_ref) != napi_ok || st.binding_ref == nullptr) {
-    return nullptr;
-  }
-  return binding;
-}
-
 static napi_value TraceEventsTrace(napi_env env, napi_callback_info /*info*/) {
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -807,7 +734,7 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
     return binding != nullptr ? binding : undefined;
   }
   if (name == "errors") {
-    napi_value binding = GetOrCreateErrorsBinding(env);
+    napi_value binding = UbiGetOrCreateErrorsBinding(env);
     return binding != nullptr ? binding : undefined;
   }
   if (name == "trace_events") {
