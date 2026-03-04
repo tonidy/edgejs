@@ -12,7 +12,7 @@ use wasmer::{
 use wasmer::{Table, Value};
 use wasmer_cache::{Cache, FileSystemCache, Hash as CacheHash};
 use wasmer_compiler_llvm::{LLVMOptLevel, LLVM};
-use wasmer_wasix::{Pipe, WasiEnv, WasiError};
+use wasmer_wasix::{Pipe, WasiEnv, WasiError, WasiModuleInstanceHandles, WasiModuleTreeHandles};
 
 const MAX_GUEST_CSTRING_SCAN: usize = 64 * 1024;
 
@@ -3102,10 +3102,7 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
     reg!("napi_fatal_error", guest_napi_fatal_error);
     // Misc
     reg!("napi_get_last_error_info", guest_napi_get_last_error_info);
-    reg!(
-        "napi_add_env_cleanup_hook",
-        guest_napi_add_env_cleanup_hook
-    );
+    reg!("napi_add_env_cleanup_hook", guest_napi_add_env_cleanup_hook);
     reg!("napi_get_version", guest_napi_get_version);
 }
 
@@ -3201,10 +3198,11 @@ pub fn run_wasix_main_capture_stdout(wasm_path: &Path, args: &[&str]) -> Result<
             .context("failed to create imported WASIX memory")?;
         import_object.define("env", "memory", memory.clone());
 
+        let runtime_memory = memory.clone();
         let func_env = FunctionEnv::new(
             &mut store,
             RuntimeEnv {
-                memory: Some(memory),
+                memory: Some(runtime_memory),
                 malloc_fn: None,
                 table: None,
                 guest_data_ptrs: std::collections::HashMap::new(),
@@ -3229,8 +3227,14 @@ pub fn run_wasix_main_capture_stdout(wasm_path: &Path, args: &[&str]) -> Result<
             .ok()
             .cloned();
 
+        let handler = WasiModuleTreeHandles::Static(WasiModuleInstanceHandles::new(
+            memory,
+            &mut store,
+            instance.clone(),
+            None,
+        ));
         wasi_env
-            .initialize(&mut store, instance.clone())
+            .initialize_handles_and_layout(&mut store, instance.clone(), handler, None, true)
             .context("failed to initialize WASIX environment")?;
 
         let exit = if let Ok(main) = instance
