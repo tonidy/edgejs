@@ -140,16 +140,16 @@ std::string ReadPackageVersionFromCandidates(const std::vector<std::filesystem::
   return "0.0.0";
 }
 
-std::string GetUndiciVersion() {
-  namespace fs = std::filesystem;
-  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-  static const std::string version = ReadPackageVersionFromCandidates({
-      source_root / "node" / "deps" / "undici" / "src" / "package.json",
-      fs::current_path() / "node" / "deps" / "undici" / "src" / "package.json",
-      fs::current_path().parent_path() / "node" / "deps" / "undici" / "src" / "package.json",
-  });
-  return version;
-}
+// std::string GetUndiciVersion() {
+//   namespace fs = std::filesystem;
+//   const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+//   static const std::string version = ReadPackageVersionFromCandidates({
+//       source_root / "node" / "deps" / "undici" / "src" / "package.json",
+//       fs::current_path() / "node" / "deps" / "undici" / "src" / "package.json",
+//       fs::current_path().parent_path() / "node" / "deps" / "undici" / "src" / "package.json",
+//   });
+//   return version;
+// }
 
 // std::string GetAmaroVersion() {
 //   namespace fs = std::filesystem;
@@ -2155,7 +2155,7 @@ napi_status UbiInstallProcessObject(napi_env env,
       {"openssl", GetOpenSslVersion()},
       {"simdjson", SIMDJSON_VERSION},
       {"simdutf", SIMDUTF_VERSION},
-      {"undici", GetUndiciVersion()},
+      // {"undici", GetUndiciVersion()},
       {"uv", uv_version_string()},
       {"uvwasi", kUvwasiVersion},
       {"v8", UBI_EMBEDDED_V8_VERSION},
