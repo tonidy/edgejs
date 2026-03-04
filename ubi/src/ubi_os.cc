@@ -18,7 +18,9 @@
 
 #include "uv.h"
 
+#if defined(__wasi__) || defined(__wasm32__)
 #define DUMMY_UV_STUBS 1
+#endif
 
 namespace {
 bool g_has_simulated_priority = false;
@@ -176,6 +178,7 @@ napi_value BindingGetUptime(napi_env env, napi_callback_info info) {
   static const uint64_t kStartHr = uv_hrtime();
   const uint64_t now = uv_hrtime();
   uptime = static_cast<double>(now - kStartHr) / 1e9;
+  if (uptime <= 0.0) uptime = 1e-6;
 #else
   const int err = uv_uptime(&uptime);
   if (err != 0) {

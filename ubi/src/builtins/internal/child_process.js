@@ -6,6 +6,7 @@ const net = require('net');
 const dgram = require('dgram');
 const { inspect } = require('util');
 const { StringDecoder } = require('string_decoder');
+const { ErrnoException } = require('internal/errors');
 const { Process } = internalBinding('process_wrap');
 const { Pipe, constants: PipeConstants } = internalBinding('pipe_wrap');
 const { TCP } = internalBinding('tcp_wrap');
@@ -871,6 +872,11 @@ function spawnSync(options) {
   result.output = output;
   result.stdout = output[1];
   result.stderr = output[2];
+  if (result.error) {
+    result.error = new ErrnoException(result.error, 'spawnSync ' + options.file);
+    result.error.path = options.file;
+    result.error.spawnargs = Array.isArray(options.args) ? options.args.slice(1) : [];
+  }
   return result;
 }
 

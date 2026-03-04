@@ -433,11 +433,25 @@ class ErrnoException extends Error {
       } catch {}
     }
     if (code === 'UNKNOWN' && typeof err === 'number') {
+      try {
+        const { getSystemErrorName } = require('util');
+        if (typeof getSystemErrorName === 'function') {
+          code = getSystemErrorName(err);
+        }
+      } catch {}
+    }
+    if (code === 'UNKNOWN' && typeof err === 'number') {
       if (err === -22) code = 'EINVAL';
       if (err === -17) code = 'EEXIST';
       if (err === -98) code = 'EADDRINUSE';
       if (err === -111) code = 'ECONNREFUSED';
       if (err === -9) code = 'EBADF';
+      if (err === -2) code = 'ENOENT';
+      if (err === -13) code = 'EACCES';
+      if (err === -23) code = 'ENFILE';
+      if (err === -24) code = 'EMFILE';
+      if (err === -60 || err === -110) code = 'ETIMEDOUT';
+      if (err === -55 || err === -105) code = 'ENOBUFS';
     }
     super(original ? `${syscall} ${code} ${original}` : `${syscall} ${code}`);
     this.errno = err;

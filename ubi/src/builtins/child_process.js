@@ -415,51 +415,7 @@ function spawnSync(_file, args, _options) {
   };
   const outputIn = Array.isArray(nativeResult.output) ? nativeResult.output : [null, Buffer.alloc(0), Buffer.alloc(0)];
   const output = [null, toBuffer(outputIn[1]), toBuffer(outputIn[2])];
-  let error;
-  if (typeof nativeResult.error === 'number') {
-    const errno = nativeResult.error;
-    error = new Error(`spawnSync ${String(file || _file || '')} failed`);
-    error.errno = errno;
-    const knownErrnoNames = {
-      [-2]: 'ENOENT',
-      [-9]: 'EBADF',
-      [-12]: 'ENOMEM',
-      [-13]: 'EACCES',
-      [-22]: 'EINVAL',
-      [-55]: 'ENOBUFS',
-      [-105]: 'ENOBUFS',
-      [-60]: 'ETIMEDOUT',
-      [-110]: 'ETIMEDOUT',
-      [-3007]: 'ENOTFOUND',
-      [-3008]: 'ENOTFOUND',
-    };
-    error.code = knownErrnoNames[errno];
-    try {
-      if (!error.code) {
-        const errnoObj = require('os').constants && require('os').constants.errno;
-        if (errnoObj && typeof errnoObj === 'object') {
-          for (const k of Object.keys(errnoObj)) {
-            if (-Number(errnoObj[k]) === errno) {
-              error.code = k;
-              break;
-            }
-          }
-        }
-      }
-      if (!error.code) {
-        const getSystemErrorName = require('util').getSystemErrorName;
-        if (typeof getSystemErrorName === 'function') error.code = getSystemErrorName(errno);
-      }
-    } catch {}
-    error.syscall = `spawnSync ${String(file || _file || '')}`;
-    error.path = String(file || _file || '');
-    error.spawnargs = argv.slice();
-    if (error.code) {
-      error.message = `spawnSync ${String(file || _file || '')} ${error.code}`;
-    }
-  } else {
-    error = nativeResult.error;
-  }
+  const error = nativeResult.error;
   const encoding = typeof options.encoding === 'string' ? options.encoding : null;
   let stderrText = output[2].toString('utf8');
   if (String(_file || '') === String(process.execPath || '')) {
@@ -885,22 +841,6 @@ function spawn(file, args, options) {
         'ERR_INVALID_ARG_TYPE',
         'The "options.signal" property must be an instance of AbortSignal.'
       );
-    }
-  }
-
-  // Match Node behavior under FD exhaustion: emit error and do not attach stdio.
-  try {
-    const probeFd = fs.openSync(__filename, 'r');
-    fs.closeSync(probeFd);
-  } catch (e) {
-    if (e && (e.code === 'EMFILE' || e.code === 'ENFILE')) {
-      const child = new ChildProcess();
-      child.stdin = undefined;
-      child.stdout = undefined;
-      child.stderr = undefined;
-      child.stdio = undefined;
-      process.nextTick(() => child.emit('error', e));
-      return child;
     }
   }
 

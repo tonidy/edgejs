@@ -86,6 +86,8 @@ std::map<napi_env, ProcessMethodsBindingState> g_process_methods_states;
 std::map<napi_env, ReportBindingState> g_report_states;
 constexpr const char kUvwasiVersion[] = "0.0.23";
 
+std::string ReadTextFileIfExists(const std::filesystem::path& path);
+
 std::string GetOpenSslVersion() {
   // Matches Node behavior: trim the "OpenSSL " prefix and keep the version
   // token, with a conservative fallback for non-OpenSSL implementations.
@@ -109,6 +111,55 @@ std::string GetLlhttpVersion() {
   return std::string(UBI_STRINGIFY(LLHTTP_VERSION_MAJOR)) + "." +
          UBI_STRINGIFY(LLHTTP_VERSION_MINOR) + "." +
          UBI_STRINGIFY(LLHTTP_VERSION_PATCH);
+}
+
+std::string ExtractPackageVersionFromJson(const std::string& json_text) {
+  const std::string key = "\"version\"";
+  const size_t key_pos = json_text.find(key);
+  if (key_pos == std::string::npos) return {};
+
+  const size_t colon = json_text.find(':', key_pos + key.size());
+  if (colon == std::string::npos) return {};
+
+  size_t first_quote = json_text.find('"', colon + 1);
+  if (first_quote == std::string::npos) return {};
+  ++first_quote;
+  const size_t second_quote = json_text.find('"', first_quote);
+  if (second_quote == std::string::npos || second_quote <= first_quote) return {};
+
+  return json_text.substr(first_quote, second_quote - first_quote);
+}
+
+std::string ReadPackageVersionFromCandidates(const std::vector<std::filesystem::path>& candidates) {
+  for (const std::filesystem::path& candidate : candidates) {
+    const std::string text = ReadTextFileIfExists(candidate);
+    if (text.empty()) continue;
+    const std::string version = ExtractPackageVersionFromJson(text);
+    if (!version.empty()) return version;
+  }
+  return "0.0.0";
+}
+
+std::string GetUndiciVersion() {
+  namespace fs = std::filesystem;
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  static const std::string version = ReadPackageVersionFromCandidates({
+      source_root / "node" / "deps" / "undici" / "src" / "package.json",
+      fs::current_path() / "node" / "deps" / "undici" / "src" / "package.json",
+      fs::current_path().parent_path() / "node" / "deps" / "undici" / "src" / "package.json",
+  });
+  return version;
+}
+
+std::string GetAmaroVersion() {
+  namespace fs = std::filesystem;
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  static const std::string version = ReadPackageVersionFromCandidates({
+      source_root / "node" / "deps" / "amaro" / "package.json",
+      fs::current_path() / "node" / "deps" / "amaro" / "package.json",
+      fs::current_path().parent_path() / "node" / "deps" / "amaro" / "package.json",
+  });
+  return version;
 }
 
 std::string MaybePreferSiblingUbiBinary(const std::string& detected_exec_path) {
@@ -193,6 +244,144 @@ std::string DetectExecPath() {
 #else
   return "ubi";
 #endif
+}
+
+std::string ReadTextFileIfExists(const std::filesystem::path& path) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec) || ec) return {};
+  std::ifstream input(path, std::ios::in | std::ios::binary);
+  if (!input.is_open()) return {};
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+  return buffer.str();
+}
+
+std::string FindNodeConfigGypiText() {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  const std::vector<fs::path> candidates = {
+      source_root / "node" / "config.gypi",
+      fs::current_path() / "node" / "config.gypi",
+      fs::current_path().parent_path() / "node" / "config.gypi",
+  };
+  for (const fs::path& candidate : candidates) {
+    if (!candidate.empty()) {
+      const std::string text = ReadTextFileIfExists(candidate);
+      if (!text.empty()) return text;
+    }
+  }
+
+  // Final fallback when tests run from <repo>/build* and source path probes fail.
+  const fs::path cwd = fs::current_path(ec);
+  if (!ec) {
+    const fs::path fallback = cwd.parent_path() / "node" / "config.gypi";
+    const std::string text = ReadTextFileIfExists(fallback);
+    if (!text.empty()) return text;
+  }
+  return {};
+}
+
+napi_value BuildMinimalProcessConfigObject(napi_env env) {
+  napi_value config_obj = nullptr;
+  if (napi_create_object(env, &config_obj) != napi_ok || config_obj == nullptr) return nullptr;
+
+  napi_value variables_obj = nullptr;
+  if (napi_create_object(env, &variables_obj) != napi_ok || variables_obj == nullptr) return nullptr;
+
+  napi_value zero = nullptr;
+  if (napi_create_int32(env, 0, &zero) != napi_ok || zero == nullptr) return nullptr;
+  const char* int_var_keys[] = {"v8_enable_i18n_support", "node_quic", "asan", "node_shared_openssl"};
+  for (const char* key : int_var_keys) {
+    if (napi_set_named_property(env, variables_obj, key, zero) != napi_ok) return nullptr;
+  }
+
+  napi_value empty_shareable_builtins = nullptr;
+  if (napi_create_array_with_length(env, 0, &empty_shareable_builtins) != napi_ok ||
+      empty_shareable_builtins == nullptr) {
+    return nullptr;
+  }
+  if (napi_set_named_property(env, variables_obj, "node_builtin_shareable_builtins", empty_shareable_builtins) !=
+      napi_ok) {
+    return nullptr;
+  }
+
+  napi_value napi_build_version = nullptr;
+  if (napi_create_string_utf8(
+          env, UBI_STRINGIFY(NODE_API_SUPPORTED_VERSION_MAX), NAPI_AUTO_LENGTH, &napi_build_version) != napi_ok ||
+      napi_build_version == nullptr) {
+    return nullptr;
+  }
+  if (napi_set_named_property(env, variables_obj, "napi_build_version", napi_build_version) != napi_ok) {
+    return nullptr;
+  }
+
+  napi_property_descriptor variables_desc = {};
+  variables_desc.utf8name = "variables";
+  variables_desc.value = variables_obj;
+  variables_desc.attributes = napi_enumerable;
+  if (napi_define_properties(env, config_obj, 1, &variables_desc) != napi_ok) return nullptr;
+
+  return config_obj;
+}
+
+napi_value ParseProcessConfigObjectFromText(napi_env env, const std::string& config_text) {
+  if (config_text.empty()) return nullptr;
+
+  const char* parse_script_source =
+      "(function(__raw){"
+      "  const body = __raw.split('\\n').slice(1).join('\\n');"
+      "  const parsed = JSON.parse(body, function(key, value) {"
+      "    if (value === 'true') return true;"
+      "    if (value === 'false') return false;"
+      "    return value;"
+      "  });"
+      "  return Object.freeze(parsed);"
+      "})";
+
+  napi_value parse_script = nullptr;
+  if (napi_create_string_utf8(env, parse_script_source, NAPI_AUTO_LENGTH, &parse_script) != napi_ok ||
+      parse_script == nullptr) {
+    return nullptr;
+  }
+
+  napi_value parse_fn = nullptr;
+  if (napi_run_script(env, parse_script, &parse_fn) != napi_ok || parse_fn == nullptr) {
+    bool has_exception = false;
+    if (napi_is_exception_pending(env, &has_exception) == napi_ok && has_exception) {
+      napi_value ignored = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored);
+    }
+    return nullptr;
+  }
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+
+  napi_value raw_text = nullptr;
+  if (napi_create_string_utf8(env, config_text.c_str(), config_text.size(), &raw_text) != napi_ok ||
+      raw_text == nullptr) {
+    return nullptr;
+  }
+
+  napi_value parsed = nullptr;
+  if (napi_call_function(env, global, parse_fn, 1, &raw_text, &parsed) != napi_ok || parsed == nullptr) {
+    bool has_exception = false;
+    if (napi_is_exception_pending(env, &has_exception) == napi_ok && has_exception) {
+      napi_value ignored = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored);
+    }
+    return nullptr;
+  }
+
+  return parsed;
+}
+
+napi_value BuildProcessConfigObject(napi_env env) {
+  const std::string config_text = FindNodeConfigGypiText();
+  napi_value parsed = ParseProcessConfigObjectFromText(env, config_text);
+  if (parsed != nullptr) return parsed;
+  return BuildMinimalProcessConfigObject(env);
 }
 
 uint64_t GetHrtimeNanoseconds() {
@@ -1953,18 +2142,20 @@ napi_status UbiInstallProcessObject(napi_env env,
       {"node", NODE_VERSION_STRING},
       {"acorn", ACORN_VERSION},
       {"ada", ADA_VERSION},
+      {"amaro", GetAmaroVersion()},
       {"ares", ARES_VERSION_STR},
       {"brotli", GetBrotliVersion()},
       {"cjs_module_lexer", CJS_MODULE_LEXER_VERSION},
       {"llhttp", GetLlhttpVersion()},
       {"modules", UBI_STRINGIFY(NODE_MODULE_VERSION)},
-      {"napi", UBI_STRINGIFY(NODE_API_DEFAULT_MODULE_API_VERSION)},
+      {"napi", UBI_STRINGIFY(NODE_API_SUPPORTED_VERSION_MAX)},
       {"nbytes", NBYTES_VERSION},
       {"ncrypto", NCRYPTO_VERSION},
       {"nghttp2", NGHTTP2_VERSION},
       {"openssl", GetOpenSslVersion()},
       {"simdjson", SIMDJSON_VERSION},
       {"simdutf", SIMDUTF_VERSION},
+      {"undici", GetUndiciVersion()},
       {"uv", uv_version_string()},
       {"uvwasi", kUvwasiVersion},
       {"v8", UBI_EMBEDDED_V8_VERSION},
@@ -2049,36 +2240,8 @@ napi_status UbiInstallProcessObject(napi_env env,
   status = napi_set_named_property(env, process_obj, "features", features_obj);
   if (status != napi_ok) return status;
 
-  napi_value config_obj = nullptr;
-  status = napi_create_object(env, &config_obj);
-  if (status != napi_ok || config_obj == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  napi_value variables_obj = nullptr;
-  status = napi_create_object(env, &variables_obj);
-  if (status != napi_ok || variables_obj == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  napi_value zero = nullptr;
-  status = napi_create_int32(env, 0, &zero);
-  if (status != napi_ok || zero == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  const char* int_var_keys[] = {"v8_enable_i18n_support", "node_quic", "asan", "node_shared_openssl"};
-  for (const char* key : int_var_keys) {
-    if (napi_set_named_property(env, variables_obj, key, zero) != napi_ok) return napi_generic_failure;
-  }
-  napi_value empty_shareable_builtins = nullptr;
-  status = napi_create_array_with_length(env, 0, &empty_shareable_builtins);
-  if (status != napi_ok || empty_shareable_builtins == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  status = napi_set_named_property(env, variables_obj, "node_builtin_shareable_builtins", empty_shareable_builtins);
-  if (status != napi_ok) return status;
-  napi_value napi_build_version = nullptr;
-  status = napi_create_string_utf8(
-      env, UBI_STRINGIFY(NODE_API_DEFAULT_MODULE_API_VERSION), NAPI_AUTO_LENGTH, &napi_build_version);
-  if (status != napi_ok || napi_build_version == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  status = napi_set_named_property(env, variables_obj, "napi_build_version", napi_build_version);
-  if (status != napi_ok) return status;
-  napi_property_descriptor variables_desc = {};
-  variables_desc.utf8name = "variables";
-  variables_desc.value = variables_obj;
-  variables_desc.attributes = napi_enumerable;
-  status = napi_define_properties(env, config_obj, 1, &variables_desc);
-  if (status != napi_ok) return status;
+  napi_value config_obj = BuildProcessConfigObject(env);
+  if (config_obj == nullptr) return napi_generic_failure;
   napi_property_descriptor config_desc = {};
   config_desc.utf8name = "config";
   config_desc.value = config_obj;

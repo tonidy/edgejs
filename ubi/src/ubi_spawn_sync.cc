@@ -2,19 +2,13 @@
 
 #include <cerrno>
 #include <csignal>
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <ctime>
 #include <cstring>
 #include <string>
 #include <vector>
 
-#include <fcntl.h>
-#include <sys/select.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <uv.h>
 
 namespace {
 
@@ -27,6 +21,50 @@ struct SpawnOptions {
   int32_t kill_signal = SIGTERM;
   std::vector<std::string> env_pairs;
   std::vector<uint8_t> stdin_input;
+};
+
+struct SpawnSyncRunner {
+  uv_loop_t loop{};
+  bool loop_initialized = false;
+
+  uv_process_t process{};
+  bool process_spawned = false;
+  bool process_exited = false;
+  int64_t exit_status = -1;
+  int term_signal = 0;
+
+  uv_pipe_t stdin_pipe{};
+  uv_pipe_t stdout_pipe{};
+  uv_pipe_t stderr_pipe{};
+  bool stdin_initialized = false;
+  bool stdout_initialized = false;
+  bool stderr_initialized = false;
+
+  uv_timer_t timer{};
+  bool timer_initialized = false;
+
+  uv_write_t stdin_write{};
+  uv_shutdown_t stdin_shutdown{};
+  bool stdin_shutdown_pending = false;
+
+  uv_stdio_container_t stdio[3]{};
+
+  std::vector<uint8_t> stdin_storage;
+  uv_buf_t stdin_buf{};
+
+  std::vector<uint8_t> out_stdout;
+  std::vector<uint8_t> out_stderr;
+
+  int kill_signal = SIGTERM;
+  int64_t max_buffer = 1024 * 1024;
+  int64_t buffered_output_size = 0;
+
+  bool timed_out = false;
+  bool max_buffer_exceeded = false;
+  bool kill_attempted = false;
+
+  int error = 0;
+  int pipe_error = 0;
 };
 
 bool GetNamedProperty(napi_env env, napi_value obj, const char* name, napi_value* out) {
@@ -203,32 +241,204 @@ const char* SignalName(int signum) {
   }
 }
 
-void SetNonBlocking(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags >= 0) {
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+void UvCloseNoop(uv_handle_t* /*handle*/) {}
+
+void SetErrorIfUnset(SpawnSyncRunner* runner, int error) {
+  if (runner == nullptr || error == 0) return;
+  if (runner->error == 0) runner->error = error;
+}
+
+void SetPipeErrorIfUnset(SpawnSyncRunner* runner, int error) {
+  if (runner == nullptr || error == 0) return;
+  if (runner->pipe_error == 0) runner->pipe_error = error;
+}
+
+void CloseHandleIfNeeded(uv_handle_t* handle) {
+  if (handle == nullptr) return;
+  if (!uv_is_closing(handle)) uv_close(handle, UvCloseNoop);
+}
+
+void WalkAndCloseHandle(uv_handle_t* handle, void* /*arg*/) {
+  if (handle == nullptr) return;
+  if (!uv_is_closing(handle)) {
+    uv_close(handle, UvCloseNoop);
   }
 }
 
-void AppendFromFd(int fd, std::vector<uint8_t>* out, bool* open) {
-  if (fd < 0 || out == nullptr || open == nullptr || !*open) return;
-  uint8_t buf[4096];
-  while (true) {
-    const ssize_t n = read(fd, buf, sizeof(buf));
-    if (n > 0) {
-      out->insert(out->end(), buf, buf + n);
-      continue;
+void CloseStdioHandles(SpawnSyncRunner* runner) {
+  if (runner == nullptr) return;
+  if (runner->stdin_initialized) {
+    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->stdin_pipe));
+  }
+  if (runner->stdout_initialized) {
+    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->stdout_pipe));
+  }
+  if (runner->stderr_initialized) {
+    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->stderr_pipe));
+  }
+}
+
+void CloseTimerIfNeeded(SpawnSyncRunner* runner) {
+  if (runner == nullptr || !runner->timer_initialized) return;
+  CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->timer));
+}
+
+void KillAndClose(SpawnSyncRunner* runner) {
+  if (runner == nullptr) return;
+  if (!runner->kill_attempted) {
+    runner->kill_attempted = true;
+    if (runner->process_spawned && !runner->process_exited) {
+      int rc = uv_process_kill(&runner->process, runner->kill_signal);
+      if (rc < 0 && rc != UV_ESRCH) {
+        SetErrorIfUnset(runner, rc);
+        (void)uv_process_kill(&runner->process, SIGKILL);
+      }
     }
-    if (n == 0) {
-      *open = false;
-      close(fd);
-      return;
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-    *open = false;
-    close(fd);
+  }
+  CloseStdioHandles(runner);
+  CloseTimerIfNeeded(runner);
+}
+
+void StartStdinShutdown(SpawnSyncRunner* runner);
+
+void StdinShutdownCallback(uv_shutdown_t* req, int status) {
+  if (req == nullptr) return;
+  auto* runner = static_cast<SpawnSyncRunner*>(req->data);
+  if (runner == nullptr) return;
+  runner->stdin_shutdown_pending = false;
+  if (status < 0 && status != UV_ENOTCONN) {
+    SetPipeErrorIfUnset(runner, status);
+  }
+  if (runner->stdin_initialized) {
+    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->stdin_pipe));
+  }
+}
+
+void StartStdinShutdown(SpawnSyncRunner* runner) {
+  if (runner == nullptr || !runner->stdin_initialized) return;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&runner->stdin_pipe);
+  if (uv_is_closing(handle) || runner->stdin_shutdown_pending) return;
+
+  runner->stdin_shutdown.data = runner;
+  runner->stdin_shutdown_pending = true;
+  int rc = uv_shutdown(&runner->stdin_shutdown,
+                       reinterpret_cast<uv_stream_t*>(&runner->stdin_pipe),
+                       StdinShutdownCallback);
+  if (rc == UV_ENOTCONN) {
+    runner->stdin_shutdown_pending = false;
+    CloseHandleIfNeeded(handle);
     return;
   }
+  if (rc < 0) {
+    runner->stdin_shutdown_pending = false;
+    SetPipeErrorIfUnset(runner, rc);
+    CloseHandleIfNeeded(handle);
+  }
+}
+
+void StdinWriteCallback(uv_write_t* req, int status) {
+  if (req == nullptr) return;
+  auto* runner = static_cast<SpawnSyncRunner*>(req->data);
+  if (runner == nullptr) return;
+  if (status < 0) {
+    SetPipeErrorIfUnset(runner, status);
+  }
+  StartStdinShutdown(runner);
+}
+
+void AllocReadBuffer(uv_handle_t* /*handle*/, size_t suggested_size, uv_buf_t* buf) {
+  if (buf == nullptr) return;
+  char* base = static_cast<char*>(std::malloc(suggested_size));
+  if (base == nullptr) {
+    *buf = uv_buf_init(nullptr, 0);
+    return;
+  }
+  *buf = uv_buf_init(base, static_cast<unsigned int>(suggested_size));
+}
+
+void OnProcessExit(uv_process_t* process, int64_t exit_status, int term_signal) {
+  if (process == nullptr) return;
+  auto* runner = static_cast<SpawnSyncRunner*>(process->data);
+  if (runner == nullptr) return;
+
+  runner->process_exited = true;
+  runner->exit_status = exit_status;
+  runner->term_signal = term_signal;
+
+  CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(process));
+  CloseTimerIfNeeded(runner);
+}
+
+void OnKillTimer(uv_timer_t* timer) {
+  if (timer == nullptr) return;
+  auto* runner = static_cast<SpawnSyncRunner*>(timer->data);
+  if (runner == nullptr) return;
+
+  runner->timed_out = true;
+  SetErrorIfUnset(runner, UV_ETIMEDOUT);
+  KillAndClose(runner);
+}
+
+void OnPipeRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+  auto* runner = stream == nullptr ? nullptr : static_cast<SpawnSyncRunner*>(stream->data);
+
+  if (nread > 0 && runner != nullptr && buf != nullptr && buf->base != nullptr) {
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(buf->base);
+    const uint8_t* end = begin + static_cast<size_t>(nread);
+
+    if (stream == reinterpret_cast<uv_stream_t*>(&runner->stdout_pipe)) {
+      runner->out_stdout.insert(runner->out_stdout.end(), begin, end);
+    } else if (stream == reinterpret_cast<uv_stream_t*>(&runner->stderr_pipe)) {
+      runner->out_stderr.insert(runner->out_stderr.end(), begin, end);
+    }
+
+    runner->buffered_output_size += nread;
+    if (runner->max_buffer > 0 && runner->buffered_output_size > runner->max_buffer) {
+      runner->max_buffer_exceeded = true;
+      SetErrorIfUnset(runner, UV_ENOBUFS);
+      KillAndClose(runner);
+    }
+  } else if (nread == UV_EOF) {
+    if (stream != nullptr) {
+      CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(stream));
+    }
+  } else if (nread < 0) {
+    if (runner != nullptr) {
+      SetPipeErrorIfUnset(runner, static_cast<int>(nread));
+    }
+    if (stream != nullptr) {
+      CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(stream));
+    }
+  }
+
+  if (buf != nullptr && buf->base != nullptr) {
+    std::free(buf->base);
+  }
+}
+
+int GetFinalError(const SpawnSyncRunner& runner) {
+  if (runner.error != 0) return runner.error;
+  return runner.pipe_error;
+}
+
+void CleanupRunner(SpawnSyncRunner* runner) {
+  if (runner == nullptr || !runner->loop_initialized) return;
+
+  if (runner->process_spawned) {
+    CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->process));
+  }
+  CloseStdioHandles(runner);
+  CloseTimerIfNeeded(runner);
+
+  // Drain close callbacks and force-close anything still registered on the loop
+  // so file descriptors are always released before returning.
+  int close_rc = uv_loop_close(&runner->loop);
+  while (close_rc == UV_EBUSY) {
+    uv_walk(&runner->loop, WalkAndCloseHandle, nullptr);
+    (void)uv_run(&runner->loop, UV_RUN_DEFAULT);
+    close_rc = uv_loop_close(&runner->loop);
+  }
+  runner->loop_initialized = false;
 }
 
 napi_value SpawnSync(napi_env env, napi_callback_info info) {
@@ -246,237 +456,155 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
     return out;
   }
 
-  int stdin_pipe[2] = {-1, -1};
-  int stdout_pipe[2] = {-1, -1};
-  int stderr_pipe[2] = {-1, -1};
-  int exec_err_pipe[2] = {-1, -1};
-  if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0 || pipe(stderr_pipe) != 0 || pipe(exec_err_pipe) != 0) {
+  SpawnSyncRunner runner;
+  runner.kill_signal = options.kill_signal;
+  runner.max_buffer = options.max_buffer;
+
+  int rc = uv_loop_init(&runner.loop);
+  if (rc < 0) {
     napi_value out = nullptr;
     napi_create_object(env, &out);
     napi_value err = nullptr;
-    napi_create_int32(env, -errno, &err);
+    napi_create_int32(env, rc, &err);
     napi_set_named_property(env, out, "error", err);
     return out;
   }
+  runner.loop_initialized = true;
 
-  pid_t pid = fork();
-  if (pid < 0) {
-    const int err_no = errno;
-    close(stdin_pipe[0]); close(stdin_pipe[1]);
-    close(stdout_pipe[0]); close(stdout_pipe[1]);
-    close(stderr_pipe[0]); close(stderr_pipe[1]);
-    close(exec_err_pipe[0]); close(exec_err_pipe[1]);
-    napi_value out = nullptr;
-    napi_create_object(env, &out);
-    napi_value err = nullptr;
-    napi_create_int32(env, -err_no, &err);
-    napi_set_named_property(env, out, "error", err);
-    return out;
+  rc = uv_pipe_init(&runner.loop, &runner.stdin_pipe, 0);
+  if (rc >= 0) {
+    runner.stdin_initialized = true;
+    runner.stdin_pipe.data = &runner;
+  } else {
+    SetErrorIfUnset(&runner, rc);
   }
 
-  if (pid == 0) {
-    close(stdin_pipe[1]);
-    close(stdout_pipe[0]);
-    close(stderr_pipe[0]);
-    close(exec_err_pipe[0]);
-    fcntl(exec_err_pipe[1], F_SETFD, FD_CLOEXEC);
-
-    if (!options.cwd.empty() && chdir(options.cwd.c_str()) != 0) {
-      const int chdir_errno = errno;
-      (void)write(exec_err_pipe[1], &chdir_errno, sizeof(chdir_errno));
-      _exit(127);
-    }
-
-    dup2(stdin_pipe[0], STDIN_FILENO);
-    dup2(stdout_pipe[1], STDOUT_FILENO);
-    dup2(stderr_pipe[1], STDERR_FILENO);
-    close(stdin_pipe[0]);
-    close(stdout_pipe[1]);
-    close(stderr_pipe[1]);
-
-    std::vector<char*> exec_argv;
-    exec_argv.reserve(options.args.size() + 1);
-    for (std::string& arg : options.args) {
-      exec_argv.push_back(const_cast<char*>(arg.c_str()));
-    }
-    exec_argv.push_back(nullptr);
-
-    if (options.env_pairs.empty()) {
-      execvp(options.file.c_str(), exec_argv.data());
+  if (rc >= 0) {
+    rc = uv_pipe_init(&runner.loop, &runner.stdout_pipe, 0);
+    if (rc >= 0) {
+      runner.stdout_initialized = true;
+      runner.stdout_pipe.data = &runner;
     } else {
-      std::vector<std::string> env_storage = options.env_pairs;
-      std::vector<char*> envp;
-      envp.reserve(env_storage.size() + 1);
-      for (std::string& kv : env_storage) envp.push_back(const_cast<char*>(kv.c_str()));
-      envp.push_back(nullptr);
-
-      if (options.file.find('/') != std::string::npos) {
-        execve(options.file.c_str(), exec_argv.data(), envp.data());
-      } else {
-        std::string path_value = "/usr/bin:/bin:/usr/sbin:/sbin";
-        for (const std::string& kv : env_storage) {
-          if (kv.rfind("PATH=", 0) == 0) {
-            path_value = kv.substr(5);
-            break;
-          }
-        }
-        size_t start = 0;
-        while (true) {
-          size_t end = path_value.find(':', start);
-          std::string dir = (end == std::string::npos) ? path_value.substr(start) : path_value.substr(start, end - start);
-          if (dir.empty()) dir = ".";
-          std::string candidate = dir + "/" + options.file;
-          execve(candidate.c_str(), exec_argv.data(), envp.data());
-          if (end == std::string::npos) break;
-          start = end + 1;
-        }
-      }
-    }
-    const int exec_errno = errno;
-    (void)write(exec_err_pipe[1], &exec_errno, sizeof(exec_errno));
-    _exit(127);
-  }
-
-  close(stdin_pipe[0]);
-  close(stdout_pipe[1]);
-  close(stderr_pipe[1]);
-  close(exec_err_pipe[1]);
-
-  if (!options.stdin_input.empty()) {
-    const uint8_t* ptr = options.stdin_input.data();
-    size_t left = options.stdin_input.size();
-    while (left > 0) {
-      const ssize_t wrote = write(stdin_pipe[1], ptr, left);
-      if (wrote > 0) {
-        ptr += wrote;
-        left -= static_cast<size_t>(wrote);
-      } else if (wrote < 0 && errno == EINTR) {
-        continue;
-      } else {
-        break;
-      }
+      SetErrorIfUnset(&runner, rc);
     }
   }
-  close(stdin_pipe[1]);
-  SetNonBlocking(stdout_pipe[0]);
-  SetNonBlocking(stderr_pipe[0]);
 
-  bool stdout_open = true;
-  bool stderr_open = true;
-  bool child_running = true;
-  bool timed_out = false;
-  bool max_buffer_exceeded = false;
-  int status = 0;
-  int spawn_errno = 0;
-  std::vector<uint8_t> out_stdout;
-  std::vector<uint8_t> out_stderr;
+  if (rc >= 0) {
+    rc = uv_pipe_init(&runner.loop, &runner.stderr_pipe, 0);
+    if (rc >= 0) {
+      runner.stderr_initialized = true;
+      runner.stderr_pipe.data = &runner;
+    } else {
+      SetErrorIfUnset(&runner, rc);
+    }
+  }
 
-  const auto start_time = std::chrono::steady_clock::now();
-  const auto io_grace_after_exit = std::chrono::milliseconds(200);
-  bool child_exit_time_set = false;
-  std::chrono::steady_clock::time_point child_exit_time = start_time;
-  while (stdout_open || stderr_open || child_running) {
-    if (child_running) {
-      pid_t waited = waitpid(pid, &status, WNOHANG);
-      if (waited == pid) {
-        child_running = false;
-        child_exit_time = std::chrono::steady_clock::now();
-        child_exit_time_set = true;
+  std::vector<char*> exec_args;
+  exec_args.reserve(options.args.size() + 1);
+  for (std::string& arg : options.args) {
+    exec_args.push_back(const_cast<char*>(arg.c_str()));
+  }
+  exec_args.push_back(nullptr);
+
+  std::vector<char*> exec_env;
+  if (!options.env_pairs.empty()) {
+    exec_env.reserve(options.env_pairs.size() + 1);
+    for (std::string& kv : options.env_pairs) {
+      exec_env.push_back(const_cast<char*>(kv.c_str()));
+    }
+    exec_env.push_back(nullptr);
+  }
+
+  if (GetFinalError(runner) == 0) {
+    uv_process_options_t uv_options{};
+    uv_options.file = options.file.c_str();
+    uv_options.args = exec_args.data();
+    uv_options.exit_cb = OnProcessExit;
+    if (!options.cwd.empty()) uv_options.cwd = options.cwd.c_str();
+    if (!exec_env.empty()) uv_options.env = exec_env.data();
+
+    runner.stdio[0].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_READABLE_PIPE);
+    runner.stdio[0].data.stream = reinterpret_cast<uv_stream_t*>(&runner.stdin_pipe);
+    runner.stdio[1].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_WRITABLE_PIPE);
+    runner.stdio[1].data.stream = reinterpret_cast<uv_stream_t*>(&runner.stdout_pipe);
+    runner.stdio[2].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_WRITABLE_PIPE);
+    runner.stdio[2].data.stream = reinterpret_cast<uv_stream_t*>(&runner.stderr_pipe);
+
+    uv_options.stdio_count = 3;
+    uv_options.stdio = runner.stdio;
+
+    rc = uv_spawn(&runner.loop, &runner.process, &uv_options);
+    if (rc < 0) {
+      SetErrorIfUnset(&runner, rc);
+    } else {
+      runner.process_spawned = true;
+      runner.process.data = &runner;
+    }
+  }
+
+  if (runner.process_spawned) {
+    rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&runner.stdout_pipe), AllocReadBuffer, OnPipeRead);
+    if (rc < 0) {
+      SetPipeErrorIfUnset(&runner, rc);
+      KillAndClose(&runner);
+    }
+
+    rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&runner.stderr_pipe), AllocReadBuffer, OnPipeRead);
+    if (rc < 0) {
+      SetPipeErrorIfUnset(&runner, rc);
+      KillAndClose(&runner);
+    }
+
+    if (!options.stdin_input.empty()) {
+      runner.stdin_storage = options.stdin_input;
+      runner.stdin_buf = uv_buf_init(
+          reinterpret_cast<char*>(runner.stdin_storage.data()),
+          static_cast<unsigned int>(runner.stdin_storage.size()));
+      runner.stdin_write.data = &runner;
+      rc = uv_write(&runner.stdin_write,
+                    reinterpret_cast<uv_stream_t*>(&runner.stdin_pipe),
+                    &runner.stdin_buf,
+                    1,
+                    StdinWriteCallback);
+      if (rc < 0) {
+        SetPipeErrorIfUnset(&runner, rc);
+        StartStdinShutdown(&runner);
       }
+    } else {
+      StartStdinShutdown(&runner);
     }
 
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    int maxfd = -1;
-    if (stdout_open) {
-      FD_SET(stdout_pipe[0], &rfds);
-      if (stdout_pipe[0] > maxfd) maxfd = stdout_pipe[0];
-    }
-    if (stderr_open) {
-      FD_SET(stderr_pipe[0], &rfds);
-      if (stderr_pipe[0] > maxfd) maxfd = stderr_pipe[0];
-    }
-
-    struct timeval tv{};
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
-    struct timeval* tv_ptr = &tv;
     if (options.timeout_ms > 0) {
-      const auto now = std::chrono::steady_clock::now();
-      const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
-      if (elapsed_ms >= options.timeout_ms) {
-        if (child_running) {
-          kill(pid, options.kill_signal);
-          (void)waitpid(pid, &status, 0);
-          child_running = false;
-          timed_out = true;
-          child_exit_time = std::chrono::steady_clock::now();
-          child_exit_time_set = true;
+      rc = uv_timer_init(&runner.loop, &runner.timer);
+      if (rc < 0) {
+        SetErrorIfUnset(&runner, rc);
+      } else {
+        runner.timer_initialized = true;
+        runner.timer.data = &runner;
+        rc = uv_timer_start(&runner.timer,
+                            OnKillTimer,
+                            static_cast<uint64_t>(options.timeout_ms),
+                            0);
+        if (rc < 0) {
+          SetErrorIfUnset(&runner, rc);
+          CloseTimerIfNeeded(&runner);
         }
       }
     }
-
-    if (maxfd >= 0) {
-      const size_t stdout_size_before = out_stdout.size();
-      const size_t stderr_size_before = out_stderr.size();
-      const int selected = select(maxfd + 1, &rfds, nullptr, nullptr, tv_ptr);
-      if (selected > 0) {
-        if (stdout_open && FD_ISSET(stdout_pipe[0], &rfds)) {
-          AppendFromFd(stdout_pipe[0], &out_stdout, &stdout_open);
-        }
-        if (stderr_open && FD_ISSET(stderr_pipe[0], &rfds)) {
-          AppendFromFd(stderr_pipe[0], &out_stderr, &stderr_open);
-        }
-      } else if (selected == 0) {
-        if (stdout_open) AppendFromFd(stdout_pipe[0], &out_stdout, &stdout_open);
-        if (stderr_open) AppendFromFd(stderr_pipe[0], &out_stderr, &stderr_open);
-      } else if (selected < 0 && errno == EINTR) {
-        continue;
-      }
-      const bool io_progress =
-          out_stdout.size() != stdout_size_before || out_stderr.size() != stderr_size_before;
-      if (options.max_buffer >= 0 &&
-          (static_cast<int64_t>(out_stdout.size()) > options.max_buffer ||
-           static_cast<int64_t>(out_stderr.size()) > options.max_buffer)) {
-        max_buffer_exceeded = true;
-        if (child_running) {
-          kill(pid, options.kill_signal);
-          (void)waitpid(pid, &status, 0);
-          child_running = false;
-          child_exit_time = std::chrono::steady_clock::now();
-          child_exit_time_set = true;
-        }
-      }
-      if (!child_running && !io_progress && child_exit_time_set) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now - child_exit_time >= io_grace_after_exit) {
-          if (stdout_open) {
-            close(stdout_pipe[0]);
-            stdout_open = false;
-          }
-          if (stderr_open) {
-            close(stderr_pipe[0]);
-            stderr_open = false;
-          }
-        }
-      }
-    } else if (!child_running) {
-      break;
-    }
   }
 
-  int err_no = 0;
-  const ssize_t err_read = read(exec_err_pipe[0], &err_no, sizeof(err_no));
-  if (err_read == static_cast<ssize_t>(sizeof(err_no))) {
-    spawn_errno = err_no;
+  if (GetFinalError(runner) != 0 && runner.process_spawned) {
+    KillAndClose(&runner);
   }
-  close(exec_err_pipe[0]);
+
+  (void)uv_run(&runner.loop, UV_RUN_DEFAULT);
 
   napi_value result = nullptr;
   napi_create_object(env, &result);
 
   napi_value pid_value = nullptr;
-  napi_create_int32(env, static_cast<int32_t>(pid), &pid_value);
+  int32_t pid = runner.process_spawned ? static_cast<int32_t>(runner.process.pid) : 0;
+  napi_create_int32(env, pid, &pid_value);
   napi_set_named_property(env, result, "pid", pid_value);
 
   napi_value output = nullptr;
@@ -486,38 +614,37 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
   napi_set_element(env, output, 0, null_value);
 
   napi_value stdout_val = nullptr;
-  const char* stdout_ptr = out_stdout.empty() ? "" : reinterpret_cast<const char*>(out_stdout.data());
-  napi_create_string_utf8(env, stdout_ptr, out_stdout.size(), &stdout_val);
+  napi_create_buffer_copy(env,
+                          runner.out_stdout.size(),
+                          runner.out_stdout.empty() ? nullptr : runner.out_stdout.data(),
+                          nullptr,
+                          &stdout_val);
   napi_set_element(env, output, 1, stdout_val);
 
   napi_value stderr_val = nullptr;
-  const char* stderr_ptr = out_stderr.empty() ? "" : reinterpret_cast<const char*>(out_stderr.data());
-  napi_create_string_utf8(env, stderr_ptr, out_stderr.size(), &stderr_val);
+  napi_create_buffer_copy(env,
+                          runner.out_stderr.size(),
+                          runner.out_stderr.empty() ? nullptr : runner.out_stderr.data(),
+                          nullptr,
+                          &stderr_val);
   napi_set_element(env, output, 2, stderr_val);
   napi_set_named_property(env, result, "output", output);
 
-  if (spawn_errno != 0) {
-    napi_value error_value = nullptr;
-    napi_create_int32(env, -spawn_errno, &error_value);
-    napi_set_named_property(env, result, "error", error_value);
-    napi_set_named_property(env, result, "status", null_value);
-    napi_set_named_property(env, result, "signal", null_value);
-    return result;
-  }
-
-  if (WIFEXITED(status)) {
-    napi_value status_value = nullptr;
-    napi_create_int32(env, WEXITSTATUS(status), &status_value);
-    napi_set_named_property(env, result, "status", status_value);
-    napi_set_named_property(env, result, "signal", null_value);
-  } else if (WIFSIGNALED(status)) {
-    napi_set_named_property(env, result, "status", null_value);
-    const char* sig_name = SignalName(WTERMSIG(status));
-    if (sig_name != nullptr) {
-      napi_value signal_value = nullptr;
-      napi_create_string_utf8(env, sig_name, NAPI_AUTO_LENGTH, &signal_value);
-      napi_set_named_property(env, result, "signal", signal_value);
+  if (runner.process_exited) {
+    if (runner.term_signal > 0) {
+      napi_set_named_property(env, result, "status", null_value);
+      const char* sig_name = SignalName(runner.term_signal);
+      if (sig_name != nullptr) {
+        napi_value signal_value = nullptr;
+        napi_create_string_utf8(env, sig_name, NAPI_AUTO_LENGTH, &signal_value);
+        napi_set_named_property(env, result, "signal", signal_value);
+      } else {
+        napi_set_named_property(env, result, "signal", null_value);
+      }
     } else {
+      napi_value status_value = nullptr;
+      napi_create_int32(env, static_cast<int32_t>(runner.exit_status), &status_value);
+      napi_set_named_property(env, result, "status", status_value);
       napi_set_named_property(env, result, "signal", null_value);
     }
   } else {
@@ -525,15 +652,14 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
     napi_set_named_property(env, result, "signal", null_value);
   }
 
-  if (timed_out) {
+  const int final_error = GetFinalError(runner);
+  if (final_error != 0) {
     napi_value error_value = nullptr;
-    napi_create_int32(env, -ETIMEDOUT, &error_value);
-    napi_set_named_property(env, result, "error", error_value);
-  } else if (max_buffer_exceeded) {
-    napi_value error_value = nullptr;
-    napi_create_int32(env, -ENOBUFS, &error_value);
+    napi_create_int32(env, final_error, &error_value);
     napi_set_named_property(env, result, "error", error_value);
   }
+
+  CleanupRunner(&runner);
   return result;
 }
 
