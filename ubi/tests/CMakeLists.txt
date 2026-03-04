@@ -87,6 +87,9 @@ if(TARGET napi_v8 AND NAPI_V8_LIBRARY)
   add_ubi_node_api_test(ubi_test_4_internal_binding_dispatch_phase02
     "${UBI_ROOT}/tests/runners/test_4_internal_binding_dispatch_phase02.cc"
   )
+  add_ubi_node_api_test(ubi_test_5_internal_binding_parity_phase03
+    "${UBI_ROOT}/tests/runners/test_5_internal_binding_parity_phase03.cc"
+  )
 else()
   message(STATUS "Skipping ubi node-api tests: napi_v8 runtime target/linkage is unavailable")
 endif()

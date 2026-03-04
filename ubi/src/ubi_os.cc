@@ -846,6 +846,10 @@ void UbiInstallOsBinding(napi_env env) {
 
   napi_value constants = CreateOsConstants(env);
   if (constants != nullptr) {
+    napi_value signals = nullptr;
+    if (napi_get_named_property(env, constants, "signals", &signals) == napi_ok && signals != nullptr) {
+      napi_object_freeze(env, signals);
+    }
     napi_set_named_property(env, global, "__ubi_os_constants", constants);
   }
 }

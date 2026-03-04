@@ -3,6 +3,7 @@
 #include "internal_binding/dispatch.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -40,6 +41,12 @@ struct TaskQueueBindingState {
 struct TraceEventsBindingState {
   napi_ref binding_ref = nullptr;
   napi_ref state_update_handler_ref = nullptr;
+  struct CategoryBufferState {
+    napi_ref typed_array_ref = nullptr;
+    uint8_t* data = nullptr;
+  };
+  std::unordered_map<std::string, int32_t> category_refcounts;
+  std::unordered_map<std::string, CategoryBufferState> category_buffers;
 };
 
 std::unordered_map<napi_env, ModuleLoaderState> g_loader_states;
@@ -447,6 +454,67 @@ static napi_value ReturnTrueCallback(napi_env env, napi_callback_info /*info*/) 
   return out;
 }
 
+static napi_value BuiltinsCompileFunctionCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return nullptr;
+  }
+
+  const std::string id = ValueToUtf8(env, argv[0]);
+  if (id.empty()) {
+    napi_throw_error(env, nullptr, "builtins.compileFunction requires a builtin id");
+    return nullptr;
+  }
+
+  fs::path resolved;
+  const std::string builtins_dir = GetBuiltinsDirForBootstrap();
+  if (!ResolveBuiltinPath(id, builtins_dir, &resolved)) {
+    const std::string msg = "No such built-in module: " + id;
+    napi_throw_error(env, nullptr, msg.c_str());
+    return nullptr;
+  }
+
+  const std::string source = ReadTextFile(resolved);
+  std::string wrapped;
+  wrapped.reserve(source.size() + 160 + id.size());
+  wrapped += "(function(exports, require, module, process, internalBinding, primordials) {\n";
+  wrapped += source;
+  wrapped += "\n})\n//# sourceURL=node:";
+  wrapped += id;
+
+  napi_value wrapped_script = nullptr;
+  if (napi_create_string_utf8(env, wrapped.c_str(), wrapped.size(), &wrapped_script) != napi_ok ||
+      wrapped_script == nullptr) {
+    return nullptr;
+  }
+  napi_value compiled = nullptr;
+  if (napi_run_script(env, wrapped_script, &compiled) != napi_ok || compiled == nullptr) {
+    return nullptr;
+  }
+  return compiled;
+}
+
+static napi_value BuiltinsSetInternalLoadersCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_set_named_property(env, global, "__ubi_internal_binding_loader", argv[0]);
+  }
+  if (argc >= 2 && argv[1] != nullptr) {
+    napi_set_named_property(env, global, "__ubi_require_builtin_loader", argv[1]);
+  }
+
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 static bool AddUvErrorMapEntry(napi_env env, napi_value map, int32_t code, const char* name, const char* message) {
   napi_value code_key = nullptr;
   napi_value name_val = nullptr;
@@ -486,6 +554,12 @@ static napi_value UvGetErrorMapCallback(napi_env env, napi_callback_info /*info*
   }
   UV_ERRNO_MAP(UBI_SET_UV_ERRMAP_ENTRY);
 #undef UBI_SET_UV_ERRMAP_ENTRY
+#ifdef UV_EAI_MEMORY
+  if (!AddUvErrorMapEntry(
+          env, err_map, static_cast<int32_t>(UV_EAI_MEMORY), "EAI_MEMORY", "memory allocation failure")) {
+    return nullptr;
+  }
+#endif
   return err_map;
 }
 
@@ -1237,7 +1311,9 @@ static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderSta
   }
 
   napi_value compile_fn = nullptr;
-  if (napi_create_function(env, "compileFunction", NAPI_AUTO_LENGTH, NoopCallback, nullptr, &compile_fn) != napi_ok ||
+  if (napi_create_function(
+          env, "compileFunction", NAPI_AUTO_LENGTH, BuiltinsCompileFunctionCallback, nullptr, &compile_fn) !=
+          napi_ok ||
       compile_fn == nullptr ||
       napi_set_named_property(env, binding, "compileFunction", compile_fn) != napi_ok) {
     return nullptr;
@@ -1246,7 +1322,7 @@ static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderSta
   if (napi_create_function(env,
                            "setInternalLoaders",
                            NAPI_AUTO_LENGTH,
-                           NoopCallback,
+                           BuiltinsSetInternalLoadersCallback,
                            nullptr,
                            &set_internal_loaders_fn) != napi_ok ||
       set_internal_loaders_fn == nullptr ||
@@ -1415,56 +1491,257 @@ static napi_value TraceEventsTrace(napi_env env, napi_callback_info /*info*/) {
   return undefined;
 }
 
-static napi_value TraceEventsIsTraceCategoryEnabled(napi_env env, napi_callback_info /*info*/) {
-  napi_value out = nullptr;
-  napi_get_boolean(env, false, &out);
-  return out;
+static bool TraceEventsIsEnabled(const TraceEventsBindingState& st, const std::string& category) {
+  auto it = st.category_refcounts.find(category);
+  return it != st.category_refcounts.end() && it->second > 0;
 }
 
-static napi_value TraceEventsGetEnabledCategories(napi_env env, napi_callback_info /*info*/) {
-  napi_value out = nullptr;
-  napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &out);
-  return out;
+static void TraceEventsSetBufferByteIfPresent(TraceEventsBindingState& st, const std::string& category, bool enabled) {
+  auto it = st.category_buffers.find(category);
+  if (it == st.category_buffers.end() || it->second.data == nullptr) return;
+  it->second.data[0] = enabled ? 1 : 0;
 }
 
-static napi_value TraceEventsGetCategoryEnabledBuffer(napi_env env, napi_callback_info /*info*/) {
+static void TraceEventsNotifyStateHandler(napi_env env, TraceEventsBindingState& st) {
+  if (st.state_update_handler_ref == nullptr) return;
+  napi_value fn = nullptr;
+  if (napi_get_reference_value(env, st.state_update_handler_ref, &fn) != napi_ok || fn == nullptr) return;
+  napi_valuetype fn_type = napi_undefined;
+  if (napi_typeof(env, fn, &fn_type) != napi_ok || fn_type != napi_function) return;
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return;
+  const bool async_hooks_enabled = TraceEventsIsEnabled(st, "node.async_hooks");
+  napi_value enabled_value = nullptr;
+  napi_get_boolean(env, async_hooks_enabled, &enabled_value);
+  napi_value ignored = nullptr;
+  napi_call_function(env, global, fn, 1, &enabled_value, &ignored);
+}
+
+static void TraceEventsApplyCategoryDelta(napi_env env,
+                                          TraceEventsBindingState& st,
+                                          const std::vector<std::string>& categories,
+                                          bool enable) {
+  bool changed = false;
+  for (const std::string& category : categories) {
+    if (category.empty()) continue;
+    const bool was_enabled = TraceEventsIsEnabled(st, category);
+    int32_t count = 0;
+    auto it = st.category_refcounts.find(category);
+    if (it != st.category_refcounts.end()) count = it->second;
+
+    if (enable) {
+      ++count;
+    } else if (count > 0) {
+      --count;
+    }
+
+    if (count > 0) {
+      st.category_refcounts[category] = count;
+    } else {
+      st.category_refcounts.erase(category);
+    }
+
+    const bool now_enabled = count > 0;
+    if (was_enabled != now_enabled) {
+      changed = true;
+      TraceEventsSetBufferByteIfPresent(st, category, now_enabled);
+    }
+  }
+
+  if (changed) {
+    TraceEventsNotifyStateHandler(env, st);
+  }
+}
+
+static std::string TrimAsciiWhitespace(std::string value) {
+  size_t start = 0;
+  while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+    ++start;
+  }
+  size_t end = value.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+    --end;
+  }
+  return value.substr(start, end - start);
+}
+
+static std::vector<std::string> TraceEventsParseCategoriesFromArg(napi_env env, napi_value arg) {
+  std::vector<std::string> categories;
+  if (arg == nullptr) return categories;
+
+  bool is_array = false;
+  if (napi_is_array(env, arg, &is_array) == napi_ok && is_array) {
+    uint32_t len = 0;
+    if (napi_get_array_length(env, arg, &len) != napi_ok) return categories;
+    for (uint32_t i = 0; i < len; i++) {
+      napi_value element = nullptr;
+      if (napi_get_element(env, arg, i, &element) != napi_ok || element == nullptr) continue;
+      std::string category = TrimAsciiWhitespace(ValueToUtf8(env, element));
+      if (!category.empty()) categories.push_back(category);
+    }
+    return categories;
+  }
+
+  const std::string text = TrimAsciiWhitespace(ValueToUtf8(env, arg));
+  if (text.empty()) return categories;
+  size_t start = 0;
+  while (start <= text.size()) {
+    size_t comma = text.find(',', start);
+    std::string category = TrimAsciiWhitespace(
+        comma == std::string::npos ? text.substr(start) : text.substr(start, comma - start));
+    if (!category.empty()) categories.push_back(std::move(category));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return categories;
+}
+
+static napi_value TraceEventsGetCategoryBuffer(napi_env env, TraceEventsBindingState& st, const std::string& category) {
+  auto it = st.category_buffers.find(category);
+  if (it != st.category_buffers.end() && it->second.typed_array_ref != nullptr) {
+    napi_value existing = nullptr;
+    if (napi_get_reference_value(env, it->second.typed_array_ref, &existing) == napi_ok && existing != nullptr) {
+      return existing;
+    }
+  }
+
   napi_value ab = nullptr;
   void* data = nullptr;
   if (napi_create_arraybuffer(env, sizeof(uint8_t), &data, &ab) != napi_ok || ab == nullptr || data == nullptr) {
     return nullptr;
   }
-  static_cast<uint8_t*>(data)[0] = 0;
+  static_cast<uint8_t*>(data)[0] = TraceEventsIsEnabled(st, category) ? 1 : 0;
+
   napi_value ta = nullptr;
-  if (napi_create_typedarray(env, napi_uint8_array, 1, ab, 0, &ta) != napi_ok || ta == nullptr) return nullptr;
+  if (napi_create_typedarray(env, napi_uint8_array, 1, ab, 0, &ta) != napi_ok || ta == nullptr) {
+    return nullptr;
+  }
+
+  TraceEventsBindingState::CategoryBufferState buffer_state;
+  buffer_state.data = static_cast<uint8_t*>(data);
+  if (napi_create_reference(env, ta, 1, &buffer_state.typed_array_ref) != napi_ok || buffer_state.typed_array_ref == nullptr) {
+    return ta;
+  }
+
+  auto existing = st.category_buffers.find(category);
+  if (existing != st.category_buffers.end() && existing->second.typed_array_ref != nullptr) {
+    napi_delete_reference(env, existing->second.typed_array_ref);
+  }
+  st.category_buffers[category] = buffer_state;
   return ta;
 }
 
-static napi_value TraceEventsCategorySetEnable(napi_env env, napi_callback_info /*info*/) {
+static napi_value TraceEventsIsTraceCategoryEnabled(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+  std::string category;
+  if (argc >= 1 && argv[0] != nullptr) {
+    category = ValueToUtf8(env, argv[0]);
+  }
+  const auto& st = g_trace_events_states[env];
+  const bool enabled = !category.empty() && TraceEventsIsEnabled(st, category);
+  napi_value out = nullptr;
+  napi_get_boolean(env, enabled, &out);
+  return out;
+}
+
+static napi_value TraceEventsGetEnabledCategories(napi_env env, napi_callback_info /*info*/) {
+  const auto& st = g_trace_events_states[env];
+  std::vector<std::string> enabled_categories;
+  enabled_categories.reserve(st.category_refcounts.size());
+  for (const auto& entry : st.category_refcounts) {
+    if (entry.second > 0) enabled_categories.push_back(entry.first);
+  }
+  std::sort(enabled_categories.begin(), enabled_categories.end());
+  std::string joined;
+  for (size_t i = 0; i < enabled_categories.size(); i++) {
+    if (i != 0) joined.push_back(',');
+    joined.append(enabled_categories[i]);
+  }
+  napi_value out = nullptr;
+  napi_create_string_utf8(env, joined.c_str(), NAPI_AUTO_LENGTH, &out);
+  return out;
+}
+
+static napi_value TraceEventsGetCategoryEnabledBuffer(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+  std::string category = argc >= 1 && argv[0] != nullptr ? ValueToUtf8(env, argv[0]) : "";
+  auto& st = g_trace_events_states[env];
+  return TraceEventsGetCategoryBuffer(env, st, category);
+}
+
+struct TraceEventsCategorySetWrap {
+  std::vector<std::string> categories;
+  bool enabled = false;
+  napi_ref wrapper_ref = nullptr;
+};
+
+static void TraceEventsCategorySetFinalize(napi_env env, void* data, void* /*hint*/) {
+  auto* wrap = static_cast<TraceEventsCategorySetWrap*>(data);
+  if (wrap == nullptr) return;
+  if (wrap->enabled) {
+    auto st_it = g_trace_events_states.find(env);
+    if (st_it != g_trace_events_states.end()) {
+      TraceEventsApplyCategoryDelta(env, st_it->second, wrap->categories, false);
+    }
+  }
+  if (wrap->wrapper_ref != nullptr) napi_delete_reference(env, wrap->wrapper_ref);
+  delete wrap;
+}
+
+static TraceEventsCategorySetWrap* TraceEventsUnwrapCategorySet(napi_env env, napi_value this_arg) {
+  void* data = nullptr;
+  if (this_arg == nullptr || napi_unwrap(env, this_arg, &data) != napi_ok || data == nullptr) return nullptr;
+  return static_cast<TraceEventsCategorySetWrap*>(data);
+}
+
+static napi_value TraceEventsCategorySetEnable(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  auto* wrap = TraceEventsUnwrapCategorySet(env, this_arg);
+  if (wrap != nullptr && !wrap->enabled) {
+    wrap->enabled = true;
+    auto& st = g_trace_events_states[env];
+    TraceEventsApplyCategoryDelta(env, st, wrap->categories, true);
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
 }
 
-static napi_value TraceEventsCategorySetDisable(napi_env env, napi_callback_info /*info*/) {
+static napi_value TraceEventsCategorySetDisable(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  auto* wrap = TraceEventsUnwrapCategorySet(env, this_arg);
+  if (wrap != nullptr && wrap->enabled) {
+    wrap->enabled = false;
+    auto& st = g_trace_events_states[env];
+    TraceEventsApplyCategoryDelta(env, st, wrap->categories, false);
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
 }
 
-static napi_value TraceEventsCategorySetCtor(napi_env env, napi_callback_info /*info*/) {
-  napi_value obj = nullptr;
-  if (napi_create_object(env, &obj) != napi_ok || obj == nullptr) return nullptr;
-  napi_value enable_fn = nullptr;
-  napi_value disable_fn = nullptr;
-  if (napi_create_function(env, "enable", NAPI_AUTO_LENGTH, TraceEventsCategorySetEnable, nullptr, &enable_fn) == napi_ok &&
-      enable_fn != nullptr) {
-    napi_set_named_property(env, obj, "enable", enable_fn);
+static napi_value TraceEventsCategorySetCtor(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok || this_arg == nullptr) {
+    return nullptr;
   }
-  if (napi_create_function(env, "disable", NAPI_AUTO_LENGTH, TraceEventsCategorySetDisable, nullptr, &disable_fn) == napi_ok &&
-      disable_fn != nullptr) {
-    napi_set_named_property(env, obj, "disable", disable_fn);
+
+  auto* wrap = new TraceEventsCategorySetWrap();
+  if (argc >= 1 && argv[0] != nullptr) {
+    wrap->categories = TraceEventsParseCategoriesFromArg(env, argv[0]);
   }
-  return obj;
+  napi_wrap(env, this_arg, wrap, TraceEventsCategorySetFinalize, nullptr, &wrap->wrapper_ref);
+  return this_arg;
 }
 
 static napi_value TraceEventsSetTraceCategoryStateUpdateHandler(napi_env env, napi_callback_info info) {
@@ -1481,16 +1758,7 @@ static napi_value TraceEventsSetTraceCategoryStateUpdateHandler(napi_env env, na
     napi_valuetype t = napi_undefined;
     if (napi_typeof(env, argv[0], &t) == napi_ok && t == napi_function) {
       napi_create_reference(env, argv[0], 1, &st.state_update_handler_ref);
-      // Node calls handler upon tracing state changes; tracing is disabled in ubi.
-      napi_value global = nullptr;
-      napi_get_global(env, &global);
-      napi_value fn = nullptr;
-      if (napi_get_reference_value(env, st.state_update_handler_ref, &fn) == napi_ok && fn != nullptr) {
-        napi_value arg = nullptr;
-        napi_get_boolean(env, false, &arg);
-        napi_value ignored = nullptr;
-        napi_call_function(env, global, fn, 1, &arg, &ignored);
-      }
+      TraceEventsNotifyStateHandler(env, st);
     }
   }
   napi_value undefined = nullptr;
@@ -1524,12 +1792,18 @@ static napi_value GetOrCreateTraceEventsBinding(napi_env env) {
   }
 
   napi_value category_set_ctor = nullptr;
-  if (napi_create_function(env,
-                           "CategorySet",
-                           NAPI_AUTO_LENGTH,
-                           TraceEventsCategorySetCtor,
-                           nullptr,
-                           &category_set_ctor) != napi_ok ||
+  napi_property_descriptor category_set_props[] = {
+      {"enable", nullptr, TraceEventsCategorySetEnable, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"disable", nullptr, TraceEventsCategorySetDisable, nullptr, nullptr, nullptr, napi_default, nullptr},
+  };
+  if (napi_define_class(env,
+                        "CategorySet",
+                        NAPI_AUTO_LENGTH,
+                        TraceEventsCategorySetCtor,
+                        nullptr,
+                        2,
+                        category_set_props,
+                        &category_set_ctor) != napi_ok ||
       category_set_ctor == nullptr ||
       napi_set_named_property(env, binding, "CategorySet", category_set_ctor) != napi_ok) {
     return nullptr;
@@ -1563,6 +1837,17 @@ static napi_value ResolveUvBinding(napi_env env) {
   set_int32("UV_" #name, static_cast<int32_t>(UV_##name));
   UV_ERRNO_MAP(UBI_SET_UV_CONSTANT);
 #undef UBI_SET_UV_CONSTANT
+
+#ifdef UV_UNKNOWN
+  set_int32("UV_UNKNOWN", static_cast<int32_t>(UV_UNKNOWN));
+#else
+  set_int32("UV_UNKNOWN", -4094);
+#endif
+#ifdef UV_EAI_MEMORY
+  set_int32("UV_EAI_MEMORY", static_cast<int32_t>(UV_EAI_MEMORY));
+#else
+  set_int32("UV_EAI_MEMORY", -3001);
+#endif
 
   auto define_method = [&](const char* method_name, napi_callback cb) -> bool {
     napi_value fn = nullptr;

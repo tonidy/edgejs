@@ -350,6 +350,216 @@ void UbiInstallUtilBinding(napi_env env) {
     }
   }
 
+  static const char kEnhanceUtilHelpers[] = R"JS((function(binding) {
+    if (!binding || typeof binding !== 'object') return binding;
+    const globalObj = globalThis;
+    const kPending = 0;
+    const kFulfilled = 1;
+    const kRejected = 2;
+
+    if (!binding.constants || typeof binding.constants !== 'object') binding.constants = {};
+    binding.constants.ALL_PROPERTIES ??= 0;
+    binding.constants.ONLY_ENUMERABLE ??= 1;
+    binding.constants.kPending = kPending;
+    binding.constants.kFulfilled = kFulfilled;
+    binding.constants.kRejected = kRejected;
+    binding.constants.kExitCode ??= 0;
+    binding.constants.kExiting ??= 1;
+    binding.constants.kHasExitCode ??= 2;
+
+    if (!binding.privateSymbols || typeof binding.privateSymbols !== 'object') {
+      binding.privateSymbols = {};
+    }
+    const privateSymbols = binding.privateSymbols;
+    const ensureSymbol = (key) => {
+      if (typeof privateSymbols[key] !== 'symbol') privateSymbols[key] = Symbol(key);
+    };
+    ensureSymbol('arrow_message_private_symbol');
+    ensureSymbol('decorated_private_symbol');
+    ensureSymbol('untransferable_object_private_symbol');
+    ensureSymbol('exit_info_private_symbol');
+    ensureSymbol('contextify_context_private_symbol');
+    ensureSymbol('host_defined_option_symbol');
+    ensureSymbol('entry_point_promise_private_symbol');
+    ensureSymbol('entry_point_module_private_symbol');
+    ensureSymbol('module_source_private_symbol');
+    ensureSymbol('module_export_names_private_symbol');
+    ensureSymbol('module_circular_visited_private_symbol');
+    ensureSymbol('module_export_private_symbol');
+    ensureSymbol('module_first_parent_private_symbol');
+    ensureSymbol('module_last_parent_private_symbol');
+    ensureSymbol('transfer_mode_private_symbol');
+    ensureSymbol('source_map_data_private_symbol');
+
+    const NativeProxy = globalObj.__ubi_native_proxy || (globalObj.__ubi_native_proxy = globalObj.Proxy);
+    const proxyTag = globalObj.__ubi_proxy_tag || (globalObj.__ubi_proxy_tag = Symbol('ubi.proxy.tag'));
+    const proxyDetails = globalObj.__ubi_proxy_details || (globalObj.__ubi_proxy_details = new WeakMap());
+
+    if (!globalObj.__ubi_proxy_wrapped &&
+        typeof NativeProxy === 'function' &&
+        typeof NativeProxy.revocable === 'function') {
+      globalObj.__ubi_proxy_wrapped = true;
+      const WrappedProxy = function Proxy(target, handler) {
+        const proxy = new NativeProxy(target, handler);
+        proxyDetails.set(proxy, [target, handler]);
+        try {
+          Object.defineProperty(proxy, proxyTag, { value: true });
+        } catch {}
+        return proxy;
+      };
+      Object.defineProperty(WrappedProxy, 'name', { value: 'Proxy' });
+      Object.defineProperty(WrappedProxy, 'length', { value: 2 });
+      WrappedProxy.revocable = function revocable(target, handler) {
+        const record = NativeProxy.revocable(target, handler);
+        proxyDetails.set(record.proxy, [target, handler]);
+        try {
+          Object.defineProperty(record.proxy, proxyTag, { value: true });
+        } catch {}
+        const nativeRevoke = record.revoke;
+        record.revoke = function revoke() {
+          proxyDetails.set(record.proxy, [null, null]);
+          return nativeRevoke();
+        };
+        return record;
+      };
+      delete WrappedProxy.prototype;
+      Object.setPrototypeOf(WrappedProxy, NativeProxy);
+      globalObj.Proxy = WrappedProxy;
+    }
+
+    binding.getProxyDetails = function(value, full = true) {
+      const details = proxyDetails.get(value);
+      if (details === undefined) return undefined;
+      if (full === false) return details[0];
+      return details;
+    };
+
+    const promiseStates = globalObj.__ubi_promise_states ||
+      (globalObj.__ubi_promise_states = new WeakMap());
+    binding.getPromiseDetails = function(promise) {
+      if (!(promise instanceof Promise)) return undefined;
+      let details = promiseStates.get(promise);
+      if (details !== undefined) return details;
+      details = [kPending, undefined];
+      promiseStates.set(promise, details);
+      try {
+        Promise.prototype.then.call(
+          promise,
+          (value) => {
+            details[0] = kFulfilled;
+            details[1] = value;
+            return value;
+          },
+          (reason) => {
+            details[0] = kRejected;
+            details[1] = reason;
+            return undefined;
+          },
+        );
+      } catch {}
+      return details;
+    };
+
+    binding.getExternalValue = function(_value) {
+      return 0n;
+    };
+
+    function shouldSkipScript(scriptName) {
+      if (!scriptName) return true;
+      const s = String(scriptName);
+      return s.includes('node:util') ||
+        s.includes('node-lib/util.js') ||
+        s.includes('internal/bootstrap/internal_binding.js') ||
+        s.includes('internal_binding.js');
+    }
+
+    function parseStackFrame(line) {
+      const trimmed = String(line).trim();
+      let m = /^at\s+(.*?)\s+\((.*):(\d+):(\d+)\)$/.exec(trimmed);
+      if (m) {
+        return {
+          functionName: m[1] || '',
+          scriptName: m[2] || '',
+          lineNumber: Number(m[3]) || 1,
+          columnNumber: Number(m[4]) || 1,
+        };
+      }
+      m = /^at\s+(.*):(\d+):(\d+)$/.exec(trimmed);
+      if (m) {
+        return {
+          functionName: '',
+          scriptName: m[1] || '',
+          lineNumber: Number(m[2]) || 1,
+          columnNumber: Number(m[3]) || 1,
+        };
+      }
+      return null;
+    }
+
+    binding.getCallSites = function(frameCount) {
+      const n = frameCount == null ? 10 : Math.max(0, Math.trunc(Number(frameCount) || 0));
+      if (n <= 0) return [];
+
+      const stackLines = String(new Error().stack || '').split('\n').slice(1);
+      const out = [];
+      for (const line of stackLines) {
+        const parsed = parseStackFrame(line);
+        if (!parsed) continue;
+        if (shouldSkipScript(parsed.scriptName)) continue;
+        out.push({
+          scriptName: parsed.scriptName,
+          scriptId: '0',
+          lineNumber: parsed.lineNumber,
+          columnNumber: parsed.columnNumber,
+          column: parsed.columnNumber,
+          functionName: parsed.functionName,
+        });
+        if (out.length >= n) break;
+      }
+
+      if (out.length === 0) {
+        const fallback = (process && process.argv && process.argv[1]) || '[eval]';
+        out.push({
+          scriptName: fallback,
+          scriptId: '0',
+          lineNumber: 1,
+          columnNumber: 1,
+          column: 1,
+          functionName: '',
+        });
+      }
+
+      return out;
+    };
+
+    binding.getCallerLocation = function() {
+      const sites = binding.getCallSites(24);
+      for (const site of sites) {
+        const file = String(site?.scriptName || '');
+        if (!file) continue;
+        if (file.includes('internal/test_runner/')) continue;
+        if (file.includes('node-lib/internal/test_runner/')) continue;
+        return [site.lineNumber || 1, site.columnNumber || 1, file];
+      }
+      return [1, 1, '[eval]'];
+    };
+
+    return binding;
+  }) )JS";
+
+  napi_value enhance_script = nullptr;
+  if (napi_create_string_utf8(env, kEnhanceUtilHelpers, NAPI_AUTO_LENGTH, &enhance_script) == napi_ok &&
+      enhance_script != nullptr) {
+    napi_value enhance_fn = nullptr;
+    if (napi_run_script(env, enhance_script, &enhance_fn) == napi_ok && enhance_fn != nullptr) {
+      napi_value global_for_call = nullptr;
+      napi_get_global(env, &global_for_call);
+      napi_value argv[1] = {binding};
+      napi_value ignored = nullptr;
+      napi_call_function(env, global_for_call, enhance_fn, 1, argv, &ignored);
+    }
+  }
+
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
     return;

@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -1408,6 +1409,33 @@ napi_value BindingMkdtemp(napi_env env, napi_callback_info info) {
   return out;
 }
 
+napi_value BindingGetFormatOfExtensionlessFile(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
+    return nullptr;
+  }
+
+  const std::string path = PathFromValue(env, argv[0]);
+  bool is_wasm = false;
+  if (!path.empty()) {
+    std::ifstream in(path, std::ios::binary);
+    if (in.good()) {
+      char header[4] = {0, 0, 0, 0};
+      in.read(header, sizeof(header));
+      is_wasm = in.gcount() == static_cast<std::streamsize>(sizeof(header)) &&
+                header[0] == '\0' &&
+                header[1] == 'a' &&
+                header[2] == 's' &&
+                header[3] == 'm';
+    }
+  }
+
+  napi_value out = nullptr;
+  if (napi_create_int32(env, is_wasm ? 1 : 0, &out) != napi_ok) return nullptr;
+  return out;
+}
+
 void SetMethod(napi_env env, napi_value obj, const char* name,
                napi_callback cb) {
   napi_value fn = nullptr;
@@ -1464,6 +1492,7 @@ void UbiInstallFsBinding(napi_env env) {
   SetMethod(env, binding, "lutimes", BindingLutimes);
   SetMethod(env, binding, "fsync", BindingFsync);
   SetMethod(env, binding, "mkdtemp", BindingMkdtemp);
+  SetMethod(env, binding, "getFormatOfExtensionlessFile", BindingGetFormatOfExtensionlessFile);
 
   SetInt32Constant(env, binding, "O_RDONLY", UV_FS_O_RDONLY);
   SetInt32Constant(env, binding, "O_WRONLY", UV_FS_O_WRONLY);

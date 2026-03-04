@@ -1,6 +1,7 @@
 #include "ubi_process.h"
 
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <cmath>
 #include <ctime>
@@ -456,6 +457,50 @@ void ThrowRangeErrorWithCode(napi_env env, const char* code, const char* message
   napi_throw(env, error_value);
 }
 
+bool SetNamedString(napi_env env, napi_value obj, const char* name, const std::string& value);
+bool SetNamedInt32(napi_env env, napi_value obj, const char* name, int32_t value);
+
+void ThrowSystemError(napi_env env, int err, const char* syscall, const std::string& path = std::string()) {
+  int uv_err = err;
+  if (uv_err > 0) uv_err = uv_translate_sys_error(uv_err);
+  if (uv_err == 0) uv_err = UV_EIO;
+
+  const char* code = uv_err_name(uv_err);
+  if (code == nullptr) code = "UNKNOWN";
+  const char* detail = uv_strerror(uv_err);
+  if (detail == nullptr) detail = "unknown error";
+
+  std::string message = std::string(code) + ": " + detail;
+  if (syscall != nullptr && syscall[0] != '\0') {
+    message += ", ";
+    message += syscall;
+  }
+  if (!path.empty()) {
+    message += " '";
+    message += path;
+    message += "'";
+  }
+
+  napi_value code_value = nullptr;
+  napi_value message_value = nullptr;
+  napi_value error_value = nullptr;
+  if (napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_value) != napi_ok ||
+      napi_create_string_utf8(env, message.c_str(), NAPI_AUTO_LENGTH, &message_value) != napi_ok ||
+      napi_create_error(env, code_value, message_value, &error_value) != napi_ok ||
+      error_value == nullptr) {
+    return;
+  }
+  napi_set_named_property(env, error_value, "code", code_value);
+  SetNamedInt32(env, error_value, "errno", uv_err);
+  if (syscall != nullptr && syscall[0] != '\0') {
+    SetNamedString(env, error_value, "syscall", syscall);
+  }
+  if (!path.empty()) {
+    SetNamedString(env, error_value, "path", path);
+  }
+  napi_throw(env, error_value);
+}
+
 std::string InvalidArgTypeSuffix(napi_env env, napi_value value) {
   napi_valuetype t = napi_undefined;
   if (value == nullptr || napi_typeof(env, value, &t) != napi_ok) return " Received undefined";
@@ -541,6 +586,15 @@ bool SetNamedBool(napi_env env, napi_value obj, const char* name, bool value) {
 bool SetNamedValue(napi_env env, napi_value obj, const char* name, napi_value value) {
   if (value == nullptr) return false;
   return napi_set_named_property(env, obj, name, value) == napi_ok;
+}
+
+bool CopyNamedProperty(napi_env env, napi_value from, napi_value to, const char* name) {
+  bool has = false;
+  if (from == nullptr || to == nullptr) return false;
+  if (napi_has_named_property(env, from, name, &has) != napi_ok || !has) return false;
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, from, name, &value) != napi_ok || value == nullptr) return false;
+  return napi_set_named_property(env, to, name, value) == napi_ok;
 }
 
 bool IsValidMacAddress(const std::string& mac);
@@ -1451,6 +1505,168 @@ napi_value ProcessMethodsRawDebugCallback(napi_env env, napi_callback_info info)
     oss << NapiValueToUtf8(env, argv[i]);
   }
   std::cerr << oss.str() << std::endl;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+napi_value ProcessMethodsDebugProcessCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    ThrowTypeErrorWithCode(env, "ERR_MISSING_ARGS", "Invalid number of arguments.");
+    return nullptr;
+  }
+  int32_t pid = 0;
+  if (!ValueToInt32(env, argv[0], &pid)) {
+    ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_TYPE", "The \"pid\" argument must be of type number.");
+    return nullptr;
+  }
+
+#if defined(_WIN32)
+  ThrowErrorWithCode(
+      env, "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM", "process._debugProcess is not supported on win32 in Ubi runtime");
+  return nullptr;
+#else
+  const int rc = uv_kill(pid, SIGUSR1);
+  if (rc != 0) {
+    ThrowSystemError(env, rc, "kill");
+    return nullptr;
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+#endif
+}
+
+napi_value ProcessMethodsExecveCallback(napi_env env, napi_callback_info /*info*/) {
+  ThrowErrorWithCode(env, "ERR_UBI_NOT_SUPPORTED", "process.execve() is not supported in Ubi runtime.");
+  return nullptr;
+}
+
+napi_value ProcessMethodsPatchProcessObjectCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+
+  napi_valuetype arg_type = napi_undefined;
+  if (napi_typeof(env, argv[0], &arg_type) != napi_ok || arg_type != napi_object) {
+    ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_TYPE", "The \"process\" argument must be of type object.");
+    return nullptr;
+  }
+
+  napi_value global = nullptr;
+  napi_value process_obj = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+
+  CopyNamedProperty(env, process_obj, argv[0], "argv");
+  CopyNamedProperty(env, process_obj, argv[0], "execArgv");
+  CopyNamedProperty(env, process_obj, argv[0], "pid");
+  CopyNamedProperty(env, process_obj, argv[0], "ppid");
+  CopyNamedProperty(env, process_obj, argv[0], "execPath");
+  CopyNamedProperty(env, process_obj, argv[0], "versions");
+  CopyNamedProperty(env, process_obj, argv[0], "_rawDebug");
+
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+napi_value ProcessMethodsLoadEnvFileCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
+
+  const bool has_path_arg = argc >= 1 && argv[0] != nullptr;
+  const std::string path = has_path_arg ? NapiValueToUtf8(env, argv[0]) : ".env";
+
+  std::ifstream input(path, std::ios::in | std::ios::binary);
+  if (!input.is_open()) {
+    int err = uv_translate_sys_error(errno);
+    if (err == 0) err = UV_ENOENT;
+    ThrowSystemError(env, err, "open", path);
+    return nullptr;
+  }
+  std::ostringstream buffer;
+  buffer << input.rdbuf();
+  const std::string content = buffer.str();
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+
+  napi_value util_binding = nullptr;
+  if (napi_get_named_property(env, global, "__ubi_util", &util_binding) != napi_ok || util_binding == nullptr) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+
+  napi_value parse_env = nullptr;
+  if (napi_get_named_property(env, util_binding, "parseEnv", &parse_env) != napi_ok || parse_env == nullptr) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+  napi_valuetype parse_type = napi_undefined;
+  if (napi_typeof(env, parse_env, &parse_type) != napi_ok || parse_type != napi_function) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+
+  napi_value content_value = nullptr;
+  if (napi_create_string_utf8(env, content.c_str(), content.size(), &content_value) != napi_ok ||
+      content_value == nullptr) {
+    return nullptr;
+  }
+
+  napi_value parsed = nullptr;
+  if (napi_call_function(env, util_binding, parse_env, 1, &content_value, &parsed) != napi_ok || parsed == nullptr) {
+    return nullptr;
+  }
+
+  napi_valuetype parsed_type = napi_undefined;
+  if (napi_typeof(env, parsed, &parsed_type) != napi_ok || parsed_type != napi_object) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+
+  napi_value process_obj = nullptr;
+  napi_value process_env = nullptr;
+  if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr ||
+      napi_get_named_property(env, process_obj, "env", &process_env) != napi_ok || process_env == nullptr) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+
+  napi_value keys = nullptr;
+  if (napi_get_property_names(env, parsed, &keys) != napi_ok || keys == nullptr) return nullptr;
+  uint32_t key_count = 0;
+  if (napi_get_array_length(env, keys, &key_count) != napi_ok) return nullptr;
+
+  for (uint32_t i = 0; i < key_count; ++i) {
+    napi_value key = nullptr;
+    if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) continue;
+
+    bool has_existing = false;
+    if (napi_has_property(env, process_env, key, &has_existing) != napi_ok || has_existing) continue;
+
+    napi_value value = nullptr;
+    if (napi_get_property(env, parsed, key, &value) != napi_ok || value == nullptr) continue;
+    napi_set_property(env, process_env, key, value);
+  }
+
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -2380,7 +2596,7 @@ napi_status UbiInstallProcessObject(napi_env env,
       napi_callback cb;
     };
     const BindingMethod methods[] = {
-        {"_debugProcess", ProcessMethodsNoopUndefinedCallback},
+        {"_debugProcess", ProcessMethodsDebugProcessCallback},
         {"abort", ProcessAbortCallback},
         {"causeSegfault", ProcessMethodsCauseSegfaultCallback},
         {"chdir", ProcessChdirCallback},
@@ -2401,10 +2617,10 @@ napi_status UbiInstallProcessObject(napi_env env,
         {"cwd", ProcessCwdCallback},
         {"dlopen", ProcessMethodsDlopenCallback},
         {"reallyExit", ProcessExitCallback},
-        {"execve", ProcessMethodsNoopUndefinedCallback},
+        {"execve", ProcessMethodsExecveCallback},
         {"uptime", ProcessUptimeCallback},
-        {"patchProcessObject", ProcessMethodsNoopUndefinedCallback},
-        {"loadEnvFile", ProcessMethodsNoopUndefinedCallback},
+        {"patchProcessObject", ProcessMethodsPatchProcessObjectCallback},
+        {"loadEnvFile", ProcessMethodsLoadEnvFileCallback},
         {"setEmitWarningSync", ProcessMethodsSetEmitWarningSyncCallback},
         {"hrtime", ProcessMethodsHrtimeCallback},
         {"hrtimeBigInt", ProcessMethodsHrtimeBigIntCallback},

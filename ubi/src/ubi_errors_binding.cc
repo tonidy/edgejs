@@ -69,9 +69,38 @@ napi_value ErrorsNoSideEffectsToString(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, argv[0], &type) != napi_ok) return MakeUndefined(env);
+
+  // Preserve primitives and avoid invoking user-defined toString/valueOf on objects.
+  if (type == napi_string) return argv[0];
+  if (type == napi_number || type == napi_boolean || type == napi_bigint || type == napi_symbol ||
+      type == napi_undefined || type == napi_null) {
+    napi_value out = nullptr;
+    if (napi_coerce_to_string(env, argv[0], &out) == napi_ok && out != nullptr) return out;
+    return MakeUndefined(env);
+  }
+
+  napi_value script = nullptr;
+  if (napi_create_string_utf8(
+          env,
+          "(function(v){ return Object.prototype.toString.call(v); })",
+          NAPI_AUTO_LENGTH,
+          &script) != napi_ok ||
+      script == nullptr) {
+    return MakeUndefined(env);
+  }
+
+  napi_value fn = nullptr;
+  if (napi_run_script(env, script, &fn) != napi_ok || fn == nullptr) return MakeUndefined(env);
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return MakeUndefined(env);
+
   napi_value out = nullptr;
-  if (napi_coerce_to_string(env, argv[0], &out) != napi_ok || out == nullptr) {
-    napi_get_undefined(env, &out);
+  napi_value call_argv[1] = {argv[0]};
+  if (napi_call_function(env, global, fn, 1, call_argv, &out) != napi_ok || out == nullptr) {
+    return MakeUndefined(env);
   }
   return out;
 }
@@ -288,9 +317,52 @@ napi_value ErrorsGetErrorSourcePositions(napi_env env, napi_callback_info info) 
         script_resource_name = location.script_resource_name;
         line_number = location.line_number;
         start_column = location.start_column;
-        source_line = ReadSourceLineAt(
-            ScriptResourceNameToFilePath(location.script_resource_name),
-            location.line_number);
+
+        auto it = g_errors_states.find(env);
+        const bool source_maps_enabled =
+            it != g_errors_states.end() && it->second.source_maps_enabled;
+        const napi_ref source_map_ref =
+            it != g_errors_states.end() ? it->second.get_source_map_error_source_ref : nullptr;
+
+        // Prefer JS-side source-map aware callback when enabled.
+        if (source_maps_enabled && source_map_ref != nullptr) {
+          napi_value cb = nullptr;
+          if (napi_get_reference_value(env, source_map_ref, &cb) == napi_ok && cb != nullptr) {
+            napi_valuetype cb_type = napi_undefined;
+            if (napi_typeof(env, cb, &cb_type) == napi_ok && cb_type == napi_function) {
+              napi_value global = nullptr;
+              napi_value script_name_v = nullptr;
+              napi_value line_v = nullptr;
+              napi_value column_v = nullptr;
+              napi_value mapped_v = nullptr;
+              if (napi_get_global(env, &global) == napi_ok &&
+                  global != nullptr &&
+                  napi_create_string_utf8(
+                      env, script_resource_name.c_str(), NAPI_AUTO_LENGTH, &script_name_v) ==
+                      napi_ok &&
+                  script_name_v != nullptr &&
+                  napi_create_int32(env, line_number, &line_v) == napi_ok &&
+                  line_v != nullptr &&
+                  napi_create_int32(env, start_column, &column_v) == napi_ok &&
+                  column_v != nullptr) {
+                napi_value mapped_argv[3] = {script_name_v, line_v, column_v};
+                if (napi_call_function(env, global, cb, 3, mapped_argv, &mapped_v) == napi_ok &&
+                    mapped_v != nullptr) {
+                  napi_valuetype mapped_type = napi_undefined;
+                  if (napi_typeof(env, mapped_v, &mapped_type) == napi_ok && mapped_type == napi_string) {
+                    source_line = ValueToUtf8(env, mapped_v);
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (source_line.empty()) {
+          source_line = ReadSourceLineAt(
+              ScriptResourceNameToFilePath(location.script_resource_name),
+              location.line_number);
+        }
       }
     }
   }
@@ -319,6 +391,24 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
     napi_get_value_bool(env, argv[1], &from_promise);
   }
 
+  auto invoke_ref_callback = [&](napi_ref ref) {
+    if (ref == nullptr) return;
+    napi_value cb = nullptr;
+    if (napi_get_reference_value(env, ref, &cb) != napi_ok || cb == nullptr) return;
+    napi_valuetype cb_type = napi_undefined;
+    if (napi_typeof(env, cb, &cb_type) != napi_ok || cb_type != napi_function) return;
+    napi_value global = nullptr;
+    if (napi_get_global(env, &global) != napi_ok || global == nullptr) return;
+    napi_value cb_argv[1] = {exception};
+    napi_value ignored = nullptr;
+    napi_call_function(env, global, cb, 1, cb_argv, &ignored);
+  };
+
+  auto st_it = g_errors_states.find(env);
+  if (st_it != g_errors_states.end()) {
+    invoke_ref_callback(st_it->second.enhance_fatal_stack_before_inspector_ref);
+  }
+
   napi_value global = nullptr;
   napi_value process = nullptr;
   if (napi_get_global(env, &global) == napi_ok &&
@@ -341,10 +431,17 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
       if (fatal_result != nullptr) {
         bool handled = false;
         if (napi_get_value_bool(env, fatal_result, &handled) == napi_ok && handled) {
+          if (st_it != g_errors_states.end()) {
+            invoke_ref_callback(st_it->second.enhance_fatal_stack_after_inspector_ref);
+          }
           return MakeUndefined(env);
         }
       }
     }
+  }
+
+  if (st_it != g_errors_states.end()) {
+    invoke_ref_callback(st_it->second.enhance_fatal_stack_after_inspector_ref);
   }
 
   napi_throw(env, exception);

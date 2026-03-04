@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +10,9 @@
 #include <vector>
 
 #include <uv.h>
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#endif
 
 #include "ubi_runtime.h"
 
@@ -589,8 +593,77 @@ napi_value UdpFdGetter(napi_env env, napi_callback_info info) {
   return MakeInt32(env, fd);
 }
 
-napi_value UdpNoop0(napi_env env, napi_callback_info info) {
+napi_value UdpSetMulticastAll(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value self = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
+  UdpWrap* wrap = nullptr;
+  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
+  bool on = false;
+  if (napi_get_value_bool(env, argv[0], &on) != napi_ok) return MakeInt32(env, UV_EINVAL);
+
+#if !defined(_WIN32) && defined(IP_MULTICAST_ALL)
+  uv_os_fd_t fd = 0;
+  const int fileno_rc = uv_fileno(reinterpret_cast<const uv_handle_t*>(&wrap->handle), &fd);
+  if (fileno_rc != 0) return MakeInt32(env, fileno_rc);
+  int value = on ? 1 : 0;
+  if (setsockopt(static_cast<int>(fd), IPPROTO_IP, IP_MULTICAST_ALL, &value, sizeof(value)) != 0) {
+    return MakeInt32(env, uv_translate_sys_error(errno));
+  }
+#else
+  (void)on;
+#endif
   return MakeInt32(env, 0);
+}
+
+napi_value UdpBufferSizeCompat(napi_env env, napi_callback_info info, bool recv, bool set_mode) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value self = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
+  UdpWrap* wrap = nullptr;
+  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  if (wrap == nullptr) {
+    napi_value undef = nullptr;
+    napi_get_undefined(env, &undef);
+    return undef;
+  }
+
+  int value = 0;
+  if (set_mode) {
+    if (argc < 1 || argv[0] == nullptr || napi_get_value_int32(env, argv[0], &value) != napi_ok) {
+      napi_value undef = nullptr;
+      napi_get_undefined(env, &undef);
+      return undef;
+    }
+  }
+
+  const int rc = recv ? uv_recv_buffer_size(reinterpret_cast<uv_handle_t*>(&wrap->handle), &value)
+                      : uv_send_buffer_size(reinterpret_cast<uv_handle_t*>(&wrap->handle), &value);
+  if (rc != 0) {
+    napi_value undef = nullptr;
+    napi_get_undefined(env, &undef);
+    return undef;
+  }
+  return MakeInt32(env, value);
+}
+
+napi_value UdpSetRecvBufferSize(napi_env env, napi_callback_info info) {
+  return UdpBufferSizeCompat(env, info, true, true);
+}
+
+napi_value UdpSetSendBufferSize(napi_env env, napi_callback_info info) {
+  return UdpBufferSizeCompat(env, info, false, true);
+}
+
+napi_value UdpGetRecvBufferSize(napi_env env, napi_callback_info info) {
+  return UdpBufferSizeCompat(env, info, true, false);
+}
+
+napi_value UdpGetSendBufferSize(napi_env env, napi_callback_info info) {
+  return UdpBufferSizeCompat(env, info, false, false);
 }
 
 napi_value UdpSetBroadcast(napi_env env, napi_callback_info info) {
@@ -908,12 +981,12 @@ void UbiInstallUdpWrapBinding(napi_env env) {
       {"dropMembership", nullptr, UdpDropMembership, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"addSourceSpecificMembership", nullptr, UdpAddSourceSpecificMembership, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"dropSourceSpecificMembership", nullptr, UdpDropSourceSpecificMembership, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setMulticastAll", nullptr, UdpNoop0, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"setMulticastAll", nullptr, UdpSetMulticastAll, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"bufferSize", nullptr, UdpBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setRecvBufferSize", nullptr, UdpNoop0, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setSendBufferSize", nullptr, UdpNoop0, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getRecvBufferSize", nullptr, UdpNoop0, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getSendBufferSize", nullptr, UdpNoop0, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"setRecvBufferSize", nullptr, UdpSetRecvBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"setSendBufferSize", nullptr, UdpSetSendBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"getRecvBufferSize", nullptr, UdpGetRecvBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"getSendBufferSize", nullptr, UdpGetSendBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"connect", nullptr, UdpConnect, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"connect6", nullptr, UdpConnect6, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"disconnect", nullptr, UdpDisconnect, nullptr, nullptr, nullptr, napi_default, nullptr},
