@@ -9,6 +9,14 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+#include <uv.h>
+
 #include "node_version.h"
 #include "unofficial_napi.h"
 #include "ubi_process.h"
@@ -123,6 +131,20 @@ std::vector<std::string> NormalizeCliOptionVector(const std::vector<std::string>
   return out;
 }
 
+bool StdinIsTTY() {
+#if defined(_WIN32)
+  return uv_guess_handle(_fileno(stdin)) == UV_TTY;
+#else
+  return uv_guess_handle(STDIN_FILENO) == UV_TTY;
+#endif
+}
+
+int RunCliBuiltin(const char* source_text, std::string* error_out) {
+  return RunWithFreshEnv(
+      [&](napi_env env) { return UbiRunScriptSourceWithLoop(env, source_text, error_out, true); },
+      error_out);
+}
+
 }  // namespace
 
 void UbiInitializeCliProcess() {
@@ -159,15 +181,11 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
   if (argv != nullptr && argc > 0 && argv[0] != nullptr) {
     UbiSetProcessArgv0(argv[0]);
   }
-  if (argv == nullptr || argc < 2) {
-    UbiSetExecArgv({});
-    UbiSetScriptArgv({});
-    if (error_out != nullptr) {
-      *error_out = kUsage;
-    }
+  if (argv == nullptr || argc < 1) {
+    if (error_out != nullptr) *error_out = kUsage;
     return 1;
   }
-  if (argv[1] != nullptr &&
+  if (argc > 1 && argv[1] != nullptr &&
       (std::string(argv[1]) == "-v" || std::string(argv[1]) == "--version")) {
     std::cout << NODE_VERSION << "\n";
     return 0;
@@ -205,9 +223,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
     UbiSetExecArgv(NormalizeCliOptionVector(raw_exec_argv));
     UbiSetScriptArgv({});
     static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
-    return RunWithFreshEnv(
-        [&](napi_env env) { return UbiRunScriptSourceWithLoop(env, kInteractiveMain, error_out, true); },
-        error_out);
+    return RunCliBuiltin(kInteractiveMain, error_out);
   }
 
   const bool is_eval_mode = (mode == "-e" || mode == "--eval" || mode == "-pe" || mode == "-ep");
@@ -234,11 +250,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
     UbiSetExecArgv(NormalizeCliOptionVector(raw_exec_argv));
     UbiSetScriptArgv(script_argv);
     static constexpr const char kEvalStringMain[] = "require('internal/main/eval_string');";
-    return RunWithFreshEnv(
-        [&](napi_env env) {
-          return UbiRunScriptSourceWithLoop(env, kEvalStringMain, error_out, true);
-        },
-        error_out);
+    return RunCliBuiltin(kEvalStringMain, error_out);
   }
 
   int script_index = 1;
@@ -250,6 +262,9 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       script_index++;
       break;
     }
+    if (token == "-") {
+      break;
+    }
     if (!token.empty() && token[0] == '-') {
       exec_argv.push_back(token);
       script_index++;
@@ -258,12 +273,23 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
     break;
   }
   UbiSetExecArgv(exec_argv);
-  if (script_index >= argc || argv[script_index] == nullptr) {
-    UbiSetScriptArgv({});
-    if (error_out != nullptr) {
-      *error_out = kUsage;
+
+  const bool use_stdin_entry =
+      script_index >= argc || argv[script_index] == nullptr || std::string(argv[script_index]) == "-";
+  if (use_stdin_entry) {
+    std::vector<std::string> script_argv;
+    if (script_index < argc && argv[script_index] != nullptr && std::string(argv[script_index]) == "-") {
+      script_argv.reserve(static_cast<size_t>(argc - (script_index + 1)));
+      for (int i = script_index + 1; i < argc; ++i) {
+        if (argv[i] != nullptr) {
+          script_argv.emplace_back(argv[i]);
+        }
+      }
     }
-    return 1;
+    UbiSetScriptArgv(script_argv);
+    static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
+    static constexpr const char kEvalStdinMain[] = "require('internal/main/eval_stdin');";
+    return RunCliBuiltin(StdinIsTTY() ? kInteractiveMain : kEvalStdinMain, error_out);
   }
 
   std::vector<std::string> script_argv;

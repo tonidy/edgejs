@@ -1,7 +1,13 @@
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <string>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#endif
 
 #include "test_env.h"
 #include "ubi_cli.h"
@@ -26,14 +32,76 @@ void RemoveTempScript(const std::string& path) {
   std::filesystem::remove(path, ec);
 }
 
+std::filesystem::path ResolveBuiltUbiBinary() {
+  namespace fs = std::filesystem;
+  const fs::path cwd = fs::current_path();
+  const std::vector<fs::path> candidates = {
+      cwd / "ubi",
+      cwd / "build-ubi-rename" / "ubi",
+      cwd / "build-ubi" / "ubi",
+      cwd / "build" / "ubi",
+      cwd.parent_path() / "ubi",
+      cwd.parent_path() / "build-ubi-rename" / "ubi",
+      cwd.parent_path() / "build-ubi" / "ubi",
+      cwd.parent_path() / "build" / "ubi",
+  };
+  for (const auto& candidate : candidates) {
+    std::error_code ec;
+    if (!fs::exists(candidate, ec) || ec) continue;
+    if (fs::is_directory(candidate, ec) || ec) continue;
+    return fs::absolute(candidate).lexically_normal();
+  }
+  return {};
+}
+
+std::string ShellSingleQuoted(const std::string& input) {
+  std::string out;
+  out.reserve(input.size() + 2);
+  out.push_back('\'');
+  for (char c : input) {
+    if (c == '\'') {
+      out += "'\\''";
+    } else {
+      out.push_back(c);
+    }
+  }
+  out.push_back('\'');
+  return out;
+}
+
 }  // namespace
 
-TEST_F(Test1CliPhase01, MissingScriptArgReturnsUsageError) {
-  const char* argv[] = {"ubi"};
-  std::string error;
-  const int exit_code = UbiRunCli(1, argv, &error);
-  EXPECT_EQ(exit_code, 1);
-  EXPECT_EQ(error, "Usage: ubi <script.js>");
+TEST_F(Test1CliPhase01, NoArgsWithStdinEofFallsBackToStdinMode) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "stdin EOF subprocess check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const auto temp_root = std::filesystem::temp_directory_path() / "ubi_phase01_cli_no_args";
+  const auto stdout_path = temp_root / "stdout.txt";
+  const auto stderr_path = temp_root / "stderr.txt";
+  std::error_code ec;
+  std::filesystem::remove_all(temp_root, ec);
+  std::filesystem::create_directories(temp_root, ec);
+  ASSERT_FALSE(ec) << "Failed to create temp directory";
+
+  const std::string cmd =
+      ShellSingleQuoted(ubi_path.string()) + " </dev/null >" +
+      ShellSingleQuoted(stdout_path.string()) + " 2>" +
+      ShellSingleQuoted(stderr_path.string());
+  const int status = std::system(cmd.c_str());
+  ASSERT_NE(status, -1);
+  ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+
+  std::ifstream stderr_in(stderr_path);
+  std::string stderr_output((std::istreambuf_iterator<char>(stderr_in)),
+                            std::istreambuf_iterator<char>());
+  EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
+
+  std::filesystem::remove_all(temp_root, ec);
+#endif
 }
 
 TEST_F(Test1CliPhase01, ExtraArgsAreForwardedToScriptArgv) {

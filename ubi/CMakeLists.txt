@@ -378,6 +378,8 @@ target_include_directories(ubi_cli
 target_link_libraries(ubi_cli
   PUBLIC
     ubi_runtime
+  PRIVATE
+    uv_a
 )
 
 option(UBI_BUILD_CLI "Build ubi CLI binary" ON)
