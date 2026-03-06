@@ -344,8 +344,8 @@ target_include_directories(ubi_runtime
     "${PROJECT_ROOT}/deps"
     "${PROJECT_ROOT}/deps/llhttp/include"
     "${PROJECT_ROOT}/deps/ncrypto"
-    "${PROJECT_ROOT}/node/deps/icu-small/source/common"
-    "${PROJECT_ROOT}/node/deps/icu-small/source/i18n"
+    "${PROJECT_ROOT}/deps/icu-small/source/common"
+    "${PROJECT_ROOT}/deps/icu-small/source/i18n"
 )
 target_link_libraries(ubi_runtime
   PUBLIC
