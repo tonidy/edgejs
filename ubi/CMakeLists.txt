@@ -332,7 +332,30 @@ if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
   target_link_libraries(ubi_node_api PUBLIC napi_v8)
 endif()
 
+file(GLOB_RECURSE UBI_NODE_LIB_BUILTIN_SOURCES CONFIGURE_DEPENDS
+  "${PROJECT_ROOT}/node-lib/*.js"
+)
+file(GLOB_RECURSE UBI_NODE_DEPS_BUILTIN_SOURCES CONFIGURE_DEPENDS
+  "${PROJECT_ROOT}/node/deps/*.js"
+  "${PROJECT_ROOT}/node/deps/*.mjs"
+)
+set(UBI_GENERATED_BUILTIN_IDS "${CMAKE_CURRENT_BINARY_DIR}/generated_builtin_ids.inc")
+add_custom_command(
+  OUTPUT "${UBI_GENERATED_BUILTIN_IDS}"
+  COMMAND
+    "${Python3_EXECUTABLE}" "${UBI_ROOT}/cmake/generate_builtin_ids.py"
+    --node-lib-root "${PROJECT_ROOT}/node-lib"
+    --node-deps-root "${PROJECT_ROOT}/node/deps"
+    --output "${UBI_GENERATED_BUILTIN_IDS}"
+  DEPENDS
+    "${UBI_ROOT}/cmake/generate_builtin_ids.py"
+    ${UBI_NODE_LIB_BUILTIN_SOURCES}
+    ${UBI_NODE_DEPS_BUILTIN_SOURCES}
+  VERBATIM
+)
+
 add_library(ubi_runtime STATIC
+  "${UBI_GENERATED_BUILTIN_IDS}"
   src/builtin_catalog.cc
   src/ubi_runtime.cc
   src/ubi_runtime_platform_v8.cc
@@ -436,6 +459,7 @@ target_include_directories(ubi_runtime
     "${UBI_ROOT}/src"
   PRIVATE
     "${NAPI_INCLUDE_ROOT}"
+    "${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_ROOT}/deps"
     "${PROJECT_ROOT}/deps/llhttp/include"
     "${PROJECT_ROOT}/deps/ncrypto"
@@ -491,6 +515,7 @@ option(UBI_BUILD_CLI "Build ubi CLI binary" ON)
 if(UBI_BUILD_CLI)
   add_executable(ubi
     "${UBI_ROOT}/src/ubi_main.cc"
+    "${UBI_ROOT}/src/wasix_host_alloc.cc"
   )
   target_include_directories(ubi
     PRIVATE
@@ -508,6 +533,11 @@ if(UBI_BUILD_CLI)
     target_link_options(ubi PRIVATE
       "-Wl,--allow-undefined"
       "-Wl,--import-undefined"
+    )
+  endif()
+  if(UBI_IS_WASIX_TARGET)
+    target_link_options(ubi PRIVATE
+      "-Wl,--export=ubi_guest_malloc"
     )
   endif()
 

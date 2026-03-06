@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -745,6 +746,7 @@ static bool IsPerContextBuiltinId(const std::string& id);
 static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state);
 static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state);
 static napi_value GetStatePerIsolateSymbols(napi_env env, ModuleLoaderState* state);
+static napi_value DispatchResolveBinding(napi_env env, void* raw_state, const char* name);
 
 static const std::vector<std::string>& CollectRuntimeBuiltinIds() {
   return builtin_catalog::AllBuiltinIds();
@@ -3223,17 +3225,24 @@ static napi_value DispatchResolveBinding(napi_env env, void* raw_state, const ch
   if (std::strcmp(name, "url") == 0) {
     return GetOrCreateBinding(state, env, "url", UbiInstallUrlBinding);
   }
-  if (std::strcmp(name, "util") == 0 || std::strcmp(name, "types") == 0) {
+  if (std::strcmp(name, "util") == 0) {
     napi_value util = GetCachedBinding(state, env, "util");
-    napi_value types = GetCachedBinding(state, env, "types");
-    if (util == nullptr || types == nullptr) {
+    if (util == nullptr) {
       util = UbiInstallUtilBinding(env);
-      if (util != nullptr && !IsUndefinedValue(env, util)) util = CacheBinding(state, env, "util", util);
+      if (util != nullptr && !IsUndefinedValue(env, util)) {
+        napi_value cached = CacheBinding(state, env, "util", util);
+        util = cached;
+      }
+    }
+    return util;
+  }
+  if (std::strcmp(name, "types") == 0) {
+    napi_value types = GetCachedBinding(state, env, "types");
+    if (types == nullptr) {
       types = UbiGetTypesBinding(env);
       if (types != nullptr && !IsUndefinedValue(env, types)) types = CacheBinding(state, env, "types", types);
     }
-    if (std::strcmp(name, "types") == 0) return types;
-    return util;
+    return types;
   }
 
   return nullptr;
@@ -3289,7 +3298,7 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
   options.callbacks.resolve_options = ResolveOptionsBinding;
 
   napi_value resolved = internal_binding::Resolve(env, name, options);
-  if (resolved != nullptr) {
+  if (resolved != nullptr && !IsUndefinedValue(env, resolved)) {
     if (!name.empty() && !IsUndefinedValue(env, resolved)) {
       napi_value cached = CacheInternalBinding(state, env, name.c_str(), resolved);
       if (cached != nullptr) {
@@ -3299,11 +3308,47 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
     return resolved;
   }
 
+  napi_value direct = DispatchResolveBinding(env, state, name.c_str());
+  if (direct != nullptr) {
+    if (!name.empty() && !IsUndefinedValue(env, direct)) {
+      napi_value cached = CacheInternalBinding(state, env, name.c_str(), direct);
+      if (cached != nullptr) {
+        return cached;
+      }
+    }
+    return direct;
+  }
+
   bool has_pending_exception = false;
   if (napi_is_exception_pending(env, &has_pending_exception) == napi_ok && has_pending_exception) {
     return nullptr;
   }
   return undefined;
+}
+
+static bool InitializeBuiltinBootstrapState(napi_env env, ModuleLoaderState* state) {
+  if (env == nullptr || state == nullptr) return false;
+
+  internal_binding::ResolveOptions options;
+  options.state = state;
+  options.callbacks.get_or_create_builtins = DispatchGetOrCreateBuiltins;
+  options.callbacks.get_or_create_task_queue = DispatchGetOrCreateTaskQueue;
+  options.callbacks.get_or_create_errors = DispatchGetOrCreateErrors;
+  options.callbacks.get_or_create_trace_events = DispatchGetOrCreateTraceEvents;
+  options.callbacks.resolve_binding = DispatchResolveBinding;
+  options.callbacks.resolve_uv = ResolveUvBinding;
+  options.callbacks.resolve_contextify = ResolveContextifyBinding;
+  options.callbacks.resolve_modules = ResolveModulesBinding;
+  options.callbacks.resolve_options = ResolveOptionsBinding;
+
+  napi_value private_symbols = UbiGetPrivateSymbols(env);
+  if (private_symbols == nullptr || IsUndefinedValue(env, private_symbols)) return false;
+  ResetStateRef(env, &state->private_symbols_ref, private_symbols);
+
+  napi_value per_isolate_symbols = internal_binding::Resolve(env, "symbols", options);
+  if (per_isolate_symbols == nullptr) return false;
+  ResetStateRef(env, &state->per_isolate_symbols_ref, per_isolate_symbols);
+  return true;
 }
 
 bool ResolveModulePath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
@@ -4060,6 +4105,9 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
                               global,
                               "internalBinding",
                               native_get_internal_binding_fn) != napi_ok) {
+    return napi_generic_failure;
+  }
+  if (!InitializeBuiltinBootstrapState(env, &state)) {
     return napi_generic_failure;
   }
   return napi_ok;

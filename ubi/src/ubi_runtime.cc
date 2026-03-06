@@ -1536,31 +1536,6 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
-  {
-    napi_value util_name = nullptr;
-    napi_value symbols_name = nullptr;
-    napi_value util_binding = nullptr;
-    napi_value symbols_binding = nullptr;
-    if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) == napi_ok &&
-        util_name != nullptr &&
-        napi_call_function(env, global, native_internal_binding, 1, &util_name, &util_binding) == napi_ok &&
-        util_binding != nullptr &&
-        !IsUndefinedValue(env, util_binding)) {
-      napi_value private_symbols = nullptr;
-      if (GetNamedProperty(env, util_binding, "privateSymbols", &private_symbols) &&
-          private_symbols != nullptr &&
-          !IsUndefinedValue(env, private_symbols)) {
-        UbiSetPrivateSymbols(env, private_symbols);
-      }
-    }
-    if (napi_create_string_utf8(env, "symbols", NAPI_AUTO_LENGTH, &symbols_name) == napi_ok &&
-        symbols_name != nullptr &&
-        napi_call_function(env, global, native_internal_binding, 1, &symbols_name, &symbols_binding) == napi_ok &&
-        symbols_binding != nullptr &&
-        !IsUndefinedValue(env, symbols_binding)) {
-      UbiSetPerIsolateSymbols(env, symbols_binding);
-    }
-  }
   napi_value get_linked_binding = nullptr;
   if (napi_create_function(env,
                            "getLinkedBinding",

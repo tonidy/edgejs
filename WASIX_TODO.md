@@ -25,13 +25,28 @@ Items here should be replaced with real WASIX implementations, proper feature ga
 
 - Revisit the temporary zero-return behavior for process memory APIs in [ubi/src/ubi_process.cc](/home/theduke/dev/github.com/wasmerio/ubi/ubi/src/ubi_process.cc). These currently avoid unresolved imports for `uv_get_available_memory`, `uv_get_constrained_memory`, and `uv_resident_set_memory`, but should either report real values or be explicitly feature-gated.
 - Revisit the `getgroups()` guard in [ubi/src/internal_binding/binding_credentials.cc](/home/theduke/dev/github.com/wasmerio/ubi/ubi/src/internal_binding/binding_credentials.cc) once the WASIX libc story for group APIs is clearer.
+- Fix libuv stdio integration for WASIX instead of relying on compatibility write paths in `ubi`. Current evidence:
+  - guest-side direct WASIX writes work
+  - `process._rawDebug()` writes to `stderr` correctly
+  - `process.stdout.write()`, `console.log()`, and `fs.writeSync(1, ...)` do not reach `fd_write(1, ...)` through the current libuv-backed path
+  - `process.stdout` is currently classified as a TTY under the harness
+  The long-term fix should make `uv_tty_*`, `uv_fs_write`, and stdio handle classification behave correctly on WASIX so Node-style stdout/stderr flows work without `ubi`-specific fallbacks.
 
 ## Build system
 
 - Stop `ubi/scripts/setup-wasix-deps.sh` from mutating cloned deps during normal builds; switch to pinned revisions or explicit update steps.
 - Reduce noisy WASIX compatibility warnings in the build once the functional gaps are resolved.
+- Revisit builtin JS loading for WASIX. The current setup is intentionally hybrid:
+  - builtin IDs are generated at build time into a compiled catalog, similar to native Node
+  - builtin source files are still loaded from host-backed directories mounted into the guest at `/node-lib` and `/node/deps`
+  This is good enough for bootstrap, but should be cleaned up into one clear packaging model. Decide whether the long-term direction is:
+  - fully guest-visible packaged sources with a stable manifest,
+  - host-provided sources with a tighter runner contract, or
+  - a different native-aligned mechanism entirely.
+  Any cleanup should preserve the requirement that builtin source loads flow through the WASIX filesystem contract rather than ad hoc host-side shortcuts.
 
 ## N-API harness
 
 - Revisit getter/setter callback dispatch in [napi/wasmer/src/napi_bridge_init.cc](/home/theduke/dev/github.com/wasmerio/ubi/napi/wasmer/src/napi_bridge_init.cc). It currently distinguishes property getters from setters by callback arity when a single N-API property descriptor carries both, which is sufficient for now but should become an explicit callback-kind bridge.
 - Replace the temporary no-op `napi_add_env_cleanup_hook()` / `napi_remove_env_cleanup_hook()` bridge in [napi/wasmer/src/lib.rs](/home/theduke/dev/github.com/wasmerio/ubi/napi/wasmer/src/lib.rs) with a real cleanup-hook registry that invokes guest callbacks during env teardown.
+- Revisit the explicit `ubi_guest_malloc` export used by the WASIX harness for guest-backed `ArrayBuffer` / typed-array creation. It unblocks correct N-API behavior today, but the long-term interface should likely become a cleaner, generic guest allocator contract rather than a `ubi`-specific exported symbol.

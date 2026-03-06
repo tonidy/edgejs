@@ -13,6 +13,7 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -42,12 +43,25 @@ struct LazyPropertyData {
 
 std::vector<std::unique_ptr<LazyPropertyData>> g_lazy_property_data;
 std::unordered_map<napi_env, napi_ref> g_types_binding_refs;
+std::unordered_map<napi_env, napi_ref> g_private_symbols_refs;
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
-  if (ref == nullptr) return nullptr;
-  napi_value value = nullptr;
-  if (napi_get_reference_value(env, ref, &value) != napi_ok || value == nullptr) return nullptr;
-  return value;
+  if (env == nullptr || ref == nullptr) return nullptr;
+  napi_value out = nullptr;
+  if (napi_get_reference_value(env, ref, &out) != napi_ok || out == nullptr) return nullptr;
+  return out;
+}
+
+void ResetRef(napi_env env, napi_ref* slot, napi_value value) {
+  if (env == nullptr || slot == nullptr) return;
+  if (*slot != nullptr) {
+    napi_delete_reference(env, *slot);
+    *slot = nullptr;
+  }
+  if (value == nullptr) return;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type == napi_undefined) return;
+  napi_create_reference(env, value, 1, slot);
 }
 
 napi_value Undefined(napi_env env) {
@@ -908,9 +922,14 @@ bool DefineMethod(napi_env env, napi_value target, const char* name, napi_callba
   return SetNamedProperty(env, target, name, fn);
 }
 
-bool InstallPrivateSymbols(napi_env env, napi_value binding) {
+napi_value GetOrCreatePrivateSymbols(napi_env env) {
+  auto it = g_private_symbols_refs.find(env);
+  if (it != g_private_symbols_refs.end()) {
+    if (napi_value existing = GetRefValue(env, it->second); existing != nullptr) return existing;
+  }
+
   napi_value private_symbols = nullptr;
-  if (napi_create_object(env, &private_symbols) != napi_ok || private_symbols == nullptr) return false;
+  if (napi_create_object(env, &private_symbols) != napi_ok || private_symbols == nullptr) return nullptr;
 
   const std::array<std::pair<const char*, const char*>, 20> symbol_names = {{
       {"arrow_message_private_symbol", "node:arrowMessage"},
@@ -939,11 +958,18 @@ bool InstallPrivateSymbols(napi_env env, napi_value binding) {
     napi_value sym = nullptr;
     if (unofficial_napi_create_private_symbol(env, description, NAPI_AUTO_LENGTH, &sym) != napi_ok ||
         sym == nullptr) {
-      return false;
+      return nullptr;
     }
-    if (!SetNamedProperty(env, private_symbols, key, sym)) return false;
+    if (!SetNamedProperty(env, private_symbols, key, sym)) return nullptr;
   }
 
+  ResetRef(env, &g_private_symbols_refs[env], private_symbols);
+  return private_symbols;
+}
+
+bool InstallPrivateSymbols(napi_env env, napi_value binding) {
+  napi_value private_symbols = GetOrCreatePrivateSymbols(env);
+  if (private_symbols == nullptr) return false;
   return SetNamedProperty(env, binding, "privateSymbols", private_symbols);
 }
 
@@ -973,15 +999,22 @@ bool InstallConstants(napi_env env, napi_value binding) {
 }
 
 bool InstallShouldAbortToggle(napi_env env, napi_value binding) {
-  napi_value ab = nullptr;
-  void* data = nullptr;
-  if (napi_create_arraybuffer(env, sizeof(uint32_t), &data, &ab) != napi_ok || ab == nullptr || data == nullptr) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
     return false;
   }
-  static_cast<uint32_t*>(data)[0] = 1;
-
+  napi_value ctor = nullptr;
+  if (napi_get_named_property(env, global, "Uint32Array", &ctor) != napi_ok || ctor == nullptr) {
+    return false;
+  }
+  napi_value length = nullptr;
+  if (napi_create_uint32(env, 1, &length) != napi_ok || length == nullptr) return false;
   napi_value out = nullptr;
-  if (napi_create_typedarray(env, napi_uint32_array, 1, ab, 0, &out) != napi_ok || out == nullptr) return false;
+  napi_value argv[1] = {length};
+  if (napi_new_instance(env, ctor, 1, argv, &out) != napi_ok || out == nullptr) return false;
+  napi_value initial = nullptr;
+  if (napi_create_uint32(env, 1, &initial) != napi_ok || initial == nullptr) return false;
+  if (napi_set_element(env, out, 0, initial) != napi_ok) return false;
   return SetNamedProperty(env, binding, "shouldAbortOnUncaughtToggle", out);
 }
 
@@ -1172,10 +1205,9 @@ napi_value UbiInstallUtilBinding(napi_env env) {
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
 
-  if (!InstallPrivateSymbols(env, binding) || !InstallConstants(env, binding) ||
-      !InstallShouldAbortToggle(env, binding)) {
-    return nullptr;
-  }
+  if (!InstallPrivateSymbols(env, binding)) return nullptr;
+  if (!InstallConstants(env, binding)) return nullptr;
+  if (!InstallShouldAbortToggle(env, binding)) return nullptr;
 
   if (!DefineMethod(env, binding, "isInsideNodeModules", IsInsideNodeModulesCallback) ||
       !DefineMethod(env, binding, "defineLazyProperties", DefineLazyPropertiesCallback) ||
@@ -1194,13 +1226,20 @@ napi_value UbiInstallUtilBinding(napi_env env) {
       !DefineMethod(env, binding, "guessHandleType", GuessHandleType)) {
     return nullptr;
   }
-
-  if (!InstallTypesBinding(env)) return nullptr;
   return binding;
 }
 
 napi_value UbiGetTypesBinding(napi_env env) {
   auto it = g_types_binding_refs.find(env);
+  if (it != g_types_binding_refs.end()) {
+    if (napi_value types = GetRefValue(env, it->second); types != nullptr) return types;
+  }
+  if (!InstallTypesBinding(env)) return nullptr;
+  it = g_types_binding_refs.find(env);
   if (it == g_types_binding_refs.end()) return nullptr;
   return GetRefValue(env, it->second);
+}
+
+napi_value UbiGetPrivateSymbols(napi_env env) {
+  return GetOrCreatePrivateSymbols(env);
 }

@@ -34,6 +34,41 @@
             };
             rustToolchain =
               pkgs.rust-bin.fromRustupToolchainFile ./napi/wasmer/rust-toolchain.toml;
+            v8Prebuilt = pkgs.stdenvNoCC.mkDerivation {
+              pname = "ubi-v8-prebuilt";
+              version = "11.9.1";
+              src = pkgs.fetchurl {
+                url = "https://github.com/wasmerio/v8-custom-builds/releases/download/11.9.1/v8-linux-amd64.tar.xz";
+                hash = "sha256-wzv7QCvuPmd5tMiAF7lf1F3v/k4cb6Zpc6LgHdclVrU=";
+              };
+              nativeBuildInputs = [ pkgs.clang pkgs.xz pkgs.gnutar ];
+              dontUnpack = true;
+              dontConfigure = true;
+              dontBuild = true;
+              installPhase = ''
+                mkdir -p "$out"
+                tar -xJf "$src" -C "$out"
+
+                ${pkgs.clang}/bin/clang++ -shared \
+                  -Wl,--whole-archive "$out/lib/libv8.a" -Wl,--no-whole-archive \
+                  -o "$out/lib/libv8.so" \
+                  -ldl -pthread -lm -lrt || true
+
+                cat > "$out/lib/v8_libplatform_stub.cc" <<'EOF'
+                extern "C" void __dummy_v8_libplatform() {}
+                EOF
+                ${pkgs.clang}/bin/clang++ -shared \
+                  "$out/lib/v8_libplatform_stub.cc" \
+                  -o "$out/lib/libv8_libplatform.so"
+
+                cat > "$out/lib/v8_libbase_stub.cc" <<'EOF'
+                extern "C" void __dummy_v8_libbase() {}
+                EOF
+                ${pkgs.clang}/bin/clang++ -shared \
+                  "$out/lib/v8_libbase_stub.cc" \
+                  -o "$out/lib/libv8_libbase.so"
+              '';
+            };
           in
           pkgs.mkShell {
             packages = [
@@ -65,6 +100,7 @@
                 targets = [ "wasm32-unknown-unknown" ];
                 extensions = [ "rust-src" ];
               })
+              v8Prebuilt
               pkgs.wabt
               pkgs.xz
             ];
@@ -72,7 +108,7 @@
             shellHook = ''
               export UBI_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
               export V8_VERSION="11.9.1"
-              export V8_ROOT_DEFAULT="$UBI_REPO_ROOT/.ci/v8/$V8_VERSION/linux-amd64"
+              export V8_ROOT_DEFAULT="${v8Prebuilt}"
 
               export LLVM_SYS_211_PREFIX="${pkgs.llvmPackages_21.llvm.dev}"
               export LIBCLANG_PATH="${pkgs.llvmPackages_21.libclang.lib}/lib"
@@ -89,12 +125,10 @@
                   ) \
                   -isystem ${pkgs.glibc.dev}/include \
                   -idirafter ${pkgs.llvmPackages_21.clang}/lib/clang/${pkgs.lib.getVersion pkgs.llvmPackages_21.clang}/include"
-              if [ -d "$V8_ROOT_DEFAULT/include" ] && [ -d "$V8_ROOT_DEFAULT/lib" ]; then
-                export V8_INCLUDE_DIR="''${V8_INCLUDE_DIR:-$V8_ROOT_DEFAULT/include}"
-                export V8_LIB_DIR="''${V8_LIB_DIR:-$V8_ROOT_DEFAULT/lib}"
-                export V8_DEFINES="''${V8_DEFINES:-V8_COMPRESS_POINTERS}"
-                export LD_LIBRARY_PATH="$V8_LIB_DIR:$LD_LIBRARY_PATH"
-              fi
+              export V8_INCLUDE_DIR="''${V8_INCLUDE_DIR:-$V8_ROOT_DEFAULT/include}"
+              export V8_LIB_DIR="''${V8_LIB_DIR:-$V8_ROOT_DEFAULT/lib}"
+              export V8_DEFINES="''${V8_DEFINES:-V8_COMPRESS_POINTERS}"
+              export LD_LIBRARY_PATH="$V8_LIB_DIR:$LD_LIBRARY_PATH"
               echo "WASIX build shell ready."
               echo "Try: ubi/scripts/build-wasix.sh"
               echo "Try: cargo build --manifest-path napi/wasmer/Cargo.toml"

@@ -19,11 +19,11 @@ struct TimersHostState {
   napi_env env = nullptr;
   napi_ref timers_callback_ref = nullptr;
   napi_ref immediate_callback_ref = nullptr;
+  napi_ref immediate_info_ref = nullptr;
+  napi_ref timeout_info_ref = nullptr;
   uv_timer_t timer_handle{};
   uv_check_t check_handle{};
   uv_idle_t idle_handle{};
-  int32_t* immediate_info_ptr = nullptr;
-  int32_t* timeout_info_ptr = nullptr;
   double timer_base_ms = -1;
   bool timer_initialized = false;
   bool check_initialized = false;
@@ -130,9 +130,9 @@ void OnTimersEnvCleanup(void* arg) {
   st->cleanup_started = true;
   DeleteRefIfAny(st->env, &st->timers_callback_ref);
   DeleteRefIfAny(st->env, &st->immediate_callback_ref);
+  DeleteRefIfAny(st->env, &st->immediate_info_ref);
+  DeleteRefIfAny(st->env, &st->timeout_info_ref);
   st->env = nullptr;
-  st->immediate_info_ptr = nullptr;
-  st->timeout_info_ptr = nullptr;
 
   if (st->timer_initialized) {
     uv_timer_stop(&st->timer_handle);
@@ -188,20 +188,42 @@ bool CallImmediateCallback(TimersHostState* st);
 void ApplyImmediateRefState(TimersHostState* st, bool ref);
 
 uint32_t ImmediateCount(const TimersHostState* st) {
-  if (st == nullptr || st->immediate_info_ptr == nullptr) return 0;
-  const int32_t count = st->immediate_info_ptr[kImmediateCount];
+  if (st == nullptr || st->env == nullptr || st->immediate_info_ref == nullptr) return 0;
+  napi_value immediate_info = nullptr;
+  napi_value value = nullptr;
+  int32_t count = 0;
+  if (napi_get_reference_value(st->env, st->immediate_info_ref, &immediate_info) != napi_ok || immediate_info == nullptr ||
+      napi_get_element(st->env, immediate_info, kImmediateCount, &value) != napi_ok || value == nullptr ||
+      napi_get_value_int32(st->env, value, &count) != napi_ok) {
+    return 0;
+  }
   return count > 0 ? static_cast<uint32_t>(count) : 0;
 }
 
 uint32_t ImmediateRefCount(const TimersHostState* st) {
-  if (st == nullptr || st->immediate_info_ptr == nullptr) return 0;
-  const int32_t count = st->immediate_info_ptr[kImmediateRefCount];
+  if (st == nullptr || st->env == nullptr || st->immediate_info_ref == nullptr) return 0;
+  napi_value immediate_info = nullptr;
+  napi_value value = nullptr;
+  int32_t count = 0;
+  if (napi_get_reference_value(st->env, st->immediate_info_ref, &immediate_info) != napi_ok || immediate_info == nullptr ||
+      napi_get_element(st->env, immediate_info, kImmediateRefCount, &value) != napi_ok || value == nullptr ||
+      napi_get_value_int32(st->env, value, &count) != napi_ok) {
+    return 0;
+  }
   return count > 0 ? static_cast<uint32_t>(count) : 0;
 }
 
 bool ImmediateHasOutstanding(const TimersHostState* st) {
-  if (st == nullptr || st->immediate_info_ptr == nullptr) return false;
-  return st->immediate_info_ptr[kImmediateHasOutstanding] != 0;
+  if (st == nullptr || st->env == nullptr || st->immediate_info_ref == nullptr) return false;
+  napi_value immediate_info = nullptr;
+  napi_value value = nullptr;
+  int32_t flag = 0;
+  if (napi_get_reference_value(st->env, st->immediate_info_ref, &immediate_info) != napi_ok || immediate_info == nullptr ||
+      napi_get_element(st->env, immediate_info, kImmediateHasOutstanding, &value) != napi_ok || value == nullptr ||
+      napi_get_value_int32(st->env, value, &flag) != napi_ok) {
+    return false;
+  }
+  return flag != 0;
 }
 
 void EnsureTimerHandle(TimersHostState* st) {
@@ -457,35 +479,31 @@ void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb)
 void AttachInfoArrays(napi_env env, napi_value binding, TimersHostState* st) {
   if (st == nullptr) return;
 
-  napi_value immediate_ab = nullptr;
-  void* immediate_data = nullptr;
-  if (napi_create_arraybuffer(env, 3 * sizeof(int32_t), &immediate_data, &immediate_ab) == napi_ok &&
-      immediate_ab != nullptr && immediate_data != nullptr) {
-    auto* ptr = static_cast<int32_t*>(immediate_data);
-    ptr[0] = 0;
-    ptr[1] = 0;
-    ptr[2] = 0;
-    st->immediate_info_ptr = ptr;
-    napi_value immediate_info = nullptr;
-    if (napi_create_typedarray(env, napi_int32_array, 3, immediate_ab, 0, &immediate_info) == napi_ok &&
-        immediate_info != nullptr) {
-      napi_set_named_property(env, binding, "immediateInfo", immediate_info);
-    }
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return;
+  napi_value int32_array_ctor = nullptr;
+  if (napi_get_named_property(env, global, "Int32Array", &int32_array_ctor) != napi_ok || int32_array_ctor == nullptr) {
+    return;
   }
 
-  napi_value timeout_ab = nullptr;
-  void* timeout_data = nullptr;
-  if (napi_create_arraybuffer(env, sizeof(int32_t), &timeout_data, &timeout_ab) == napi_ok &&
-      timeout_ab != nullptr && timeout_data != nullptr) {
-    auto* ptr = static_cast<int32_t*>(timeout_data);
-    ptr[0] = 0;
-    st->timeout_info_ptr = ptr;
-    napi_value timeout_info = nullptr;
-    if (napi_create_typedarray(env, napi_int32_array, 1, timeout_ab, 0, &timeout_info) == napi_ok &&
-        timeout_info != nullptr) {
-      napi_set_named_property(env, binding, "timeoutInfo", timeout_info);
+  auto create_info_array = [&](uint32_t length, napi_ref* ref_slot, const char* prop_name) {
+    napi_value js_length = nullptr;
+    if (napi_create_uint32(env, length, &js_length) != napi_ok || js_length == nullptr) return;
+    napi_value info = nullptr;
+    napi_value argv[1] = {js_length};
+    if (napi_new_instance(env, int32_array_ctor, 1, argv, &info) != napi_ok || info == nullptr) return;
+    for (uint32_t i = 0; i < length; ++i) {
+      napi_value zero = nullptr;
+      if (napi_create_int32(env, 0, &zero) != napi_ok || zero == nullptr) return;
+      if (napi_set_element(env, info, i, zero) != napi_ok) return;
     }
-  }
+    if (napi_set_named_property(env, binding, prop_name, info) != napi_ok) return;
+    DeleteRefIfAny(env, ref_slot);
+    napi_create_reference(env, info, 1, ref_slot);
+  };
+
+  create_info_array(3, &st->immediate_info_ref, "immediateInfo");
+  create_info_array(1, &st->timeout_info_ref, "timeoutInfo");
 }
 
 }  // namespace
@@ -516,14 +534,28 @@ napi_value UbiInstallTimersHostBinding(napi_env env) {
 
 int32_t UbiGetActiveTimeoutCount(napi_env env) {
   const TimersHostState* st = GetState(env);
-  if (st == nullptr || st->timeout_info_ptr == nullptr) return 0;
-  const int32_t count = st->timeout_info_ptr[0];
+  if (st == nullptr || st->env == nullptr || st->timeout_info_ref == nullptr) return 0;
+  napi_value timeout_info = nullptr;
+  napi_value value = nullptr;
+  int32_t count = 0;
+  if (napi_get_reference_value(st->env, st->timeout_info_ref, &timeout_info) != napi_ok || timeout_info == nullptr ||
+      napi_get_element(st->env, timeout_info, 0, &value) != napi_ok || value == nullptr ||
+      napi_get_value_int32(st->env, value, &count) != napi_ok) {
+    return 0;
+  }
   return count > 0 ? count : 0;
 }
 
 uint32_t UbiGetActiveImmediateRefCount(napi_env env) {
   const TimersHostState* st = GetState(env);
-  if (st == nullptr || st->immediate_info_ptr == nullptr) return 0;
-  const int32_t count = st->immediate_info_ptr[kImmediateRefCount];
+  if (st == nullptr || st->env == nullptr || st->immediate_info_ref == nullptr) return 0;
+  napi_value immediate_info = nullptr;
+  napi_value value = nullptr;
+  int32_t count = 0;
+  if (napi_get_reference_value(st->env, st->immediate_info_ref, &immediate_info) != napi_ok || immediate_info == nullptr ||
+      napi_get_element(st->env, immediate_info, kImmediateRefCount, &value) != napi_ok || value == nullptr ||
+      napi_get_value_int32(st->env, value, &count) != napi_ok) {
+    return 0;
+  }
   return count > 0 ? static_cast<uint32_t>(count) : 0;
 }

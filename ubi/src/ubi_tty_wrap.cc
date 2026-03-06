@@ -1,10 +1,13 @@
 #include "ubi_tty_wrap.h"
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 
+#include <unistd.h>
 #include <uv.h>
 
 #include "ubi_async_wrap.h"
@@ -64,6 +67,32 @@ const UbiStreamBaseOps kTtyOps = {
     TtyDestroy,
     nullptr,
 };
+
+int SyncTtyWrite(TtyWrap* wrap, const char* data, size_t len) {
+  if (wrap == nullptr || !wrap->initialized || wrap->fd < 0) return UV_EBADF;
+  if (len == 0) return 0;
+  ssize_t rc = -1;
+  do {
+    rc = write(wrap->fd, data, len);
+  } while (rc < 0 && errno == EINTR);
+  if (rc < 0) return -errno;
+  wrap->base.bytes_written += static_cast<uint64_t>(rc);
+  return 0;
+}
+
+napi_value FinishSyncTtyWrite(TtyWrap* wrap, napi_value req_obj, int status) {
+  if (wrap == nullptr || wrap->env == nullptr) return nullptr;
+  if (req_obj != nullptr) {
+    napi_value stream_obj = UbiStreamBaseGetWrapper(&wrap->base);
+    napi_value argv[3] = {
+        UbiStreamBaseMakeInt32(wrap->env, status),
+        stream_obj != nullptr ? stream_obj : UbiStreamBaseUndefined(wrap->env),
+        status < 0 ? nullptr : UbiStreamBaseUndefined(wrap->env),
+    };
+    UbiStreamBaseInvokeReqOnComplete(wrap->env, req_obj, status, argv, 3);
+  }
+  return UbiStreamBaseMakeInt32(wrap->env, status);
+}
 
 napi_value GetThis(napi_env env,
                    napi_callback_info info,
@@ -267,7 +296,17 @@ napi_value TtyWriteBuffer(napi_env env, napi_callback_info info) {
   if (wrap == nullptr || !wrap->initialized || argc < 2) {
     return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   }
+#if defined(__wasi__)
+  const uint8_t* data = nullptr;
+  size_t len = 0;
+  bool refable = false;
+  std::string temp_utf8;
+  UbiStreamBaseExtractByteSpan(env, argv[1], &data, &len, &refable, &temp_utf8);
+  if (data == nullptr && len > 0) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  return FinishSyncTtyWrite(wrap, argv[0], SyncTtyWrite(wrap, reinterpret_cast<const char*>(data), len));
+#else
   return UbiLibuvStreamWriteBuffer(&wrap->base, argv[0], argv[1], nullptr, nullptr);
+#endif
 }
 
 napi_value TtyWriteString(napi_env env, napi_callback_info info) {
@@ -283,12 +322,28 @@ napi_value TtyWriteString(napi_env env, napi_callback_info info) {
   if (wrap == nullptr || !wrap->initialized || argc < 2) {
     return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   }
+#if defined(__wasi__)
+  napi_value encoding = nullptr;
+  const char* encoding_name = static_cast<const char*>(data);
+  if (encoding_name != nullptr) {
+    napi_create_string_utf8(env, encoding_name, NAPI_AUTO_LENGTH, &encoding);
+  }
+  napi_value buffer = UbiStreamBufferFromWithEncoding(env, argv[1], encoding);
+  const uint8_t* bytes = nullptr;
+  size_t len = 0;
+  bool refable = false;
+  std::string temp_utf8;
+  UbiStreamBaseExtractByteSpan(env, buffer, &bytes, &len, &refable, &temp_utf8);
+  if (bytes == nullptr && len > 0) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  return FinishSyncTtyWrite(wrap, argv[0], SyncTtyWrite(wrap, reinterpret_cast<const char*>(bytes), len));
+#else
   return UbiLibuvStreamWriteString(&wrap->base,
                                    argv[0],
                                    argv[1],
                                    static_cast<const char*>(data),
                                    nullptr,
                                    nullptr);
+#endif
 }
 
 napi_value TtyWriteV(napi_env env, napi_callback_info info) {

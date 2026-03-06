@@ -57,13 +57,37 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
     println!("cargo:rustc-link-search=native={v8_lib}");
-    println!("cargo:rustc-link-lib=dylib=v8");
-    println!("cargo:rustc-link-lib=dylib=v8_libplatform");
-    println!("cargo:rustc-link-lib=dylib=v8_libbase");
+    let v8_lib_dir = std::path::Path::new(&v8_lib);
+    let v8_link_kind = if v8_lib_dir.join("libv8.so").exists()
+        || v8_lib_dir.join("libv8.dylib").exists()
+    {
+        "dylib"
+    } else {
+        "static"
+    };
+    println!("cargo:rustc-link-lib={v8_link_kind}=v8");
+
+    let v8_libplatform_kind = if v8_lib_dir.join("libv8_libplatform.a").exists() {
+        "static"
+    } else {
+        "dylib"
+    };
+    println!("cargo:rustc-link-lib={v8_libplatform_kind}=v8_libplatform");
+
+    let v8_libbase_kind = if v8_lib_dir.join("libv8_libbase.a").exists() {
+        "static"
+    } else {
+        "dylib"
+    };
+    println!("cargo:rustc-link-lib={v8_libbase_kind}=v8_libbase");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" || target_os == "ios" {
         println!("cargo:rustc-link-lib=dylib=c++");
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rustc-link-lib=dylib=dl");
+        println!("cargo:rustc-link-lib=dylib=m");
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        println!("cargo:rustc-link-lib=dylib=rt");
     }
 }

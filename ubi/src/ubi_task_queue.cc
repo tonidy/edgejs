@@ -12,7 +12,7 @@ struct TaskQueueBindingState {
   napi_ref binding_ref = nullptr;
   napi_ref tick_callback_ref = nullptr;
   napi_ref promise_reject_callback_ref = nullptr;
-  int32_t* tick_info_fields = nullptr;
+  napi_ref tick_info_ref = nullptr;
 };
 
 std::unordered_map<napi_env, TaskQueueBindingState> g_task_queue_states;
@@ -34,7 +34,7 @@ void OnTaskQueueEnvCleanup(void* arg) {
   DeleteRefIfAny(env, &it->second.binding_ref);
   DeleteRefIfAny(env, &it->second.tick_callback_ref);
   DeleteRefIfAny(env, &it->second.promise_reject_callback_ref);
-  it->second.tick_info_fields = nullptr;
+  DeleteRefIfAny(env, &it->second.tick_info_ref);
   g_task_queue_states.erase(it);
 }
 
@@ -151,23 +151,25 @@ napi_value UbiGetOrCreateTaskQueueBinding(napi_env env) {
     return nullptr;
   }
 
-  napi_value tick_ab = nullptr;
-  void* tick_data = nullptr;
-  if (napi_create_arraybuffer(env, 2 * sizeof(int32_t), &tick_data, &tick_ab) != napi_ok ||
-      tick_ab == nullptr || tick_data == nullptr) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+  napi_value int32_array_ctor = nullptr;
+  if (napi_get_named_property(env, global, "Int32Array", &int32_array_ctor) != napi_ok ||
+      int32_array_ctor == nullptr) {
     return nullptr;
   }
-
-  auto* fields = static_cast<int32_t*>(tick_data);
-  fields[0] = 0;
-  fields[1] = 0;
-  st.tick_info_fields = fields;
-
+  napi_value length = nullptr;
+  if (napi_create_uint32(env, 2, &length) != napi_ok || length == nullptr) return nullptr;
   napi_value tick_info = nullptr;
-  if (napi_create_typedarray(env, napi_int32_array, 2, tick_ab, 0, &tick_info) != napi_ok || tick_info == nullptr) {
+  napi_value tick_args[1] = {length};
+  if (napi_new_instance(env, int32_array_ctor, 1, tick_args, &tick_info) != napi_ok || tick_info == nullptr) {
     return nullptr;
   }
   if (napi_set_named_property(env, binding, "tickInfo", tick_info) != napi_ok) return nullptr;
+  DeleteRefIfAny(env, &st.tick_info_ref);
+  if (napi_create_reference(env, tick_info, 1, &st.tick_info_ref) != napi_ok || st.tick_info_ref == nullptr) {
+    return nullptr;
+  }
 
   napi_value promise_events = nullptr;
   if (napi_create_object(env, &promise_events) != napi_ok || promise_events == nullptr) return nullptr;
@@ -242,15 +244,25 @@ bool UbiGetTaskQueueFlags(napi_env env, bool* has_tick_scheduled, bool* has_reje
   }
 
   auto it = g_task_queue_states.find(env);
-  if (it == g_task_queue_states.end() || it->second.tick_info_fields == nullptr) {
+  if (it == g_task_queue_states.end() || it->second.tick_info_ref == nullptr) {
     return false;
   }
 
-  if (has_tick_scheduled != nullptr) {
-    *has_tick_scheduled = it->second.tick_info_fields[0] != 0;
+  napi_value tick_info = nullptr;
+  if (napi_get_reference_value(env, it->second.tick_info_ref, &tick_info) != napi_ok || tick_info == nullptr) {
+    return false;
   }
-  if (has_rejection_to_warn != nullptr) {
-    *has_rejection_to_warn = it->second.tick_info_fields[1] != 0;
-  }
-  return true;
+  auto read_flag = [&](uint32_t index, bool* out) -> bool {
+    if (out == nullptr) return true;
+    napi_value value = nullptr;
+    uint32_t raw = 0;
+    if (napi_get_element(env, tick_info, index, &value) != napi_ok || value == nullptr ||
+        napi_get_value_uint32(env, value, &raw) != napi_ok) {
+      return false;
+    }
+    *out = raw != 0;
+    return true;
+  };
+
+  return read_flag(0, has_tick_scheduled) && read_flag(1, has_rejection_to_warn);
 }

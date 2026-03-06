@@ -28,21 +28,34 @@ void* g_scope = nullptr;  // opaque scope handle from unofficial_napi_create_env
 constexpr uint32_t kUnofficialEnvHandle = 1;
 constexpr uint32_t kUnofficialScopeHandle = 1;
 
-// Handle table: maps u32 IDs to napi_value pointers.
-std::unordered_map<uint32_t, napi_value> g_values;
+// Handle table: maps u32 IDs to persistent napi_value references.
+//
+// Raw napi_value handles are only valid within the originating handle scope.
+// The guest stores these IDs across calls, so we must hold a reference on the
+// host side and re-resolve it when loading the value again.
+std::unordered_map<uint32_t, napi_ref> g_values;
 uint32_t g_next_id = 1;
 
 uint32_t StoreValue(napi_value val) {
   if (val == nullptr) return 0;
+  napi_ref ref = nullptr;
+  if (napi_create_reference(g_env, val, 1, &ref) != napi_ok || ref == nullptr) {
+    return 0;
+  }
   uint32_t id = g_next_id++;
-  g_values[id] = val;
+  g_values[id] = ref;
   return id;
 }
 
 napi_value LoadValue(uint32_t id) {
   if (id == 0) return nullptr;
   auto it = g_values.find(id);
-  return it != g_values.end() ? it->second : nullptr;
+  if (it == g_values.end() || it->second == nullptr) return nullptr;
+  napi_value value = nullptr;
+  if (napi_get_reference_value(g_env, it->second, &value) != napi_ok || value == nullptr) {
+    return nullptr;
+  }
+  return value;
 }
 
 // Handle table for napi_ref (references)
@@ -122,6 +135,11 @@ void* LoadModuleWrapHandle(uint32_t id) {
 void RemoveModuleWrapHandle(uint32_t id) { g_module_wrap_handles.erase(id); }
 
 napi_status DisposeBridgeStateLocked() {
+  for (auto& entry : g_values) {
+    if (entry.second != nullptr) {
+      napi_delete_reference(g_env, entry.second);
+    }
+  }
   g_values.clear();
   g_next_id = 1;
   g_refs.clear();
