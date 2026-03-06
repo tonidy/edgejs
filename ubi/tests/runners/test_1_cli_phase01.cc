@@ -82,6 +82,50 @@ std::string ShellSingleQuoted(const std::string& input) {
   return out;
 }
 
+struct CommandResult {
+  int status = -1;
+  std::string stdout_output;
+  std::string stderr_output;
+};
+
+CommandResult RunBuiltBinaryAndCapture(const std::filesystem::path& binary,
+                                       const std::vector<std::string>& args,
+                                       const std::string& stem) {
+  namespace fs = std::filesystem;
+  std::string unique_key = binary.string();
+  for (const auto& arg : args) {
+    unique_key.append("\n");
+    unique_key.append(arg);
+  }
+
+  const fs::path temp_root =
+      fs::temp_directory_path() /
+      (stem + "_" + std::to_string(static_cast<unsigned long long>(std::hash<std::string>{}(unique_key))));
+  const fs::path stdout_path = temp_root / "stdout.txt";
+  const fs::path stderr_path = temp_root / "stderr.txt";
+  std::error_code ec;
+  fs::remove_all(temp_root, ec);
+  fs::create_directories(temp_root, ec);
+
+  std::string cmd = ShellSingleQuoted(binary.string());
+  for (const auto& arg : args) {
+    cmd.push_back(' ');
+    cmd += ShellSingleQuoted(arg);
+  }
+  cmd += " >" + ShellSingleQuoted(stdout_path.string()) + " 2>" + ShellSingleQuoted(stderr_path.string());
+
+  CommandResult result;
+  result.status = std::system(cmd.c_str());
+
+  std::ifstream stdout_in(stdout_path);
+  result.stdout_output.assign(std::istreambuf_iterator<char>(stdout_in), std::istreambuf_iterator<char>());
+  std::ifstream stderr_in(stderr_path);
+  result.stderr_output.assign(std::istreambuf_iterator<char>(stderr_in), std::istreambuf_iterator<char>());
+
+  fs::remove_all(temp_root, ec);
+  return result;
+}
+
 }  // namespace
 
 TEST_F(Test1CliPhase01, NoArgsWithStdinEofFallsBackToStdinMode) {
@@ -517,22 +561,114 @@ TEST_F(Test1CliPhase01, ProcessExitCodeWithoutExplicitProcessExitIsReturned) {
 }
 
 TEST_F(Test1CliPhase01, ExplicitProcessExitDoesNotEmitBeforeExit) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "explicit process exit CLI parity check is POSIX-only";
+#else
   const std::string script_path = WriteTempScript(
       "ubi_phase01_cli_explicit_exit",
       "process.on('beforeExit', () => console.log('beforeExit'));\n"
       "process.on('exit', (code) => console.log('exit:' + code));\n"
       "process.exit(5);\n");
-  const char* argv[] = {"ubi", script_path.c_str()};
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
 
-  testing::internal::CaptureStdout();
-  std::string error;
-  const int exit_code = UbiRunCli(2, argv, &error);
-  const std::string stdout_output = testing::internal::GetCapturedStdout();
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_explicit_exit_run");
 
-  EXPECT_EQ(exit_code, 5);
-  EXPECT_EQ(error, "process.exit(5)");
-  EXPECT_EQ(stdout_output.find("beforeExit"), std::string::npos);
-  EXPECT_NE(stdout_output.find("exit:5"), std::string::npos);
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 5) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_EQ(result.stdout_output.find("beforeExit"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("exit:5"), std::string::npos) << result.stdout_output;
 
   RemoveTempScript(script_path);
+#endif
+}
+
+TEST_F(Test1CliPhase01, ExplicitProcessExitInsideAsyncDoesNotBecomeUnhandledRejection) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "async process exit CLI parity check is POSIX-only";
+#else
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_async_exit",
+      "process.on('unhandledRejection', (err) => {\n"
+      "  console.error('unhandledRejection', err && err.code, err && err.__ubiExitCode);\n"
+      "});\n"
+      "(async () => {\n"
+      "  await 0;\n"
+      "  process.exit(0);\n"
+      "})();\n"
+      "setTimeout(() => console.log('timer fired'), 50);\n");
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_async_exit_run");
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_EQ(result.stdout_output.find("timer fired"), std::string::npos) << result.stdout_output;
+  EXPECT_EQ(result.stderr_output.find("unhandledRejection"), std::string::npos) << result.stderr_output;
+  EXPECT_EQ(result.stderr_output.find("ERR_UBI_PROCESS_EXIT"), std::string::npos) << result.stderr_output;
+
+  RemoveTempScript(script_path);
+#endif
+}
+
+TEST_F(Test1CliPhase01, ProcessExitFromBeforeExitRunsImmediately) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "beforeExit process exit CLI parity check is POSIX-only";
+#else
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_before_exit_exit",
+      "process.on('beforeExit', () => {\n"
+      "  console.log('beforeExit');\n"
+      "  setTimeout(() => console.log('timer fired'), 5);\n"
+      "  process.exit(0);\n"
+      "  console.log('afterExit');\n"
+      "});\n");
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_before_exit_exit_run");
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("beforeExit"), std::string::npos) << result.stdout_output;
+  EXPECT_EQ(result.stdout_output.find("timer fired"), std::string::npos) << result.stdout_output;
+  EXPECT_EQ(result.stdout_output.find("afterExit"), std::string::npos) << result.stdout_output;
+
+  RemoveTempScript(script_path);
+#endif
+}
+
+TEST_F(Test1CliPhase01, ProcessExitCallsMonkeyPatchedReallyExit) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "process.reallyExit CLI parity check is POSIX-only";
+#else
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_really_exit_patch",
+      "process.reallyExit = function(code) {\n"
+      "  console.log('really exited:' + code);\n"
+      "};\n"
+      "process.exit();\n");
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_really_exit_patch_run");
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("really exited:0"), std::string::npos) << result.stdout_output;
+
+  RemoveTempScript(script_path);
+#endif
 }

@@ -305,19 +305,6 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
     return "";
   }
 
-  bool has_exit_code = false;
-  if (napi_has_named_property(env, exception, "__ubiExitCode", &has_exit_code) == napi_ok && has_exit_code) {
-    napi_value exit_code_value = nullptr;
-    int32_t code = 1;
-    if (napi_get_named_property(env, exception, "__ubiExitCode", &exit_code_value) == napi_ok &&
-        exit_code_value != nullptr &&
-        napi_get_value_int32(env, exit_code_value, &code) == napi_ok) {
-      if (is_process_exit != nullptr) *is_process_exit = true;
-      if (process_exit_code != nullptr) *process_exit_code = code;
-      return "";
-    }
-  }
-
   napi_value stack_value = nullptr;
   if (napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok && stack_value != nullptr) {
     napi_value stack_string = nullptr;
@@ -466,12 +453,6 @@ bool DispatchUncaughtException(napi_env env, napi_value exception, bool* handled
     if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
       napi_value pending = nullptr;
       if (napi_get_and_clear_last_exception(env, &pending) == napi_ok && pending != nullptr) {
-        bool has_exit_code = false;
-        if (napi_has_named_property(env, pending, "__ubiExitCode", &has_exit_code) == napi_ok && has_exit_code) {
-          (void)napi_throw(env, pending);
-          if (handled_out != nullptr) *handled_out = false;
-          return true;
-        }
         (void)napi_throw(env, pending);
       }
     }
@@ -509,29 +490,6 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   if (napi_get_and_clear_last_exception(env, &exception) != napi_ok || exception == nullptr) {
     if (error_out != nullptr) *error_out = "Unhandled async exception";
     return 1;
-  }
-
-  bool is_process_exit = false;
-  int process_exit_code = 1;
-  bool has_exit_code = false;
-  if (napi_has_named_property(env, exception, "__ubiExitCode", &has_exit_code) == napi_ok && has_exit_code) {
-    napi_value exit_code_value = nullptr;
-    int32_t code = 1;
-    if (napi_get_named_property(env, exception, "__ubiExitCode", &exit_code_value) == napi_ok &&
-        exit_code_value != nullptr &&
-        napi_get_value_int32(env, exit_code_value, &code) == napi_ok) {
-      is_process_exit = true;
-      process_exit_code = code;
-    }
-  }
-  if (is_process_exit) {
-    if (error_out != nullptr) {
-      error_out->clear();
-      if (process_exit_code != 0) {
-        *error_out = "process.exit(" + std::to_string(process_exit_code) + ")";
-      }
-    }
-    return process_exit_code;
   }
 
   bool handled = false;
@@ -2068,19 +2026,7 @@ int RunScriptWithGlobals(napi_env env,
     return 0;
   }
 
-  bool is_process_exit = false;
-  int process_exit_code = 1;
-  const std::string exception_message =
-      GetAndClearPendingException(env, &is_process_exit, &process_exit_code);
-  if (is_process_exit) {
-    if (error_out != nullptr) {
-      error_out->clear();
-      if (process_exit_code != 0) {
-        *error_out = "process.exit(" + std::to_string(process_exit_code) + ")";
-      }
-    }
-    return process_exit_code;
-  }
+  const std::string exception_message = GetAndClearPendingException(env, nullptr, nullptr);
   if (error_out != nullptr) {
     if (!exception_message.empty()) {
       *error_out = exception_message;
@@ -2148,13 +2094,6 @@ bool UbiHandlePendingExceptionNow(napi_env env, bool* handled_out) {
   napi_value exception = nullptr;
   if (napi_get_and_clear_last_exception(env, &exception) != napi_ok || exception == nullptr) {
     return false;
-  }
-
-  bool has_exit_code = false;
-  if (napi_has_named_property(env, exception, "__ubiExitCode", &has_exit_code) == napi_ok && has_exit_code) {
-    (void)napi_throw(env, exception);
-    if (handled_out != nullptr) *handled_out = false;
-    return true;
   }
 
   bool handled = false;

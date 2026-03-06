@@ -1786,20 +1786,7 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
     napi_valuetype arg_type = napi_undefined;
     if (napi_typeof(env, args[0], &arg_type) == napi_ok && arg_type != napi_undefined) napi_get_value_int32(env, args[0], &exit_code);
   }
-  napi_value code_value = nullptr;
-  napi_value message_value = nullptr;
-  napi_value error_value = nullptr;
-  napi_create_string_utf8(env, "ERR_UBI_PROCESS_EXIT", NAPI_AUTO_LENGTH, &code_value);
-  napi_create_string_utf8(env, "process.exit()", NAPI_AUTO_LENGTH, &message_value);
-  napi_create_error(env, code_value, message_value, &error_value);
-  napi_value exit_code_value = nullptr;
-  napi_create_int32(env, exit_code, &exit_code_value);
-  napi_set_named_property(env, error_value, "__ubiExitCode", exit_code_value);
-  uv_loop_t* loop = uv_default_loop();
-  if (loop != nullptr) {
-    uv_stop(loop);
-  }
-  napi_throw(env, error_value);
+  std::exit(exit_code);
   return nullptr;
 }
 
