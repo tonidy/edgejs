@@ -575,6 +575,130 @@ TEST_F(Test1CliPhase01, FsPromisesReadFileInsideListenCallbackDoesNotHang) {
 #endif
 }
 
+TEST_F(Test1CliPhase01, FsPromisesWriteFileInsideRequestDoesNotHang) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "request/writeFile subprocess parity check is POSIX-only";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const fs::path output_dir =
+      fs::temp_directory_path() / ("ubi_phase01_request_writefile_" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::create_directories(output_dir, ec);
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_request_writefile",
+      "const http = require('http');\n"
+      "const fs = require('fs/promises');\n"
+      "const path = require('path');\n"
+      "const payload = Buffer.alloc(512 * 1024, 0x61);\n"
+      "let count = 0;\n"
+      "const timer = setTimeout(() => {\n"
+      "  console.error('timeout');\n"
+      "  process.exit(9);\n"
+      "}, 4000);\n"
+      "const server = http.createServer(async (req, res) => {\n"
+      "  try {\n"
+      "    count += 1;\n"
+      "    const out = path.join(" + JsSingleQuoted(output_dir.string()) + ", 'req-' + count + '.bin');\n"
+      "    await fs.writeFile(out, payload);\n"
+      "    res.end('ok:' + count);\n"
+      "    if (count === 2) {\n"
+      "      setImmediate(() => {\n"
+      "        clearTimeout(timer);\n"
+      "        server.close();\n"
+      "      });\n"
+      "    }\n"
+      "  } catch (err) {\n"
+      "    console.error(err && err.stack || err);\n"
+      "    process.exitCode = 1;\n"
+      "    res.statusCode = 500;\n"
+      "    res.end('err');\n"
+      "  }\n"
+      "});\n"
+      "server.listen(0, async () => {\n"
+      "  const { port } = server.address();\n"
+      "  const getBody = () => new Promise((resolve, reject) => {\n"
+      "    http.get({ host: '127.0.0.1', port, path: '/' }, (res) => {\n"
+      "      let body = '';\n"
+      "      res.setEncoding('utf8');\n"
+      "      res.on('data', (chunk) => body += chunk);\n"
+      "      res.on('end', () => resolve(body));\n"
+      "    }).on('error', reject);\n"
+      "  });\n"
+      "  try {\n"
+      "    console.log(await getBody());\n"
+      "    console.log(await getBody());\n"
+      "  } catch (err) {\n"
+      "    console.error(err && err.stack || err);\n"
+      "    process.exitCode = 1;\n"
+      "    clearTimeout(timer);\n"
+      "    server.close();\n"
+      "  }\n"
+      "});\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_request_writefile_run");
+
+  RemoveTempScript(script_path);
+  fs::remove_all(output_dir, ec);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("ok:1"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("ok:2"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, FsPromisesWritevUsesTypedArrayByteLength) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "fs.promises.writev typed-array parity check is POSIX-only";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const fs::path file_path =
+      fs::temp_directory_path() / ("ubi_phase01_writev_typed_array_" + std::to_string(::getpid()) + ".bin");
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_writev_typed_array",
+      "const fs = require('fs/promises');\n"
+      "(async () => {\n"
+      "  const file = " + JsSingleQuoted(file_path.string()) + ";\n"
+      "  const fh = await fs.open(file, 'w');\n"
+      "  try {\n"
+      "    const view = new Uint16Array([0x4241, 0x4443]);\n"
+      "    const { bytesWritten } = await fh.writev([view]);\n"
+      "    const stat = await fs.stat(file);\n"
+      "    console.log('written:' + bytesWritten + ':' + stat.size);\n"
+      "  } finally {\n"
+      "    await fh.close();\n"
+      "  }\n"
+      "})().catch((err) => {\n"
+      "  console.error(err && err.stack || err);\n"
+      "  process.exitCode = 1;\n"
+      "});\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_writev_typed_array_run");
+
+  RemoveTempScript(script_path);
+  std::error_code ec;
+  fs::remove(file_path, ec);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("written:4:4"), std::string::npos) << result.stdout_output;
+#endif
+}
+
 TEST_F(Test1CliPhase01, AsyncLocalStoragePromiseContextSurvivesConcurrentAwaits) {
 #if defined(_WIN32)
   GTEST_SKIP() << "AsyncLocalStorage subprocess parity check is POSIX-only";
@@ -640,6 +764,97 @@ TEST_F(Test1CliPhase01, TextDecoderAcceptsSharedArrayBufferInput) {
   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
   EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
   EXPECT_NE(result.stdout_output.find("foo"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, FsWatchEmitsChangeAndClosesCleanly) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "fs.watch subprocess parity check is POSIX-only";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const fs::path file_path =
+      fs::temp_directory_path() / ("ubi_phase01_fs_watch_" + std::to_string(::getpid()) + ".txt");
+  {
+    std::ofstream out(file_path);
+    out << "start";
+  }
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_fs_watch",
+      "const fs = require('fs');\n"
+      "const file = " + JsSingleQuoted(file_path.string()) + ";\n"
+      "const timer = setTimeout(() => {\n"
+      "  console.error('timeout');\n"
+      "  process.exit(2);\n"
+      "}, 4000);\n"
+      "const watcher = fs.watch(file, (eventType, filename) => {\n"
+      "  console.log('watch:' + eventType + ':' + String(filename));\n"
+      "  watcher.close();\n"
+      "  clearTimeout(timer);\n"
+      "});\n"
+      "setTimeout(() => fs.appendFileSync(file, 'x'), 50);\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_fs_watch_run");
+
+  RemoveTempScript(script_path);
+  std::error_code ec;
+  fs::remove(file_path, ec);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("watch:"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, FsWatchFileEmitsChangeAndUnwatchWorks) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "fs.watchFile subprocess parity check is POSIX-only";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const fs::path file_path =
+      fs::temp_directory_path() / ("ubi_phase01_fs_watchfile_" + std::to_string(::getpid()) + ".txt");
+  {
+    std::ofstream out(file_path);
+    out << "start";
+  }
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_fs_watchfile",
+      "const fs = require('fs');\n"
+      "const file = " + JsSingleQuoted(file_path.string()) + ";\n"
+      "const timer = setTimeout(() => {\n"
+      "  console.error('timeout');\n"
+      "  process.exit(2);\n"
+      "}, 6000);\n"
+      "fs.watchFile(file, { interval: 50 }, (curr, prev) => {\n"
+      "  if (curr.mtimeMs === prev.mtimeMs) return;\n"
+      "  console.log('watchFile:' + curr.size + ':' + prev.size);\n"
+      "  fs.unwatchFile(file);\n"
+      "  clearTimeout(timer);\n"
+      "});\n"
+      "setTimeout(() => fs.appendFileSync(file, 'x'), 100);\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_fs_watchfile_run");
+
+  RemoveTempScript(script_path);
+  std::error_code ec;
+  fs::remove(file_path, ec);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("watchFile:"), std::string::npos) << result.stdout_output;
 #endif
 }
 

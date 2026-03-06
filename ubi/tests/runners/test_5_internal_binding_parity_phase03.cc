@@ -441,6 +441,7 @@ assert.strictEqual(syntheticWrap.getNamespace().x, 42);
 moduleWrapBinding.throwIfPromiseRejected(Promise.resolve());
 
 const fsBinding = internalBinding('fs');
+const fsConstants = constants.fs;
 assert.strictEqual(typeof fsBinding.FSReqCallback, 'function');
 assert.strictEqual(typeof fsBinding.FileHandle, 'function');
 assert.strictEqual(typeof fsBinding.StatWatcher, 'function');
@@ -463,12 +464,18 @@ assert.ok(fsBinding.bigintStatValues instanceof BigInt64Array);
 assert.ok(fsBinding.statFsValues instanceof Float64Array);
 assert.ok(fsBinding.bigintStatFsValues instanceof BigInt64Array);
 assert.strictEqual(typeof fsBinding.getFormatOfExtensionlessFile, 'function');
+assert.strictEqual(typeof fsBinding.accessSync, 'undefined');
+assert.strictEqual(typeof fsBinding.readSync, 'undefined');
+assert.strictEqual(typeof fsBinding.writeSync, 'undefined');
+assert.strictEqual(typeof fsBinding.writeSyncString, 'undefined');
+assert.strictEqual(typeof fsBinding.F_OK, 'undefined');
+assert.strictEqual(typeof fsBinding.O_RDONLY, 'undefined');
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ubi-fmt-'));
 const wasmPath = path.join(tmpRoot, 'mod');
 const jsPath = path.join(tmpRoot, 'main');
 const wasmFd = fsBinding.open(
   wasmPath,
-  fsBinding.O_WRONLY | fsBinding.O_CREAT | fsBinding.O_TRUNC,
+  fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC,
   0o666,
 );
 fsBinding.writeBuffer(wasmFd, new Uint8Array([0x00, 0x61, 0x73, 0x6d]), 0, 4, 0);
@@ -494,11 +501,11 @@ assert.strictEqual(fsStatBigValues.length, 18);
 const fsStatFsValues = fsBinding.statfs(jsPath, false);
 assert.ok(fsStatFsValues instanceof Float64Array);
 assert.strictEqual(fsStatFsValues.length, 7);
-fsBinding.access(jsPath, fsBinding.F_OK);
+fsBinding.access(jsPath, fsConstants.F_OK);
 const ioPath = path.join(tmpRoot, 'io.txt');
 const ioWriteFd = fsBinding.open(
   ioPath,
-  fsBinding.O_WRONLY | fsBinding.O_CREAT | fsBinding.O_TRUNC,
+  fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC,
   0o666,
 );
 assert.strictEqual(fsBinding.writeString(ioWriteFd, 'hello', null, 'utf8'), 5);
@@ -507,7 +514,7 @@ assert.strictEqual(
   6,
 );
 fsBinding.close(ioWriteFd);
-const ioReadFd = fsBinding.open(ioPath, fsBinding.O_RDONLY, 0o666);
+const ioReadFd = fsBinding.open(ioPath, fsConstants.O_RDONLY, 0o666);
 const ioReadBuffer = Buffer.alloc(11);
 assert.strictEqual(fsBinding.read(ioReadFd, ioReadBuffer, 0, 11, 0), 11);
 assert.strictEqual(ioReadBuffer.toString('utf8'), 'hello world');
@@ -515,10 +522,36 @@ const ioReadParts = [Buffer.alloc(5), Buffer.alloc(6)];
 assert.strictEqual(fsBinding.readBuffers(ioReadFd, ioReadParts, 0), 11);
 assert.strictEqual(Buffer.concat(ioReadParts).toString('utf8'), 'hello world');
 fsBinding.close(ioReadFd);
-const syncFileHandle = fsBinding.openFileHandle(ioPath, fsBinding.O_RDONLY, 0o666);
+const syncFileHandle = fsBinding.openFileHandle(ioPath, fsConstants.O_RDONLY, 0o666);
 assert.ok(syncFileHandle instanceof fsBinding.FileHandle);
 assert.strictEqual(typeof syncFileHandle.fd, 'number');
+assert.strictEqual(typeof syncFileHandle.getAsyncId, 'function');
+assert.strictEqual(typeof syncFileHandle.isStreamBase, 'boolean');
+assert.strictEqual(typeof syncFileHandle.bytesRead, 'number');
+assert.strictEqual(typeof syncFileHandle.bytesWritten, 'number');
+assert.strictEqual(typeof syncFileHandle._externalStream, 'object');
 syncFileHandle.close();
+const statWatcher = new fsBinding.StatWatcher(false);
+assert.strictEqual(typeof statWatcher.start, 'function');
+assert.strictEqual(typeof statWatcher.close, 'function');
+assert.strictEqual(typeof statWatcher.ref, 'function');
+assert.strictEqual(typeof statWatcher.unref, 'function');
+assert.strictEqual(typeof statWatcher.getAsyncId, 'function');
+assert.strictEqual(typeof statWatcher.getAsyncId(), 'number');
+statWatcher.close();
+const fsEventBinding = internalBinding('fs_event_wrap');
+assert.ok(fsEventBinding && typeof fsEventBinding === 'object');
+assert.strictEqual(typeof fsEventBinding.FSEvent, 'function');
+const fsEventHandle = new fsEventBinding.FSEvent();
+assert.strictEqual(fsEventHandle.initialized, false);
+fsEventHandle.owner = { marker: 1 };
+assert.strictEqual(fsEventHandle.owner.marker, 1);
+assert.strictEqual(typeof fsEventHandle.start, 'function');
+assert.strictEqual(typeof fsEventHandle.close, 'function');
+assert.strictEqual(typeof fsEventHandle.ref, 'function');
+assert.strictEqual(typeof fsEventHandle.unref, 'function');
+assert.strictEqual(typeof fsEventHandle.getAsyncId(), 'number');
+fsEventHandle.close();
 const pkgMainDir = path.join(tmpRoot, 'pkg-main');
 fs.mkdirSync(pkgMainDir);
 fs.writeFileSync(path.join(pkgMainDir, 'entry.js'), 'module.exports = 1;');

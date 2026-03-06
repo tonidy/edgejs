@@ -1436,6 +1436,81 @@ napi_value BindingFchmod(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+napi_value BindingChown(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 3) {
+    return nullptr;
+  }
+  std::string path = PathFromValue(env, argv[0]);
+  if (path.empty()) return nullptr;
+  uint32_t uid = 0;
+  uint32_t gid = 0;
+  if (napi_get_value_uint32(env, argv[1], &uid) != napi_ok ||
+      napi_get_value_uint32(env, argv[2], &gid) != napi_ok) {
+    return nullptr;
+  }
+  uv_fs_t req;
+  int err = uv_fs_chown(nullptr, &req, path.c_str(), uid, gid, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "chown", path.c_str());
+    return nullptr;
+  }
+  return nullptr;
+}
+
+napi_value BindingFchown(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 3) {
+    return nullptr;
+  }
+  int32_t fd = 0;
+  uint32_t uid = 0;
+  uint32_t gid = 0;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok ||
+      napi_get_value_uint32(env, argv[1], &uid) != napi_ok ||
+      napi_get_value_uint32(env, argv[2], &gid) != napi_ok) {
+    return nullptr;
+  }
+  uv_fs_t req;
+  int err = uv_fs_fchown(nullptr, &req, fd, uid, gid, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "fchown", nullptr);
+    return nullptr;
+  }
+  return nullptr;
+}
+
+napi_value BindingLchown(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 3) {
+    return nullptr;
+  }
+  std::string path = PathFromValue(env, argv[0]);
+  if (path.empty()) return nullptr;
+  uint32_t uid = 0;
+  uint32_t gid = 0;
+  if (napi_get_value_uint32(env, argv[1], &uid) != napi_ok ||
+      napi_get_value_uint32(env, argv[2], &gid) != napi_ok) {
+    return nullptr;
+  }
+  uv_fs_t req;
+  int err = uv_fs_lchown(nullptr, &req, path.c_str(), uid, gid, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "lchown", path.c_str());
+    return nullptr;
+  }
+  return nullptr;
+}
+
 napi_value BindingUtimes(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3] = {nullptr};
@@ -1546,6 +1621,25 @@ napi_value BindingFsync(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+napi_value BindingFdatasync(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 1) {
+    return nullptr;
+  }
+  int32_t fd = 0;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) return nullptr;
+  uv_fs_t req;
+  int err = uv_fs_fdatasync(nullptr, &req, fd, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "fdatasync", nullptr);
+    return nullptr;
+  }
+  return nullptr;
+}
+
 napi_value BindingMkdtemp(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -1573,6 +1667,47 @@ napi_value BindingMkdtemp(napi_env env, napi_callback_info info) {
   }
   uv_fs_req_cleanup(&req);
   return out;
+}
+
+napi_value BindingAccess(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 2) {
+    return nullptr;
+  }
+  std::string path = PathFromValue(env, argv[0]);
+  if (path.empty()) return nullptr;
+  int32_t mode = 0;
+  if (napi_get_value_int32(env, argv[1], &mode) != napi_ok) return nullptr;
+  uv_fs_t req;
+  int err = uv_fs_access(nullptr, &req, path.c_str(), mode, nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "access", path.c_str());
+    return nullptr;
+  }
+  return nullptr;
+}
+
+napi_value BindingLink(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
+      argc < 2) {
+    return nullptr;
+  }
+  std::string existing_path = PathFromValue(env, argv[0]);
+  std::string new_path = PathFromValue(env, argv[1]);
+  if (existing_path.empty() || new_path.empty()) return nullptr;
+  uv_fs_t req;
+  int err = uv_fs_link(nullptr, &req, existing_path.c_str(), new_path.c_str(), nullptr);
+  uv_fs_req_cleanup(&req);
+  if (err < 0) {
+    ThrowUVException(env, err, "link", new_path.c_str());
+    return nullptr;
+  }
+  return nullptr;
 }
 
 napi_value BindingGetFormatOfExtensionlessFile(napi_env env, napi_callback_info info) {
@@ -1634,6 +1769,7 @@ napi_value UbiInstallFsBinding(napi_env env) {
   SetMethod(env, binding, "readdir", BindingReaddir);
   SetMethod(env, binding, "realpath", BindingRealpath);
   SetMethod(env, binding, "existsSync", BindingExistsSync);
+  SetMethod(env, binding, "access", BindingAccess);
   SetMethod(env, binding, "accessSync", BindingAccessSync);
   SetMethod(env, binding, "stat", BindingStat);
   SetMethod(env, binding, "lstat", BindingLstat);
@@ -1653,11 +1789,16 @@ napi_value UbiInstallFsBinding(napi_env env) {
   SetMethod(env, binding, "symlink", BindingSymlink);
   SetMethod(env, binding, "chmod", BindingChmod);
   SetMethod(env, binding, "fchmod", BindingFchmod);
+  SetMethod(env, binding, "chown", BindingChown);
+  SetMethod(env, binding, "fchown", BindingFchown);
+  SetMethod(env, binding, "lchown", BindingLchown);
   SetMethod(env, binding, "utimes", BindingUtimes);
   SetMethod(env, binding, "futimes", BindingFutimes);
   SetMethod(env, binding, "lutimes", BindingLutimes);
   SetMethod(env, binding, "fsync", BindingFsync);
+  SetMethod(env, binding, "fdatasync", BindingFdatasync);
   SetMethod(env, binding, "mkdtemp", BindingMkdtemp);
+  SetMethod(env, binding, "link", BindingLink);
   SetMethod(env, binding, "getFormatOfExtensionlessFile", BindingGetFormatOfExtensionlessFile);
 
   SetInt32Constant(env, binding, "O_RDONLY", UV_FS_O_RDONLY);

@@ -1,21 +1,92 @@
 #include "internal_binding/dispatch.h"
 
-#include <unordered_map>
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+#include <uv.h>
 
 #include "internal_binding/helpers.h"
+#include "ubi_runtime.h"
 
 namespace internal_binding {
 
 namespace {
 
-struct FsEventWrap {
-  uint32_t async_id = 0;
+enum class FsEventEncoding {
+  kUtf8,
+  kBuffer,
 };
 
-std::unordered_map<napi_env, uint32_t> g_next_async_id;
+struct FsEventWrap {
+  napi_env env = nullptr;
+  napi_ref wrapper_ref = nullptr;
+  napi_ref owner_ref = nullptr;
+  uv_fs_event_t handle{};
+  bool initialized = false;
+  bool closing = false;
+  bool closed = false;
+  bool finalized = false;
+  bool delete_on_close = false;
+  bool referenced = true;
+  int64_t async_id = 0;
+  FsEventEncoding encoding = FsEventEncoding::kUtf8;
+};
 
-void FsEventFinalize(napi_env /*env*/, void* data, void* /*hint*/) {
-  delete static_cast<FsEventWrap*>(data);
+int64_t g_next_async_id = 500000;
+
+napi_value GetRefValue(napi_env env, napi_ref ref) {
+  if (env == nullptr || ref == nullptr) return nullptr;
+  napi_value out = nullptr;
+  if (napi_get_reference_value(env, ref, &out) != napi_ok) return nullptr;
+  return out;
+}
+
+void ResetRef(napi_env env, napi_ref* ref_ptr) {
+  if (env == nullptr || ref_ptr == nullptr || *ref_ptr == nullptr) return;
+  napi_delete_reference(env, *ref_ptr);
+  *ref_ptr = nullptr;
+}
+
+bool ValueToUtf8(napi_env env, napi_value value, std::string* out) {
+  if (env == nullptr || value == nullptr || out == nullptr) return false;
+
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
+    void* data = nullptr;
+    size_t len = 0;
+    if (napi_get_buffer_info(env, value, &data, &len) != napi_ok || data == nullptr) return false;
+    out->assign(static_cast<const char*>(data), len);
+    return true;
+  }
+
+  size_t len = 0;
+  if (napi_get_value_string_utf8(env, value, nullptr, 0, &len) != napi_ok) return false;
+  std::string text(len + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, value, text.data(), text.size(), &copied) != napi_ok) return false;
+  text.resize(copied);
+  *out = std::move(text);
+  return true;
+}
+
+napi_value MakeInt32(napi_env env, int32_t value) {
+  napi_value out = nullptr;
+  napi_create_int32(env, value, &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value MakeInt64(napi_env env, int64_t value) {
+  napi_value out = nullptr;
+  napi_create_int64(env, value, &out);
+  return out != nullptr ? out : Undefined(env);
+}
+
+FsEventWrap* UnwrapFsEvent(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+  void* data = nullptr;
+  if (napi_unwrap(env, value, &data) != napi_ok || data == nullptr) return nullptr;
+  return static_cast<FsEventWrap*>(data);
 }
 
 FsEventWrap* GetFsEventWrap(napi_env env, napi_callback_info info, napi_value* this_arg_out = nullptr) {
@@ -23,10 +94,99 @@ FsEventWrap* GetFsEventWrap(napi_env env, napi_callback_info info, napi_value* t
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   if (this_arg_out != nullptr) *this_arg_out = this_arg;
-  if (this_arg == nullptr) return nullptr;
-  void* data = nullptr;
-  if (napi_unwrap(env, this_arg, &data) != napi_ok || data == nullptr) return nullptr;
-  return static_cast<FsEventWrap*>(data);
+  return UnwrapFsEvent(env, this_arg);
+}
+
+napi_value CreateFilenameValue(FsEventWrap* wrap, const char* filename) {
+  if (wrap == nullptr || wrap->env == nullptr || filename == nullptr) {
+    napi_value out = nullptr;
+    if (wrap != nullptr && wrap->env != nullptr) {
+      napi_get_null(wrap->env, &out);
+    }
+    return out;
+  }
+
+  napi_value out = nullptr;
+  if (wrap->encoding == FsEventEncoding::kBuffer) {
+    napi_create_buffer_copy(wrap->env, std::strlen(filename), filename, nullptr, &out);
+  } else {
+    napi_create_string_utf8(wrap->env, filename, NAPI_AUTO_LENGTH, &out);
+  }
+  return out != nullptr ? out : Undefined(wrap->env);
+}
+
+void OnClosed(uv_handle_t* handle) {
+  auto* wrap = static_cast<FsEventWrap*>(handle != nullptr ? handle->data : nullptr);
+  if (wrap == nullptr) return;
+  wrap->closing = false;
+  wrap->closed = true;
+  wrap->initialized = false;
+  if (wrap->finalized || wrap->delete_on_close) {
+    ResetRef(wrap->env, &wrap->owner_ref);
+    ResetRef(wrap->env, &wrap->wrapper_ref);
+    delete wrap;
+  }
+}
+
+void CloseFsEvent(FsEventWrap* wrap) {
+  if (wrap == nullptr || wrap->closed || wrap->closing) return;
+  if (!wrap->initialized) {
+    wrap->closed = true;
+    return;
+  }
+  wrap->closing = true;
+  uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnClosed);
+}
+
+void FsEventFinalize(napi_env env, void* data, void* /*hint*/) {
+  auto* wrap = static_cast<FsEventWrap*>(data);
+  if (wrap == nullptr) return;
+  wrap->finalized = true;
+  if (!wrap->initialized || wrap->closed) {
+    ResetRef(env, &wrap->owner_ref);
+    ResetRef(env, &wrap->wrapper_ref);
+    delete wrap;
+    return;
+  }
+  wrap->delete_on_close = true;
+  CloseFsEvent(wrap);
+}
+
+void OnEvent(uv_fs_event_t* handle, const char* filename, int events, int status) {
+  auto* wrap = static_cast<FsEventWrap*>(handle != nullptr ? handle->data : nullptr);
+  if (wrap == nullptr || wrap->env == nullptr) return;
+
+  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+  if (self == nullptr) return;
+
+  napi_value onchange = nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_get_named_property(wrap->env, self, "onchange", &onchange) != napi_ok ||
+      onchange == nullptr ||
+      napi_typeof(wrap->env, onchange, &type) != napi_ok ||
+      type != napi_function) {
+    return;
+  }
+
+  const char* event_name = "";
+  if (status == 0) {
+    if ((events & UV_RENAME) != 0) {
+      event_name = "rename";
+    } else if ((events & UV_CHANGE) != 0) {
+      event_name = "change";
+    }
+  }
+
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_create_int32(wrap->env, status, &argv[0]);
+  napi_create_string_utf8(wrap->env, event_name, NAPI_AUTO_LENGTH, &argv[1]);
+  argv[2] = CreateFilenameValue(wrap, filename);
+  if (argv[2] == nullptr) {
+    napi_get_null(wrap->env, &argv[2]);
+  }
+
+  napi_value ignored = nullptr;
+  UbiMakeCallback(wrap->env, self, onchange, 3, argv, &ignored);
 }
 
 napi_value FsEventCtor(napi_env env, napi_callback_info info) {
@@ -36,38 +196,131 @@ napi_value FsEventCtor(napi_env env, napi_callback_info info) {
   if (this_arg == nullptr) return nullptr;
 
   auto* wrap = new FsEventWrap();
-  wrap->async_id = ++g_next_async_id[env];
-  if (napi_wrap(env, this_arg, wrap, FsEventFinalize, nullptr, nullptr) != napi_ok) {
+  wrap->env = env;
+  wrap->async_id = g_next_async_id++;
+  if (napi_wrap(env, this_arg, wrap, FsEventFinalize, nullptr, &wrap->wrapper_ref) != napi_ok) {
     delete wrap;
     return nullptr;
   }
   return this_arg;
 }
 
-napi_value FsEventStart(napi_env env, napi_callback_info /*info*/) {
-  napi_value out = nullptr;
-  napi_create_int32(env, 0, &out);
-  return out != nullptr ? out : Undefined(env);
+napi_value FsEventStart(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  FsEventWrap* wrap = UnwrapFsEvent(env, this_arg);
+  if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
+  if (wrap->closed || wrap->closing) return MakeInt32(env, UV_EINVAL);
+  if (wrap->initialized) return MakeInt32(env, 0);
+
+  std::string path;
+  if (argc < 1 || !ValueToUtf8(env, argv[0], &path)) return MakeInt32(env, UV_EINVAL);
+
+  bool persistent = true;
+  if (argc >= 2 && argv[1] != nullptr) {
+    napi_get_value_bool(env, argv[1], &persistent);
+  }
+
+  bool recursive = false;
+  if (argc >= 3 && argv[2] != nullptr) {
+    napi_get_value_bool(env, argv[2], &recursive);
+  }
+
+  std::string encoding = "utf8";
+  if (argc >= 4 && argv[3] != nullptr) {
+    ValueToUtf8(env, argv[3], &encoding);
+  }
+  wrap->encoding = (encoding == "buffer") ? FsEventEncoding::kBuffer : FsEventEncoding::kUtf8;
+
+  int flags = 0;
+  if (recursive) flags |= UV_FS_EVENT_RECURSIVE;
+
+  int rc = uv_fs_event_init(uv_default_loop(), &wrap->handle);
+  if (rc != 0) return MakeInt32(env, rc);
+
+  wrap->handle.data = wrap;
+  rc = uv_fs_event_start(&wrap->handle, OnEvent, path.c_str(), flags);
+  if (rc != 0) {
+    wrap->initialized = true;
+    wrap->closing = true;
+    uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnClosed);
+    return MakeInt32(env, rc);
+  }
+
+  wrap->initialized = true;
+  wrap->closed = false;
+  wrap->closing = false;
+  if (!persistent) {
+    uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+    wrap->referenced = false;
+  } else {
+    wrap->referenced = true;
+  }
+
+  return MakeInt32(env, 0);
 }
 
-napi_value FsEventClose(napi_env env, napi_callback_info /*info*/) {
+napi_value FsEventClose(napi_env env, napi_callback_info info) {
+  FsEventWrap* wrap = GetFsEventWrap(env, info);
+  if (wrap == nullptr) return Undefined(env);
+  CloseFsEvent(wrap);
   return Undefined(env);
 }
 
-napi_value FsEventRef(napi_env env, napi_callback_info /*info*/) {
+napi_value FsEventRef(napi_env env, napi_callback_info info) {
+  FsEventWrap* wrap = GetFsEventWrap(env, info);
+  if (wrap == nullptr || !wrap->initialized || wrap->closing || wrap->closed) return Undefined(env);
+  if (!wrap->referenced) {
+    uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+    wrap->referenced = true;
+  }
   return Undefined(env);
 }
 
-napi_value FsEventUnref(napi_env env, napi_callback_info /*info*/) {
+napi_value FsEventUnref(napi_env env, napi_callback_info info) {
+  FsEventWrap* wrap = GetFsEventWrap(env, info);
+  if (wrap == nullptr || !wrap->initialized || wrap->closing || wrap->closed) return Undefined(env);
+  if (wrap->referenced) {
+    uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+    wrap->referenced = false;
+  }
   return Undefined(env);
 }
 
 napi_value FsEventGetAsyncId(napi_env env, napi_callback_info info) {
   FsEventWrap* wrap = GetFsEventWrap(env, info);
-  const uint32_t async_id = wrap != nullptr ? wrap->async_id : 0;
+  return MakeInt64(env, wrap != nullptr ? wrap->async_id : -1);
+}
+
+napi_value FsEventGetInitialized(napi_env env, napi_callback_info info) {
+  FsEventWrap* wrap = GetFsEventWrap(env, info);
   napi_value out = nullptr;
-  napi_create_uint32(env, async_id, &out);
+  napi_get_boolean(env,
+                   wrap != nullptr && wrap->initialized && !wrap->closing && !wrap->closed,
+                   &out);
   return out != nullptr ? out : Undefined(env);
+}
+
+napi_value FsEventGetOwner(napi_env env, napi_callback_info info) {
+  FsEventWrap* wrap = GetFsEventWrap(env, info);
+  napi_value owner = wrap == nullptr ? nullptr : GetRefValue(env, wrap->owner_ref);
+  return owner != nullptr ? owner : Undefined(env);
+}
+
+napi_value FsEventSetOwner(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  FsEventWrap* wrap = UnwrapFsEvent(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  ResetRef(env, &wrap->owner_ref);
+  if (argc >= 1 && argv[0] != nullptr && !IsUndefined(env, argv[0])) {
+    napi_create_reference(env, argv[0], 1, &wrap->owner_ref);
+  }
+  return Undefined(env);
 }
 
 }  // namespace
@@ -82,6 +335,15 @@ napi_value ResolveFsEventWrap(napi_env env, const ResolveOptions& /*options*/) {
       {"ref", nullptr, FsEventRef, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"unref", nullptr, FsEventUnref, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"getAsyncId", nullptr, FsEventGetAsyncId, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"initialized", nullptr, nullptr, FsEventGetInitialized, nullptr, nullptr, napi_default, nullptr},
+      {"owner",
+       nullptr,
+       nullptr,
+       FsEventGetOwner,
+       FsEventSetOwner,
+       nullptr,
+       static_cast<napi_property_attributes>(napi_configurable),
+       nullptr},
   };
 
   napi_value cls = nullptr;
@@ -101,4 +363,3 @@ napi_value ResolveFsEventWrap(napi_env env, const ResolveOptions& /*options*/) {
 }
 
 }  // namespace internal_binding
-

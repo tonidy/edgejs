@@ -8,6 +8,7 @@
 #include <uv.h>
 
 #include "internal_binding/helpers.h"
+#include "ubi_runtime.h"
 
 namespace internal_binding {
 
@@ -274,20 +275,20 @@ void CompleteReq(DirReq* req, napi_value err, napi_value value) {
   if (err != nullptr && !IsUndefined(env, err)) {
     napi_value argv[1] = {err};
     napi_value ignored = nullptr;
-    napi_call_function(env, req_obj, oncomplete, 1, argv, &ignored);
+    UbiMakeCallback(env, req_obj, oncomplete, 1, argv, &ignored);
     return;
   }
 
   if (value != nullptr && !IsUndefined(env, value)) {
     napi_value argv[2] = {Undefined(env), value};
     napi_value ignored = nullptr;
-    napi_call_function(env, req_obj, oncomplete, 2, argv, &ignored);
+    UbiMakeCallback(env, req_obj, oncomplete, 2, argv, &ignored);
     return;
   }
 
   napi_value argv[1] = {Undefined(env)};
   napi_value ignored = nullptr;
-  napi_call_function(env, req_obj, oncomplete, 1, argv, &ignored);
+  UbiMakeCallback(env, req_obj, oncomplete, 1, argv, &ignored);
 }
 
 void DeleteReq(DirReq* req) {
