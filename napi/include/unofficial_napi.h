@@ -57,6 +57,15 @@ NAPI_EXTERN napi_status unofficial_napi_get_constructor_name(napi_env env,
                                                              napi_value value,
                                                              napi_value* name_out);
 
+// Unofficial helper for Node-style process.memoryUsage() parity.
+// Returns V8 heap statistics plus allocator-tracked ArrayBuffer memory.
+NAPI_EXTERN napi_status unofficial_napi_get_process_memory_info(
+    napi_env env,
+    double* heap_total_out,
+    double* heap_used_out,
+    double* external_out,
+    double* array_buffers_out);
+
 // Unofficial helpers for Node's async_context_frame parity. These expose the
 // engine continuation-preserved embedder data used by AsyncContextFrame.
 NAPI_EXTERN napi_status unofficial_napi_get_continuation_preserved_embedder_data(

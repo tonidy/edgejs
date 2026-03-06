@@ -6,6 +6,7 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <csignal>
 #include <sys/wait.h>
 #endif
 
@@ -1165,6 +1166,26 @@ TEST_F(Test1CliPhase01, ProcessExitCallsMonkeyPatchedReallyExit) {
   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
   EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
   EXPECT_NE(result.stdout_output.find("really exited:0"), std::string::npos) << result.stdout_output;
+
+  RemoveTempScript(script_path);
+#endif
+}
+
+TEST_F(Test1CliPhase01, ProcessAbortTerminatesProcess) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "process.abort CLI parity check is POSIX-only";
+#else
+  const std::string script_path = WriteTempScript("ubi_phase01_cli_abort", "process.abort();\n");
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const CommandResult result = RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_abort_run");
+
+  ASSERT_NE(result.status, -1);
+  const bool terminated_by_sigabrt =
+      (WIFSIGNALED(result.status) && WTERMSIG(result.status) == SIGABRT) ||
+      (WIFEXITED(result.status) && WEXITSTATUS(result.status) == 128 + SIGABRT);
+  EXPECT_TRUE(terminated_by_sigabrt) << "status=" << result.status << " stderr=" << result.stderr_output;
 
   RemoveTempScript(script_path);
 #endif

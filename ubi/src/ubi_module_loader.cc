@@ -2508,7 +2508,6 @@ static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderSta
 
   napi_value config_json = nullptr;
   std::string builtins_config_json = LoadBuiltinsConfigJson();
-  ReplaceJsonBooleanOrNumber(&builtins_config_json, "v8_enable_i18n_support", RuntimeHasIntl(env));
   if (napi_create_string_utf8(env, builtins_config_json.c_str(), NAPI_AUTO_LENGTH, &config_json) != napi_ok ||
       config_json == nullptr ||
       napi_set_named_property(env, binding, "config", config_json) != napi_ok) {

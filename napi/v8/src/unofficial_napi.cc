@@ -1,5 +1,6 @@
 #include "unofficial_napi.h"
 
+#include <atomic>
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
@@ -46,9 +47,60 @@ std::mutex g_runtime_mu;
 SharedRuntime g_runtime;
 std::unordered_map<v8::Isolate*, napi_env> g_env_by_isolate;
 std::unordered_map<v8::Isolate*, v8::Global<v8::Function>> g_promise_reject_callbacks;
+std::unordered_map<v8::ArrayBuffer::Allocator*, void*> g_tracking_allocators;
+
+class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
+ public:
+  TrackingArrayBufferAllocator()
+      : backing_(v8::ArrayBuffer::Allocator::NewDefaultAllocator()) {}
+
+  ~TrackingArrayBufferAllocator() override { delete backing_; }
+
+  void* Allocate(size_t length) override {
+    void* data = backing_ != nullptr ? backing_->Allocate(length) : nullptr;
+    if (data != nullptr) {
+      total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
+    }
+    return data;
+  }
+
+  void* AllocateUninitialized(size_t length) override {
+    void* data = backing_ != nullptr ? backing_->AllocateUninitialized(length) : nullptr;
+    if (data != nullptr) {
+      total_mem_usage_.fetch_add(length, std::memory_order_relaxed);
+    }
+    return data;
+  }
+
+  void Free(void* data, size_t length) override {
+    if (data != nullptr) {
+      total_mem_usage_.fetch_sub(length, std::memory_order_relaxed);
+    }
+    if (backing_ != nullptr) {
+      backing_->Free(data, length);
+    }
+  }
+
+  size_t MaxAllocationSize() const override {
+    return backing_ != nullptr ? backing_->MaxAllocationSize()
+                               : v8::ArrayBuffer::Allocator::MaxAllocationSize();
+  }
+
+  v8::PageAllocator* GetPageAllocator() override {
+    return backing_ != nullptr ? backing_->GetPageAllocator() : nullptr;
+  }
+
+  uint64_t total_mem_usage() const {
+    return total_mem_usage_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  v8::ArrayBuffer::Allocator* backing_ = nullptr;
+  std::atomic<uint64_t> total_mem_usage_ {0};
+};
 
 void ApplyDefaultV8Flags() {
-  static constexpr char kDefaultFlags[] = "--js-float16array --expose-gc";
+  static constexpr char kDefaultFlags[] = "--js-float16array";
   v8::V8::SetFlagsFromString(kDefaultFlags, static_cast<int>(sizeof(kDefaultFlags) - 1));
 }
 
@@ -67,12 +119,14 @@ napi_status AcquireRuntime(v8::Isolate** isolate_out) {
     v8::V8::InitializePlatform(g_runtime.platform.get());
     v8::V8::Initialize();
 
-    g_runtime.params.array_buffer_allocator =
-        v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+    auto* allocator = new TrackingArrayBufferAllocator();
+    g_runtime.params.array_buffer_allocator = allocator;
+    g_tracking_allocators[g_runtime.params.array_buffer_allocator] = allocator;
     g_runtime.isolate = v8::Isolate::New(g_runtime.params);
     if (g_runtime.isolate == nullptr) {
       delete g_runtime.params.array_buffer_allocator;
       g_runtime.params.array_buffer_allocator = nullptr;
+      g_tracking_allocators.erase(allocator);
       g_runtime.platform.reset();
       v8::V8::Dispose();
       v8::V8::DisposePlatform();
@@ -858,6 +912,37 @@ napi_status NAPI_CDECL unofficial_napi_get_constructor_name(napi_env env,
   v8::Local<v8::String> name = raw.As<v8::Object>()->GetConstructorName();
   *name_out = napi_v8_wrap_value(env, name);
   return *name_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_process_memory_info(
+    napi_env env,
+    double* heap_total_out,
+    double* heap_used_out,
+    double* external_out,
+    double* array_buffers_out) {
+  if (env == nullptr || env->isolate == nullptr || heap_total_out == nullptr ||
+      heap_used_out == nullptr || external_out == nullptr || array_buffers_out == nullptr) {
+    return napi_invalid_arg;
+  }
+
+  v8::HeapStatistics stats;
+  env->isolate->GetHeapStatistics(&stats);
+
+  uint64_t array_buffers = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto it = g_tracking_allocators.find(env->isolate->GetArrayBufferAllocator());
+    if (it != g_tracking_allocators.end() && it->second != nullptr) {
+      auto* allocator = static_cast<TrackingArrayBufferAllocator*>(it->second);
+      array_buffers = allocator->total_mem_usage();
+    }
+  }
+
+  *heap_total_out = static_cast<double>(stats.total_heap_size());
+  *heap_used_out = static_cast<double>(stats.used_heap_size());
+  *external_out = static_cast<double>(stats.external_memory());
+  *array_buffers_out = static_cast<double>(array_buffers);
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(

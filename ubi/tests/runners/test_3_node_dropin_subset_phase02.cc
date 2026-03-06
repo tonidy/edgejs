@@ -1022,7 +1022,7 @@ DEFINE_RAW_NODE_TEST(RawQuerystringEscapeFromNodeTest, "test-querystring-escape.
 
 // Raw Node process tests
 DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessFeaturesFromNodeTest, "test-process-features.js")
-DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessAbortFromNodeTest, "test-process-abort.js")
+DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessAbortFromNodeTest, "test-process-abort.js")
 TEST_F(Test3NodeDropinSubsetPhase02, RawProcessArgv0FromNodeTest) {
   if (RawNodeScriptStartsWithFlagsHeader("test-process-argv-0.js")) {
     GTEST_SKIP() << "Skipping Node.js raw test with // Flags header: test-process-argv-0.js";

@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "internal_binding/helpers.h"
+#include "ncrypto/ncrypto.h"
 
 namespace internal_binding {
 
@@ -52,16 +53,6 @@ bool HasIntl(napi_env env) {
   return napi_typeof(env, intl, &t) == napi_ok && (t == napi_object || t == napi_function);
 }
 
-bool GetTruthyProcessNested(napi_env env, const char* first_key, const char* second_key) {
-  napi_value global = GetGlobal(env);
-  napi_value process = GetNamed(env, global, "process");
-  if (process == nullptr) return false;
-  napi_value first = GetNamed(env, process, first_key);
-  if (first == nullptr) return false;
-  napi_value value = GetNamed(env, first, second_key);
-  return IsTruthy(env, value);
-}
-
 bool GetProcessConfigVariable(napi_env env, const char* key) {
   napi_value global = GetGlobal(env);
   napi_value process = GetNamed(env, global, "process");
@@ -69,23 +60,6 @@ bool GetProcessConfigVariable(napi_env env, const char* key) {
   napi_value variables = GetNamed(env, config, "variables");
   napi_value value = GetNamed(env, variables, key);
   return IsTruthy(env, value);
-}
-
-void SyncProcessConfigIntlSupport(napi_env env, bool has_intl) {
-  napi_value global = GetGlobal(env);
-  napi_value process = GetNamed(env, global, "process");
-  napi_value config = GetNamed(env, process, "config");
-  if (config == nullptr) return;
-
-  napi_value variables = GetNamed(env, config, "variables");
-  if (variables == nullptr) {
-    if (napi_create_object(env, &variables) != napi_ok || variables == nullptr) return;
-    if (napi_set_named_property(env, config, "variables", variables) != napi_ok) return;
-  }
-
-  napi_value value = nullptr;
-  if (napi_create_int32(env, has_intl ? 1 : 0, &value) != napi_ok || value == nullptr) return;
-  napi_set_named_property(env, variables, "v8_enable_i18n_support", value);
 }
 
 napi_value ConfigGetDefaultLocale(napi_env env, napi_callback_info /*info*/) {
@@ -116,18 +90,22 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return Undefined(env);
 
   const bool has_intl = HasIntl(env);
-  const bool has_inspector = GetTruthyProcessNested(env, "features", "inspector");
-  const bool has_tracing = GetTruthyProcessNested(env, "features", "tracing");
-  const bool has_openssl = GetTruthyProcessNested(env, "versions", "openssl");
-  const bool openssl_is_boringssl =
-      GetTruthyProcessNested(env, "versions", "boringssl") ||
-      GetTruthyProcessNested(env, "features", "openssl_is_boringssl");
+  const bool has_inspector = false;
+  const bool has_tracing = false;
+#ifdef OPENSSL_VERSION_NUMBER
+  const bool has_openssl = true;
+#else
+  const bool has_openssl = false;
+#endif
+#ifdef OPENSSL_IS_BORINGSSL
+  const bool openssl_is_boringssl = true;
+#else
+  const bool openssl_is_boringssl = false;
+#endif
   const bool has_small_icu = false;
   const bool fips_mode =
       GetProcessConfigVariable(env, "openssl_is_fips") || GetProcessConfigVariable(env, "node_fipsinstall");
   const bool is_debug_build = GetProcessConfigVariable(env, "debug");
-
-  SyncProcessConfigIntlSupport(env, has_intl);
 
   SetBool(env, out, "hasIntl", has_intl);
   SetBool(env, out, "hasSmallICU", has_small_icu);

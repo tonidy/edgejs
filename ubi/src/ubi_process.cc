@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -40,29 +41,35 @@
 #if defined(_WIN32)
 #include <io.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+#define umask _umask
+using mode_t = int;
 extern char** _environ;
 #elif defined(__APPLE__)
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 extern char** environ;
 #else
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 extern char** environ;
 #endif
 
-#define DUMMY_UV_STUBS 1
-
 namespace {
 
-const auto g_process_start_time = std::chrono::steady_clock::now();
-const auto g_cpu_usage_start = std::chrono::steady_clock::now();
+constexpr double kMicrosPerSec = 1e6;
+constexpr double kNanosPerSec = 1e9;
+uint64_t g_process_start_time_ns = uv_hrtime();
 std::string g_ubi_exec_path;
 std::string g_ubi_argv0;
-uint32_t g_process_umask = 0022;
+std::string g_process_title = "ubi";
+uint32_t g_process_debug_port = 9229;
+std::mutex g_process_umask_mutex;
 
 #ifndef UBI_EMBEDDED_V8_VERSION
 #define UBI_EMBEDDED_V8_VERSION "0.0.0-node.0"
@@ -74,6 +81,7 @@ uint32_t g_process_umask = 0022;
 struct ProcessMethodsBindingState {
   napi_ref binding_ref = nullptr;
   napi_ref hrtime_buffer_ref = nullptr;
+  napi_ref emit_warning_sync_ref = nullptr;
 };
 
 struct ReportBindingState {
@@ -319,37 +327,11 @@ std::string FindNodeConfigGypiText() {
   return {};
 }
 
-bool HasV8I18nSupport(napi_env env) {
-  napi_value global = nullptr;
-  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
-
-  napi_value intl = nullptr;
-  if (napi_get_named_property(env, global, "Intl", &intl) != napi_ok || intl == nullptr) return false;
-
-  napi_valuetype intl_type = napi_undefined;
-  if (napi_typeof(env, intl, &intl_type) != napi_ok) return false;
-  return intl_type == napi_object || intl_type == napi_function;
-}
-
 bool SetProcessConfigVariableInt(napi_env env, napi_value variables_obj, const char* key, int32_t value) {
   if (variables_obj == nullptr || key == nullptr) return false;
   napi_value js_value = nullptr;
   if (napi_create_int32(env, value, &js_value) != napi_ok || js_value == nullptr) return false;
   return napi_set_named_property(env, variables_obj, key, js_value) == napi_ok;
-}
-
-bool OverrideProcessConfigRuntimeVariables(napi_env env, napi_value config_obj) {
-  if (config_obj == nullptr) return false;
-
-  napi_value variables_obj = nullptr;
-  const napi_status get_status = napi_get_named_property(env, config_obj, "variables", &variables_obj);
-  if (get_status != napi_ok || variables_obj == nullptr) {
-    if (napi_create_object(env, &variables_obj) != napi_ok || variables_obj == nullptr) return false;
-    if (napi_set_named_property(env, config_obj, "variables", variables_obj) != napi_ok) return false;
-  }
-
-  const int32_t v8_i18n_support = HasV8I18nSupport(env) ? 1 : 0;
-  return SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", v8_i18n_support);
 }
 
 napi_value BuildMinimalProcessConfigObject(napi_env env) {
@@ -407,8 +389,6 @@ napi_value BuildMinimalProcessConfigObject(napi_env env) {
   variables_desc.value = variables_obj;
   variables_desc.attributes = napi_enumerable;
   if (napi_define_properties(env, config_obj, 1, &variables_desc) != napi_ok) return nullptr;
-
-  if (!OverrideProcessConfigRuntimeVariables(env, config_obj)) return nullptr;
 
   return config_obj;
 }
@@ -469,15 +449,13 @@ napi_value BuildProcessConfigObject(napi_env env) {
   const std::string config_text = FindNodeConfigGypiText();
   napi_value parsed = ParseProcessConfigObjectFromText(env, config_text);
   if (parsed != nullptr) {
-    if (!OverrideProcessConfigRuntimeVariables(env, parsed)) return nullptr;
     return parsed;
   }
   return BuildMinimalProcessConfigObject(env);
 }
 
 uint64_t GetHrtimeNanoseconds() {
-  const auto now = std::chrono::steady_clock::now().time_since_epoch();
-  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+  return uv_hrtime();
 }
 
 void ThrowTypeErrorWithCode(napi_env env, const char* code, const char* message) {
@@ -564,6 +542,93 @@ void ThrowSystemError(napi_env env, int err, const char* syscall, const std::str
     SetNamedString(env, error_value, "path", path);
   }
   napi_throw(env, error_value);
+}
+
+void ThrowUvCwdError(napi_env env, int err) {
+  int uv_err = err;
+  if (uv_err > 0) uv_err = uv_translate_sys_error(uv_err);
+  if (uv_err == 0) uv_err = UV_EIO;
+
+  const char* code = uv_err_name(uv_err);
+  if (code == nullptr) code = "UNKNOWN";
+  const char* detail = uv_strerror(uv_err);
+  if (detail == nullptr) detail = "unknown error";
+
+  std::string message = std::string(code) + ": process.cwd failed with error " + detail;
+  if (uv_err == UV_ENOENT) {
+    message += ", the current working directory was likely removed without changing the working directory";
+  }
+  message += ", uv_cwd";
+
+  napi_value code_value = nullptr;
+  napi_value message_value = nullptr;
+  napi_value error_value = nullptr;
+  if (napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_value) != napi_ok ||
+      napi_create_string_utf8(env, message.c_str(), NAPI_AUTO_LENGTH, &message_value) != napi_ok ||
+      napi_create_error(env, code_value, message_value, &error_value) != napi_ok ||
+      error_value == nullptr) {
+    return;
+  }
+  napi_set_named_property(env, error_value, "code", code_value);
+  SetNamedInt32(env, error_value, "errno", uv_err);
+  SetNamedString(env, error_value, "syscall", "uv_cwd");
+  napi_throw(env, error_value);
+}
+
+std::string GetCurrentWorkingDirectoryForErrors() {
+  size_t cwd_len = 256;
+  for (;;) {
+    std::string cwd(cwd_len, '\0');
+    const int rc = uv_cwd(cwd.data(), &cwd_len);
+    if (rc == 0) {
+      cwd.resize(cwd_len);
+      return cwd;
+    }
+    if (rc != UV_ENOBUFS) return ".";
+    cwd_len += 1;
+  }
+}
+
+std::string GetProcessTitleString() {
+  std::string title(16, '\0');
+  for (;;) {
+    const int rc = uv_get_process_title(title.data(), title.size());
+    if (rc == 0) {
+      title.resize(std::strlen(title.c_str()));
+      return title;
+    }
+    if (rc != UV_ENOBUFS || title.size() >= 1024 * 1024) {
+      return g_process_title.empty() ? std::string("node") : g_process_title;
+    }
+    title.resize(title.size() * 2);
+  }
+}
+
+bool GetFloat64ArrayData(napi_env env,
+                         napi_value value,
+                         size_t min_length,
+                         double** data_out,
+                         size_t* length_out = nullptr) {
+  if (data_out == nullptr || value == nullptr) return false;
+  bool is_typedarray = false;
+  if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok || !is_typedarray) return false;
+  napi_typedarray_type ta_type = napi_int8_array;
+  size_t length = 0;
+  void* data = nullptr;
+  napi_value arraybuffer = nullptr;
+  size_t byte_offset = 0;
+  if (napi_get_typedarray_info(env, value, &ta_type, &length, &data, &arraybuffer, &byte_offset) != napi_ok ||
+      ta_type != napi_float64_array || data == nullptr || length < min_length) {
+    return false;
+  }
+  *data_out = static_cast<double*>(data);
+  if (length_out != nullptr) *length_out = length;
+  return true;
+}
+
+bool SetOwnPropertyValue(napi_env env, napi_value obj, const char* name, napi_value value) {
+  if (obj == nullptr || value == nullptr) return false;
+  return napi_set_named_property(env, obj, name, value) == napi_ok;
 }
 
 std::string InvalidArgTypeSuffix(napi_env env, napi_value value) {
@@ -1515,16 +1580,23 @@ napi_status InstallProcessStream(napi_env env,
 }
 
 napi_value ProcessCwdCallback(napi_env env, napi_callback_info info) {
-  std::string cwd = ".";
-#if defined(_WIN32)
-  const char* pwd = std::getenv("PWD");
-  if (pwd != nullptr && pwd[0] != '\0') cwd = pwd;
-#else
-  char buf[4096] = {'\0'};
-  if (getcwd(buf, sizeof(buf)) != nullptr) cwd = buf;
-#endif
+  size_t cwd_len = 256;
+  std::string cwd;
+  for (;;) {
+    cwd.assign(cwd_len, '\0');
+    const int rc = uv_cwd(cwd.data(), &cwd_len);
+    if (rc == 0) {
+      cwd.resize(cwd_len);
+      break;
+    }
+    if (rc != UV_ENOBUFS) {
+      ThrowUvCwdError(env, rc);
+      return nullptr;
+    }
+    cwd_len += 1;
+  }
   napi_value result = nullptr;
-  if (napi_create_string_utf8(env, cwd.c_str(), NAPI_AUTO_LENGTH, &result) != napi_ok) return nullptr;
+  if (napi_create_string_utf8(env, cwd.c_str(), cwd.size(), &result) != napi_ok) return nullptr;
   return result;
 }
 
@@ -1547,51 +1619,48 @@ napi_value ProcessChdirCallback(napi_env env, napi_callback_info info) {
   size_t copied = 0;
   if (napi_get_value_string_utf8(env, args[0], buf.data(), buf.size(), &copied) != napi_ok) return nullptr;
   const std::string dest(buf.data(), copied);
-#if defined(_WIN32)
-  (void)dest;
-  napi_value undefined = nullptr;
-  napi_get_undefined(env, &undefined);
-  return undefined;
-#else
-  char oldcwd[4096] = {'\0'};
-  const char* oldcwd_s = getcwd(oldcwd, sizeof(oldcwd)) ? oldcwd : ".";
-  if (chdir(dest.c_str()) != 0) {
-    std::string msg = "ENOENT: no such file or directory, chdir " + std::string(oldcwd_s) + " -> '" + dest + "'";
-    napi_value code = nullptr;
-    napi_value text = nullptr;
-    napi_value e = nullptr;
-    napi_create_string_utf8(env, "ENOENT", NAPI_AUTO_LENGTH, &code);
-    napi_create_string_utf8(env, msg.c_str(), NAPI_AUTO_LENGTH, &text);
-    napi_create_error(env, code, text, &e);
-    napi_value syscall = nullptr;
-    napi_value path = nullptr;
-    napi_value destv = nullptr;
-    napi_create_string_utf8(env, "chdir", NAPI_AUTO_LENGTH, &syscall);
-    napi_create_string_utf8(env, oldcwd_s, NAPI_AUTO_LENGTH, &path);
-    napi_create_string_utf8(env, dest.c_str(), NAPI_AUTO_LENGTH, &destv);
-    napi_set_named_property(env, e, "code", code);
-    napi_set_named_property(env, e, "syscall", syscall);
-    napi_set_named_property(env, e, "path", path);
-    napi_set_named_property(env, e, "dest", destv);
-    napi_throw(env, e);
+  const std::string oldcwd = GetCurrentWorkingDirectoryForErrors();
+  const int rc = uv_chdir(dest.c_str());
+  if (rc != 0) {
+    const char* code = uv_err_name(rc);
+    if (code == nullptr) code = "UNKNOWN";
+    const char* detail = uv_strerror(rc);
+    if (detail == nullptr) detail = "unknown error";
+    std::string msg = std::string(code) + ": " + detail + ", chdir " + oldcwd + " -> '" + dest + "'";
+    napi_value code_value = nullptr;
+    napi_value message_value = nullptr;
+    napi_value error_value = nullptr;
+    if (napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_value) != napi_ok ||
+        napi_create_string_utf8(env, msg.c_str(), NAPI_AUTO_LENGTH, &message_value) != napi_ok ||
+        napi_create_error(env, code_value, message_value, &error_value) != napi_ok ||
+        error_value == nullptr) {
+      return nullptr;
+    }
+    napi_set_named_property(env, error_value, "code", code_value);
+    SetNamedInt32(env, error_value, "errno", rc);
+    SetNamedString(env, error_value, "syscall", "chdir");
+    SetNamedString(env, error_value, "path", oldcwd);
+    SetNamedString(env, error_value, "dest", dest);
+    napi_throw(env, error_value);
     return nullptr;
   }
-  setenv("PWD", dest.c_str(), 1);
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
-#endif
 }
 
 napi_value ProcessCpuUsageCallback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-  const auto now = std::chrono::steady_clock::now();
-  const uint64_t micros =
-      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - g_cpu_usage_start).count());
-  uint64_t user = micros * 7 / 10;
-  uint64_t system = micros - user;
+  uv_rusage_t rusage;
+  const int rc = uv_getrusage(&rusage);
+  if (rc != 0) {
+    ThrowSystemError(env, rc, "uv_getrusage");
+    return nullptr;
+  }
+  uint64_t user = static_cast<uint64_t>(kMicrosPerSec * rusage.ru_utime.tv_sec + rusage.ru_utime.tv_usec);
+  uint64_t system = static_cast<uint64_t>(kMicrosPerSec * rusage.ru_stime.tv_sec + rusage.ru_stime.tv_usec);
   if (argc >= 1 && args[0] != nullptr) {
     napi_valuetype t = napi_undefined;
     if (napi_typeof(env, args[0], &t) != napi_ok || t != napi_object) {
@@ -1657,13 +1726,13 @@ napi_value ProcessCpuUsageCallback(napi_env env, napi_callback_info info) {
 
 napi_value ProcessAvailableMemoryCallback(napi_env env, napi_callback_info info) {
   napi_value out = nullptr;
-  napi_create_double(env, 1024.0 * 1024.0 * 1024.0, &out);
+  napi_create_double(env, static_cast<double>(uv_get_available_memory()), &out);
   return out;
 }
 
 napi_value ProcessConstrainedMemoryCallback(napi_env env, napi_callback_info info) {
   napi_value out = nullptr;
-  napi_create_double(env, 0, &out);
+  napi_create_double(env, static_cast<double>(uv_get_constrained_memory()), &out);
   return out;
 }
 
@@ -1671,10 +1740,21 @@ napi_value ProcessUmaskCallback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok) return nullptr;
-  const uint32_t old_mask = g_process_umask;
+  uint32_t old_mask = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_process_umask_mutex);
+    old_mask = umask(0);
+    umask(static_cast<mode_t>(old_mask));
+  }
   if (argc >= 1 && args[0] != nullptr) {
     napi_valuetype arg_type = napi_undefined;
     if (napi_typeof(env, args[0], &arg_type) != napi_ok) return nullptr;
+    if (arg_type == napi_undefined) {
+      napi_value result = nullptr;
+      if (napi_create_uint32(env, old_mask, &result) != napi_ok) return nullptr;
+      return result;
+    }
+    uint32_t new_mask = 0;
     if (arg_type == napi_string) {
       size_t len = 0;
       if (napi_get_value_string_utf8(env, args[0], nullptr, 0, &len) != napi_ok) return nullptr;
@@ -1693,7 +1773,7 @@ napi_value ProcessUmaskCallback(napi_env env, napi_callback_info info) {
         }
       }
       try {
-        g_process_umask = static_cast<uint32_t>(std::stoul(value, nullptr, 8)) & 0777u;
+        new_mask = static_cast<uint32_t>(std::stoul(value, nullptr, 8)) & 0777u;
       } catch (...) {
         ThrowErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "The argument 'mask' is invalid.");
         return nullptr;
@@ -1705,11 +1785,13 @@ napi_value ProcessUmaskCallback(napi_env env, napi_callback_info info) {
         ThrowErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "The argument 'mask' is invalid.");
         return nullptr;
       }
-      g_process_umask = static_cast<uint32_t>(num) & 0777u;
-    } else if (arg_type != napi_undefined) {
+      new_mask = static_cast<uint32_t>(num) & 0777u;
+    } else {
       ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_TYPE", "The \"mask\" argument must be of type number or string.");
       return nullptr;
     }
+    std::lock_guard<std::mutex> lock(g_process_umask_mutex);
+    old_mask = umask(static_cast<mode_t>(new_mask));
   }
   napi_value result = nullptr;
   if (napi_create_uint32(env, old_mask, &result) != napi_ok) return nullptr;
@@ -1717,9 +1799,7 @@ napi_value ProcessUmaskCallback(napi_env env, napi_callback_info info) {
 }
 
 napi_value ProcessUptimeCallback(napi_env env, napi_callback_info info) {
-  const auto now = std::chrono::steady_clock::now();
-  const auto elapsed = now - g_process_start_time;
-  const double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
+  const double seconds = static_cast<double>(GetHrtimeNanoseconds() - g_process_start_time_ns) / kNanosPerSec;
   napi_value result = nullptr;
   if (napi_create_double(env, seconds, &result) != napi_ok) return nullptr;
   return result;
@@ -1782,6 +1862,62 @@ napi_value ProcessHrtimeCallback(napi_env env, napi_callback_info info) {
   return out;
 }
 
+napi_value ProcessObjectTitleGetter(napi_env env, napi_callback_info info) {
+  napi_value result = nullptr;
+  const std::string title = GetProcessTitleString();
+  if (napi_create_string_utf8(env, title.c_str(), NAPI_AUTO_LENGTH, &result) != napi_ok) return nullptr;
+  return result;
+}
+
+napi_value ProcessObjectTitleSetter(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return nullptr;
+  }
+  g_process_title = NapiValueToUtf8(env, argv[0]);
+  if (g_process_title.empty()) g_process_title = "node";
+  (void)uv_set_process_title(g_process_title.c_str());
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+napi_value ProcessObjectDebugPortGetter(napi_env env, napi_callback_info info) {
+  napi_value result = nullptr;
+  if (napi_create_uint32(env, g_process_debug_port, &result) != napi_ok) return nullptr;
+  return result;
+}
+
+napi_value ProcessObjectDebugPortSetter(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return nullptr;
+  }
+  napi_value coerced = nullptr;
+  double port = 0;
+  if (napi_coerce_to_number(env, argv[0], &coerced) != napi_ok ||
+      napi_get_value_double(env, coerced, &port) != napi_ok) {
+    port = 0;
+  }
+  const int32_t port_i32 = static_cast<int32_t>(port);
+  if ((port_i32 != 0 && port_i32 < 1024) || port_i32 > 65535) {
+    ThrowRangeErrorWithCode(env, "ERR_OUT_OF_RANGE", "process.debugPort must be 0 or in range 1024 to 65535");
+    return nullptr;
+  }
+  g_process_debug_port = static_cast<uint32_t>(port_i32);
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+napi_value ProcessObjectPpidGetter(napi_env env, napi_callback_info info) {
+  napi_value result = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(uv_os_getppid()), &result) != napi_ok) return nullptr;
+  return result;
+}
+
 napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1] = {nullptr};
@@ -1796,7 +1932,12 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
 }
 
 napi_value ProcessAbortCallback(napi_env env, napi_callback_info info) {
-  napi_throw_type_error(env, "ERR_INVALID_THIS", "process.abort()");
+  napi_value new_target = nullptr;
+  if (napi_get_new_target(env, info, &new_target) == napi_ok && new_target != nullptr) {
+    napi_throw_type_error(env, nullptr, "process.abort is not a constructor");
+    return nullptr;
+  }
+  std::abort();
   return nullptr;
 }
 
@@ -2064,14 +2205,34 @@ napi_value ProcessMethodsPatchProcessObjectCallback(napi_env env, napi_callback_
     return undefined;
   }
 
-  CopyNamedProperty(env, process_obj, argv[0], "argv");
-  CopyNamedProperty(env, process_obj, argv[0], "execArgv");
-  CopyNamedProperty(env, process_obj, argv[0], "pid");
-  CopyNamedProperty(env, process_obj, argv[0], "ppid");
-  CopyNamedProperty(env, process_obj, argv[0], "title");
-  CopyNamedProperty(env, process_obj, argv[0], "debugPort");
-  CopyNamedProperty(env, process_obj, argv[0], "execPath");
-  CopyNamedProperty(env, process_obj, argv[0], "versions");
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, process_obj, "argv", &value) == napi_ok && value != nullptr) {
+    SetOwnPropertyValue(env, argv[0], "argv", value);
+  }
+  if (napi_get_named_property(env, process_obj, "execArgv", &value) == napi_ok && value != nullptr) {
+    SetOwnPropertyValue(env, argv[0], "execArgv", value);
+  }
+  if (napi_get_named_property(env, process_obj, "execPath", &value) == napi_ok && value != nullptr) {
+    SetOwnPropertyValue(env, argv[0], "execPath", value);
+  }
+  if (napi_get_named_property(env, process_obj, "versions", &value) == napi_ok && value != nullptr) {
+    SetOwnPropertyValue(env, argv[0], "versions", value);
+  }
+  napi_value pid_value = nullptr;
+  if (napi_create_int32(env, static_cast<int32_t>(uv_os_getpid()), &pid_value) == napi_ok && pid_value != nullptr) {
+    SetOwnPropertyValue(env, argv[0], "pid", pid_value);
+  }
+
+  napi_property_descriptor descriptors[3] = {};
+  descriptors[0].utf8name = "title";
+  descriptors[0].getter = ProcessObjectTitleGetter;
+  descriptors[0].setter = ProcessObjectTitleSetter;
+  descriptors[1].utf8name = "ppid";
+  descriptors[1].getter = ProcessObjectPpidGetter;
+  descriptors[2].utf8name = "debugPort";
+  descriptors[2].getter = ProcessObjectDebugPortGetter;
+  descriptors[2].setter = ProcessObjectDebugPortSetter;
+  napi_define_properties(env, argv[0], 3, descriptors);
 
   // Node's process object has a custom constructor on its prototype where
   // constructor.prototype points back to that same process prototype.
@@ -2349,18 +2510,20 @@ napi_value ProcessMethodsEmptyArrayCallback(napi_env env, napi_callback_info inf
 }
 
 static size_t get_rss() {
-#ifdef DUMMY_UV_STUBS
-  return 0;
-#else
   size_t rss = 0;
-  uv_resident_set_memory(&rss);
+  if (uv_resident_set_memory(&rss) != 0) return 0;
   return rss;
-#endif
 }
 
 napi_value ProcessMethodsRssCallback(napi_env env, napi_callback_info info) {
+  size_t rss = 0;
+  const int rc = uv_resident_set_memory(&rss);
+  if (rc != 0) {
+    ThrowSystemError(env, rc, "uv_resident_set_memory");
+    return nullptr;
+  }
   napi_value out = nullptr;
-  napi_create_double(env, static_cast<double>(get_rss()), &out);
+  napi_create_double(env, static_cast<double>(rss), &out);
   return out;
 }
 
@@ -2369,32 +2532,43 @@ napi_value ProcessMethodsCpuUsageBufferCallback(napi_env env, napi_callback_info
   napi_value argv[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1 || argv[0] == nullptr) return nullptr;
-  bool is_typedarray = false;
-  napi_is_typedarray(env, argv[0], &is_typedarray);
-  if (!is_typedarray) return nullptr;
-  napi_typedarray_type ta_type;
-  size_t length = 0;
-  void* data = nullptr;
-  napi_value arraybuffer = nullptr;
-  size_t byte_offset = 0;
-  if (napi_get_typedarray_info(env, argv[0], &ta_type, &length, &data, &arraybuffer, &byte_offset) != napi_ok ||
-      data == nullptr) {
+  double* values = nullptr;
+  if (!GetFloat64ArrayData(env, argv[0], 2, &values)) return nullptr;
+  uv_rusage_t rusage;
+  const int rc = uv_getrusage(&rusage);
+  if (rc != 0) {
+    ThrowSystemError(env, rc, "uv_getrusage");
     return nullptr;
   }
-  if (ta_type != napi_float64_array || length < 2) return nullptr;
-  double* values = static_cast<double*>(data);
-  const auto now = std::chrono::steady_clock::now();
-  const uint64_t micros =
-      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - g_cpu_usage_start).count());
-  values[0] = static_cast<double>(micros * 7 / 10);
-  values[1] = static_cast<double>(micros * 3 / 10);
+  values[0] = kMicrosPerSec * rusage.ru_utime.tv_sec + rusage.ru_utime.tv_usec;
+  values[1] = kMicrosPerSec * rusage.ru_stime.tv_sec + rusage.ru_stime.tv_usec;
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
 }
 
 napi_value ProcessMethodsThreadCpuUsageBufferCallback(napi_env env, napi_callback_info info) {
-  return ProcessMethodsCpuUsageBufferCallback(env, info);
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1 || argv[0] == nullptr) return nullptr;
+  double* values = nullptr;
+  if (!GetFloat64ArrayData(env, argv[0], 2, &values)) return nullptr;
+  uv_rusage_t rusage;
+  const int rc = uv_getrusage_thread(&rusage);
+  if (rc != 0) {
+#if defined(__sun)
+    ThrowErrorWithCode(env, "ERR_OPERATION_FAILED", "Operation failed: threadCpuUsage is not available on SunOS");
+#else
+    ThrowSystemError(env, rc, "uv_getrusage_thread");
+#endif
+    return nullptr;
+  }
+  values[0] = kMicrosPerSec * rusage.ru_utime.tv_sec + rusage.ru_utime.tv_usec;
+  values[1] = kMicrosPerSec * rusage.ru_stime.tv_sec + rusage.ru_stime.tv_usec;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
 }
 
 napi_value ProcessMethodsMemoryUsageBufferCallback(napi_env env, napi_callback_info info) {
@@ -2402,25 +2576,26 @@ napi_value ProcessMethodsMemoryUsageBufferCallback(napi_env env, napi_callback_i
   napi_value argv[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1 || argv[0] == nullptr) return nullptr;
-  bool is_typedarray = false;
-  napi_is_typedarray(env, argv[0], &is_typedarray);
-  if (!is_typedarray) return nullptr;
-  napi_typedarray_type ta_type;
-  size_t length = 0;
-  void* data = nullptr;
-  napi_value arraybuffer = nullptr;
-  size_t byte_offset = 0;
-  if (napi_get_typedarray_info(env, argv[0], &ta_type, &length, &data, &arraybuffer, &byte_offset) != napi_ok ||
-      data == nullptr) {
+  double* values = nullptr;
+  if (!GetFloat64ArrayData(env, argv[0], 5, &values)) return nullptr;
+  size_t rss = 0;
+  const int rss_rc = uv_resident_set_memory(&rss);
+  if (rss_rc != 0) {
+    ThrowSystemError(env, rss_rc, "uv_resident_set_memory");
     return nullptr;
   }
-  if (ta_type != napi_float64_array || length < 5) return nullptr;
-  double* values = static_cast<double*>(data);
-  values[0] = static_cast<double>(get_rss());
-  values[1] = 16.0 * 1024.0 * 1024.0;
-  values[2] = 8.0 * 1024.0 * 1024.0;
-  values[3] = 0.0;
-  values[4] = 0.0;
+  double heap_total = 0;
+  double heap_used = 0;
+  double external = 0;
+  double array_buffers = 0;
+  const napi_status memory_status = unofficial_napi_get_process_memory_info(
+      env, &heap_total, &heap_used, &external, &array_buffers);
+  if (memory_status != napi_ok) return nullptr;
+  values[0] = static_cast<double>(rss);
+  values[1] = heap_total;
+  values[2] = heap_used;
+  values[3] = external;
+  values[4] = array_buffers;
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -2431,21 +2606,32 @@ napi_value ProcessMethodsResourceUsageBufferCallback(napi_env env, napi_callback
   napi_value argv[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   if (argc < 1 || argv[0] == nullptr) return nullptr;
-  bool is_typedarray = false;
-  napi_is_typedarray(env, argv[0], &is_typedarray);
-  if (!is_typedarray) return nullptr;
-  napi_typedarray_type ta_type;
+  double* values = nullptr;
   size_t length = 0;
-  void* data = nullptr;
-  napi_value arraybuffer = nullptr;
-  size_t byte_offset = 0;
-  if (napi_get_typedarray_info(env, argv[0], &ta_type, &length, &data, &arraybuffer, &byte_offset) != napi_ok ||
-      data == nullptr) {
+  if (!GetFloat64ArrayData(env, argv[0], 16, &values, &length)) return nullptr;
+  uv_rusage_t rusage;
+  const int rc = uv_getrusage(&rusage);
+  if (rc != 0) {
+    ThrowSystemError(env, rc, "uv_getrusage");
     return nullptr;
   }
-  if (ta_type != napi_float64_array) return nullptr;
-  double* values = static_cast<double*>(data);
   for (size_t i = 0; i < length; ++i) values[i] = 0;
+  values[0] = kMicrosPerSec * rusage.ru_utime.tv_sec + rusage.ru_utime.tv_usec;
+  values[1] = kMicrosPerSec * rusage.ru_stime.tv_sec + rusage.ru_stime.tv_usec;
+  values[2] = static_cast<double>(rusage.ru_maxrss);
+  values[3] = static_cast<double>(rusage.ru_ixrss);
+  values[4] = static_cast<double>(rusage.ru_idrss);
+  values[5] = static_cast<double>(rusage.ru_isrss);
+  values[6] = static_cast<double>(rusage.ru_minflt);
+  values[7] = static_cast<double>(rusage.ru_majflt);
+  values[8] = static_cast<double>(rusage.ru_nswap);
+  values[9] = static_cast<double>(rusage.ru_inblock);
+  values[10] = static_cast<double>(rusage.ru_oublock);
+  values[11] = static_cast<double>(rusage.ru_msgsnd);
+  values[12] = static_cast<double>(rusage.ru_msgrcv);
+  values[13] = static_cast<double>(rusage.ru_nsignals);
+  values[14] = static_cast<double>(rusage.ru_nvcsw);
+  values[15] = static_cast<double>(rusage.ru_nivcsw);
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -2496,6 +2682,21 @@ napi_value ProcessMethodsHrtimeBigIntCallback(napi_env env, napi_callback_info i
 }
 
 napi_value ProcessMethodsSetEmitWarningSyncCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok && argc >= 1 && argv[0] != nullptr) {
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, argv[0], &type) == napi_ok && type == napi_function) {
+      auto* state = GetProcessMethodsState(env);
+      if (state != nullptr) {
+        if (state->emit_warning_sync_ref != nullptr) {
+          napi_delete_reference(env, state->emit_warning_sync_ref);
+          state->emit_warning_sync_ref = nullptr;
+        }
+        napi_create_reference(env, argv[0], 1, &state->emit_warning_sync_ref);
+      }
+    }
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -2515,6 +2716,10 @@ void ProcessMethodsBindingFinalize(napi_env env, void* data, void* hint) {
   if (it->second.hrtime_buffer_ref != nullptr) {
     napi_delete_reference(env, it->second.hrtime_buffer_ref);
     it->second.hrtime_buffer_ref = nullptr;
+  }
+  if (it->second.emit_warning_sync_ref != nullptr) {
+    napi_delete_reference(env, it->second.emit_warning_sync_ref);
+    it->second.emit_warning_sync_ref = nullptr;
   }
   if (it->second.binding_ref != nullptr) {
     napi_delete_reference(env, it->second.binding_ref);
@@ -2900,6 +3105,8 @@ napi_status UbiInstallProcessObject(napi_env env,
   if (status != napi_ok) return status;
 
   const std::string title = process_title.empty() ? "ubi" : process_title;
+  g_process_title = title;
+  (void)uv_set_process_title(g_process_title.c_str());
   napi_value title_value = nullptr;
   status = napi_create_string_utf8(env, title.c_str(), NAPI_AUTO_LENGTH, &title_value);
   if (status != napi_ok || title_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
@@ -2970,6 +3177,13 @@ napi_status UbiInstallProcessObject(napi_env env,
   status = InstallProcessStream(env, process_obj, "stderr", 2, ProcessStderrWriteCallback);
   if (status != napi_ok) return status;
 
+  napi_value raw_debug_fn = nullptr;
+  status =
+      napi_create_function(env, "_rawDebug", NAPI_AUTO_LENGTH, ProcessMethodsRawDebugCallback, nullptr, &raw_debug_fn);
+  if (status != napi_ok || raw_debug_fn == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  status = napi_set_named_property(env, process_obj, "_rawDebug", raw_debug_fn);
+  if (status != napi_ok) return status;
+
   napi_value abort_fn = nullptr;
   status = napi_create_function(env, "abort", NAPI_AUTO_LENGTH, ProcessAbortCallback, nullptr, &abort_fn);
   if (status != napi_ok || abort_fn == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
@@ -3008,21 +3222,13 @@ napi_status UbiInstallProcessObject(napi_env env,
   if (status != napi_ok) return status;
 
   napi_value pid_value = nullptr;
-#if defined(_WIN32)
-  status = napi_create_int32(env, 1, &pid_value);
-#else
-  status = napi_create_int32(env, static_cast<int32_t>(getpid()), &pid_value);
-#endif
+  status = napi_create_int32(env, static_cast<int32_t>(uv_os_getpid()), &pid_value);
   if (status != napi_ok || pid_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   status = napi_set_named_property(env, process_obj, "pid", pid_value);
   if (status != napi_ok) return status;
 
   napi_value ppid_value = nullptr;
-#if defined(_WIN32)
-  status = napi_create_int32(env, 1, &ppid_value);
-#else
-  status = napi_create_int32(env, static_cast<int32_t>(getppid()), &ppid_value);
-#endif
+  status = napi_create_int32(env, static_cast<int32_t>(uv_os_getppid()), &ppid_value);
   if (status != napi_ok || ppid_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   status = napi_set_named_property(env, process_obj, "ppid", ppid_value);
   if (status != napi_ok) return status;
@@ -3121,16 +3327,26 @@ napi_status UbiInstallProcessObject(napi_env env,
   napi_value false_value = nullptr;
   status = napi_get_boolean(env, false, &false_value);
   if (status != napi_ok || false_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  // Keep this aligned with available native bindings.
-  status = napi_set_named_property(env, features_obj, "inspector", false_value);
-  if (status != napi_ok) return status;
-  const char* feature_keys[] = {"debug", "uv", "ipv6", "openssl_is_boringssl", "tls_alpn", "tls_sni",
-                                "tls_ocsp", "tls", "cached_builtins", "require_module"};
-  for (const char* key : feature_keys) {
-    if (napi_set_named_property(env, features_obj, key, false_value) != napi_ok) return napi_generic_failure;
-  }
-  // Keep compatibility with currently imported crypto test subset.
-  if (napi_set_named_property(env, features_obj, "openssl_is_boringssl", true_value) != napi_ok) {
+  const bool has_openssl = !GetOpenSslVersion().empty() && GetOpenSslVersion() != "0.0.0";
+#ifdef OPENSSL_IS_BORINGSSL
+  const bool openssl_is_boringssl = true;
+#else
+  const bool openssl_is_boringssl = false;
+#endif
+  if (napi_set_named_property(env, features_obj, "inspector", false_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "debug", false_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "uv", true_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "ipv6", true_value) != napi_ok ||
+      napi_set_named_property(env,
+                              features_obj,
+                              "openssl_is_boringssl",
+                              openssl_is_boringssl ? true_value : false_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "tls_alpn", has_openssl ? true_value : false_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "tls_sni", has_openssl ? true_value : false_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "tls_ocsp", has_openssl ? true_value : false_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "tls", has_openssl ? true_value : false_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "cached_builtins", false_value) != napi_ok ||
+      napi_set_named_property(env, features_obj, "require_module", false_value) != napi_ok) {
     return napi_generic_failure;
   }
   if (napi_set_named_property(env, features_obj, "typescript", false_value) != napi_ok) return napi_generic_failure;
@@ -3161,6 +3377,10 @@ napi_status UbiInstallProcessObject(napi_env env,
     if (state.hrtime_buffer_ref != nullptr) {
       napi_delete_reference(env, state.hrtime_buffer_ref);
       state.hrtime_buffer_ref = nullptr;
+    }
+    if (state.emit_warning_sync_ref != nullptr) {
+      napi_delete_reference(env, state.emit_warning_sync_ref);
+      state.emit_warning_sync_ref = nullptr;
     }
     napi_value binding = nullptr;
     status = napi_create_object(env, &binding);
@@ -3206,8 +3426,6 @@ napi_status UbiInstallProcessObject(napi_env env,
         {"_getActiveHandles", ProcessMethodsGetActiveHandlesCallback},
         {"getActiveResourcesInfo", ProcessMethodsGetActiveResourcesInfoCallback},
         {"_kill", ProcessMethodsKillCallback},
-        {"_setEnv", ProcessMethodsSetEnvCallback},
-        {"_unsetEnv", ProcessMethodsUnsetEnvCallback},
         {"_rawDebug", ProcessMethodsRawDebugCallback},
         {"cwd", ProcessCwdCallback},
         {"dlopen", ProcessMethodsDlopenCallback},
@@ -3217,7 +3435,6 @@ napi_status UbiInstallProcessObject(napi_env env,
         {"patchProcessObject", ProcessMethodsPatchProcessObjectCallback},
         {"loadEnvFile", ProcessMethodsLoadEnvFileCallback},
         {"setEmitWarningSync", ProcessMethodsSetEmitWarningSyncCallback},
-        {"resetStdioForTesting", ProcessMethodsResetStdioForTestingCallback},
         {"hrtime", ProcessMethodsHrtimeCallback},
         {"hrtimeBigInt", ProcessMethodsHrtimeBigIntCallback},
     };
