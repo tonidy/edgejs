@@ -316,8 +316,10 @@ add_library(ubi_runtime STATIC
   src/ubi_os.cc
   src/ubi_encoding.cc
   src/ubi_string_decoder.cc
+  src/ubi_async_wrap.cc
   src/ubi_http_parser.cc
   src/ubi_js_stream.cc
+  src/ubi_stream_base.cc
   src/ubi_stream_listener.cc
   src/ubi_udp_listener.cc
   src/ubi_stream_wrap.cc

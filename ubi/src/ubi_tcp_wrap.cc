@@ -1,19 +1,18 @@
 #include "ubi_tcp_wrap.h"
 
+#include <arpa/inet.h>
+
+#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
-#include <arpa/inet.h>
 #include <uv.h>
 
+#include "ubi_async_wrap.h"
 #include "ubi_runtime.h"
-#include "ubi_http_parser.h"
+#include "ubi_stream_base.h"
 #include "ubi_stream_listener.h"
-#include "ubi_stream_wrap.h"
 
 namespace {
 
@@ -29,51 +28,17 @@ struct ConnectReqWrap {
   TcpWrap* tcp = nullptr;
 };
 
-struct WriteReqWrap {
-  uv_write_t req{};
-  napi_env env = nullptr;
-  napi_ref req_obj_ref = nullptr;
-  uv_buf_t* bufs = nullptr;
-  uv_buf_t* bufs_storage = nullptr;
-  napi_ref* bufs_refs = nullptr;
-  char** bufs_allocs = nullptr;
-  uint32_t nbufs = 0;
-  uint32_t nbufs_storage = 0;
-};
-
-struct ShutdownReqWrap {
-  uv_shutdown_t req{};
-  napi_env env = nullptr;
-  napi_ref req_obj_ref = nullptr;
-  TcpWrap* tcp = nullptr;
-};
-
 struct TcpWrap {
   napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
-  napi_ref close_cb_ref = nullptr;
-  napi_ref user_read_buffer_ref = nullptr;
+  UbiStreamBase base{};
   uv_tcp_t handle{};
-  UbiStreamListenerState listener_state{};
-  UbiStreamListener default_listener{};
-  UbiStreamListener user_buffer_listener{};
-  char* user_buffer_base = nullptr;
-  size_t user_buffer_len = 0;
-  bool initialized = false;
-  bool closed = false;
-  bool finalized = false;
-  bool delete_on_close = false;
-  bool user_buffer_listener_active = false;
-  uint64_t bytes_read = 0;
-  uint64_t bytes_written = 0;
-  int64_t async_id = 0;
+  int socket_type = kTcpSocket;
 };
 
 struct TcpBindingState {
   napi_ref tcp_ctor_ref = nullptr;
   napi_ref connect_wrap_ctor_ref = nullptr;
   napi_ref tcp_binding_ref = nullptr;
-  int64_t next_async_id = 1;
 };
 
 std::unordered_map<napi_env, TcpBindingState> g_tcp_states;
@@ -88,901 +53,87 @@ TcpBindingState& EnsureBindingState(napi_env env) {
   return g_tcp_states[env];
 }
 
-void OnClosed(uv_handle_t* h);
+TcpWrap* FromBase(UbiStreamBase* base) {
+  if (base == nullptr) return nullptr;
+  return reinterpret_cast<TcpWrap*>(reinterpret_cast<char*>(base) - offsetof(TcpWrap, base));
+}
+
+uv_handle_t* TcpGetHandle(UbiStreamBase* base) {
+  auto* wrap = FromBase(base);
+  return wrap != nullptr ? reinterpret_cast<uv_handle_t*>(&wrap->handle) : nullptr;
+}
+
+uv_stream_t* TcpGetStreamForBase(UbiStreamBase* base) {
+  auto* wrap = FromBase(base);
+  return wrap != nullptr ? reinterpret_cast<uv_stream_t*>(&wrap->handle) : nullptr;
+}
+
+void TcpDestroy(UbiStreamBase* base) {
+  delete FromBase(base);
+}
+
+void TcpAfterClose(uv_handle_t* handle) {
+  auto* wrap = handle != nullptr ? static_cast<TcpWrap*>(handle->data) : nullptr;
+  if (wrap == nullptr) return;
+  UbiStreamBaseOnClosed(&wrap->base);
+}
+
+const UbiStreamBaseOps kTcpOps = {
+    TcpGetHandle,
+    TcpGetStreamForBase,
+    TcpAfterClose,
+    TcpDestroy,
+    nullptr,
+};
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
-  if (ref == nullptr) return nullptr;
-  napi_value v = nullptr;
-  if (napi_get_reference_value(env, ref, &v) != napi_ok) return nullptr;
-  return v;
+  if (env == nullptr || ref == nullptr) return nullptr;
+  napi_value value = nullptr;
+  if (napi_get_reference_value(env, ref, &value) != napi_ok || value == nullptr) {
+    return nullptr;
+  }
+  return value;
+}
+
+bool IsFunction(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+napi_value GetThis(napi_env env,
+                   napi_callback_info info,
+                   size_t* argc_out,
+                   napi_value* argv,
+                   TcpWrap** wrap_out) {
+  size_t argc = argc_out != nullptr ? *argc_out : 0;
+  napi_value self = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
+  if (argc_out != nullptr) *argc_out = argc;
+  if (wrap_out != nullptr) {
+    *wrap_out = nullptr;
+    if (self != nullptr) {
+      napi_unwrap(env, self, reinterpret_cast<void**>(wrap_out));
+    }
+  }
+  return self;
 }
 
 std::string ValueToUtf8(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return {};
+  napi_value string_value = nullptr;
+  if (napi_coerce_to_string(env, value, &string_value) != napi_ok || string_value == nullptr) return {};
   size_t len = 0;
-  if (napi_coerce_to_string(env, value, &value) != napi_ok ||
-      napi_get_value_string_utf8(env, value, nullptr, 0, &len) != napi_ok) {
-    return {};
-  }
+  if (napi_get_value_string_utf8(env, string_value, nullptr, 0, &len) != napi_ok) return {};
   std::string out(len + 1, '\0');
   size_t copied = 0;
-  if (napi_get_value_string_utf8(env, value, out.data(), out.size(), &copied) != napi_ok) return {};
+  if (napi_get_value_string_utf8(env, string_value, out.data(), out.size(), &copied) != napi_ok) return {};
   out.resize(copied);
   return out;
 }
 
-void SetReqError(napi_env env, napi_value req_obj, int status) {
-  if (req_obj == nullptr || status >= 0) return;
-  const char* err = uv_err_name(status);
-  napi_value err_v = nullptr;
-  napi_create_string_utf8(env, err != nullptr ? err : "UV_ERROR", NAPI_AUTO_LENGTH, &err_v);
-  if (err_v != nullptr) napi_set_named_property(env, req_obj, "error", err_v);
-}
-
-int32_t* StreamState() {
-  return UbiGetStreamBaseState();
-}
-
-void SetState(int idx, int32_t value) {
-  int32_t* s = StreamState();
-  if (s == nullptr) return;
-  s[idx] = value;
-}
-
-napi_value GetThis(napi_env env, napi_callback_info info, size_t* argc_out, napi_value* argv, TcpWrap** wrap_out) {
-  size_t argc = argc_out ? *argc_out : 0;
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
-  if (argc_out) *argc_out = argc;
-  if (wrap_out != nullptr) {
-    *wrap_out = nullptr;
-    napi_unwrap(env, self, reinterpret_cast<void**>(wrap_out));
-  }
-  return self;
-}
-
-napi_value MakeInt32(napi_env env, int32_t v) {
-  napi_value out = nullptr;
-  napi_create_int32(env, v, &out);
-  return out;
-}
-
-napi_value MakeBool(napi_env env, bool v) {
-  napi_value out = nullptr;
-  napi_get_boolean(env, v, &out);
-  return out;
-}
-
-void FreeWriteReq(WriteReqWrap* r) {
-  if (r == nullptr) return;
-  if (r->bufs_refs != nullptr) {
-    for (uint32_t i = 0; i < r->nbufs_storage; i++) {
-      if (r->bufs_refs[i] != nullptr) {
-        napi_delete_reference(r->env, r->bufs_refs[i]);
-      }
-    }
-    delete[] r->bufs_refs;
-  }
-  if (r->bufs_allocs != nullptr) {
-    for (uint32_t i = 0; i < r->nbufs_storage; i++) {
-      free(r->bufs_allocs[i]);
-    }
-    delete[] r->bufs_allocs;
-  }
-  if (r->bufs_storage != nullptr) {
-    delete[] r->bufs_storage;
-  }
-  if (r->req_obj_ref != nullptr) napi_delete_reference(r->env, r->req_obj_ref);
-  delete r;
-}
-
-void InvokeReqOnComplete(napi_env env, napi_value req_obj, int status, napi_value* argv = nullptr, size_t argc = 1) {
-  if (req_obj == nullptr) return;
-  SetReqError(env, req_obj, status);
-  napi_value oncomplete = nullptr;
-  if (napi_get_named_property(env, req_obj, "oncomplete", &oncomplete) != napi_ok || oncomplete == nullptr) return;
-  napi_valuetype t = napi_undefined;
-  napi_typeof(env, oncomplete, &t);
-  if (t != napi_function) return;
-  napi_value status_v = MakeInt32(env, status);
-  napi_value local_argv[5] = {status_v, nullptr, nullptr, nullptr, nullptr};
-  if (argv != nullptr && argc > 0) {
-    for (size_t i = 0; i < argc; i++) local_argv[i] = argv[i];
-  } else {
-    argc = 1;
-  }
-  napi_value ignored = nullptr;
-  UbiMakeCallback(env, req_obj, oncomplete, argc, local_argv, &ignored);
-}
-
-void OnWriteDone(uv_write_t* req, int status) {
-  auto* wr = static_cast<WriteReqWrap*>(req->data);
-  if (wr == nullptr) return;
-  napi_value req_obj = GetRefValue(wr->env, wr->req_obj_ref);
-  napi_value argv[1] = {MakeInt32(wr->env, status)};
-  InvokeReqOnComplete(wr->env, req_obj, status, argv, 1);
-  FreeWriteReq(wr);
-}
-
-void OnShutdownDone(uv_shutdown_t* req, int status) {
-  auto* sr = static_cast<ShutdownReqWrap*>(req->data);
-  if (sr == nullptr) return;
-  napi_value req_obj = GetRefValue(sr->env, sr->req_obj_ref);
-  napi_value tcp_obj = sr->tcp != nullptr ? GetRefValue(sr->env, sr->tcp->wrapper_ref) : nullptr;
-  napi_value argv[3] = {MakeInt32(sr->env, status), tcp_obj, req_obj};
-  InvokeReqOnComplete(sr->env, req_obj, status, argv, 3);
-  if (sr->req_obj_ref != nullptr) napi_delete_reference(sr->env, sr->req_obj_ref);
-  delete sr;
-}
-
-void OnConnectDone(uv_connect_t* req, int status) {
-  auto* cr = static_cast<ConnectReqWrap*>(req->data);
-  if (cr == nullptr) return;
-  napi_value req_obj = GetRefValue(cr->env, cr->req_obj_ref);
-  napi_value tcp_obj = cr->tcp != nullptr ? GetRefValue(cr->env, cr->tcp->wrapper_ref) : nullptr;
-  napi_value argv[5] = {
-      MakeInt32(cr->env, status),
-      tcp_obj,
-      req_obj,
-      MakeBool(cr->env, true),
-      MakeBool(cr->env, true),
-  };
-  InvokeReqOnComplete(cr->env, req_obj, status, argv, 5);
-  if (cr->req_obj_ref != nullptr) napi_delete_reference(cr->env, cr->req_obj_ref);
-  delete cr;
-}
-
-size_t TypedArrayElementSize(napi_typedarray_type type) {
-  switch (type) {
-    case napi_int8_array:
-    case napi_uint8_array:
-    case napi_uint8_clamped_array:
-      return 1;
-    case napi_int16_array:
-    case napi_uint16_array:
-      return 2;
-    case napi_int32_array:
-    case napi_uint32_array:
-    case napi_float32_array:
-      return 4;
-    case napi_float64_array:
-    case napi_bigint64_array:
-    case napi_biguint64_array:
-      return 8;
-    default:
-      return 1;
-  }
-}
-
-bool IsFunction(napi_env env, napi_value value) {
-  if (value == nullptr) return false;
-  napi_valuetype type = napi_undefined;
-  if (napi_typeof(env, value, &type) != napi_ok) return false;
-  return type == napi_function;
-}
-
-bool UpdateUserReadBuffer(TcpWrap* wrap, napi_value value) {
-  if (wrap == nullptr || value == nullptr) return false;
-
-  bool is_buffer = false;
-  if (napi_is_buffer(wrap->env, value, &is_buffer) == napi_ok && is_buffer) {
-    void* data = nullptr;
-    size_t len = 0;
-    if (napi_get_buffer_info(wrap->env, value, &data, &len) != napi_ok ||
-        data == nullptr ||
-        len == 0) {
-      return false;
-    }
-    if (wrap->user_read_buffer_ref != nullptr) {
-      napi_delete_reference(wrap->env, wrap->user_read_buffer_ref);
-      wrap->user_read_buffer_ref = nullptr;
-    }
-    if (napi_create_reference(wrap->env, value, 1, &wrap->user_read_buffer_ref) != napi_ok ||
-        wrap->user_read_buffer_ref == nullptr) {
-      return false;
-    }
-    wrap->user_buffer_base = static_cast<char*>(data);
-    wrap->user_buffer_len = len;
-    return true;
-  }
-
-  bool is_typedarray = false;
-  if (napi_is_typedarray(wrap->env, value, &is_typedarray) == napi_ok &&
-      is_typedarray) {
-    napi_typedarray_type ta_type = napi_int8_array;
-    size_t length = 0;
-    void* data = nullptr;
-    napi_value arraybuffer = nullptr;
-    size_t byte_offset = 0;
-    if (napi_get_typedarray_info(wrap->env,
-                                 value,
-                                 &ta_type,
-                                 &length,
-                                 &data,
-                                 &arraybuffer,
-                                 &byte_offset) != napi_ok ||
-        data == nullptr ||
-        length == 0) {
-      return false;
-    }
-    if (wrap->user_read_buffer_ref != nullptr) {
-      napi_delete_reference(wrap->env, wrap->user_read_buffer_ref);
-      wrap->user_read_buffer_ref = nullptr;
-    }
-    if (napi_create_reference(wrap->env, value, 1, &wrap->user_read_buffer_ref) != napi_ok ||
-        wrap->user_read_buffer_ref == nullptr) {
-      return false;
-    }
-    wrap->user_buffer_base = static_cast<char*>(data);
-    wrap->user_buffer_len = length * TypedArrayElementSize(ta_type);
-    return true;
-  }
-
-  return false;
-}
-
-bool TcpDefaultOnAlloc(UbiStreamListener* listener,
-                       size_t suggested_size,
-                       uv_buf_t* out) {
-  if (listener == nullptr || out == nullptr) return false;
-  char* base = static_cast<char*>(malloc(suggested_size));
-  if (base == nullptr && suggested_size > 0) return false;
-  *out = uv_buf_init(base, static_cast<unsigned int>(suggested_size));
-  return true;
-}
-
-bool TcpDefaultOnRead(UbiStreamListener* listener,
-                      ssize_t nread,
-                      const uv_buf_t* buf) {
-  if (listener == nullptr) return false;
-  auto* wrap = static_cast<TcpWrap*>(listener->data);
-  if (wrap == nullptr) return false;
-
-  SetState(kUbiReadBytesOrError, static_cast<int32_t>(nread));
-  SetState(kUbiArrayBufferOffset, 0);
-
-  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-  napi_value onread = nullptr;
-  if (self != nullptr &&
-      napi_get_named_property(wrap->env, self, "onread", &onread) == napi_ok &&
-      IsFunction(wrap->env, onread)) {
-    napi_value argv[1] = {nullptr};
-    if (nread > 0 && buf != nullptr && buf->base != nullptr) {
-      void* out = nullptr;
-      napi_value ab = nullptr;
-      if (napi_create_arraybuffer(wrap->env, nread, &out, &ab) == napi_ok &&
-          out != nullptr &&
-          ab != nullptr) {
-        memcpy(out, buf->base, nread);
-        argv[0] = ab;
-      }
-    }
-    if (argv[0] == nullptr) napi_get_undefined(wrap->env, &argv[0]);
-    napi_value ignored = nullptr;
-    UbiMakeCallback(wrap->env, self, onread, 1, argv, &ignored);
-    (void)UbiHandlePendingExceptionNow(wrap->env, nullptr);
-  }
-
-  if (buf != nullptr && buf->base != nullptr) free(buf->base);
-  return true;
-}
-
-bool TcpUserBufferOnAlloc(UbiStreamListener* listener,
-                          size_t suggested_size,
-                          uv_buf_t* out) {
-  (void)suggested_size;
-  if (listener == nullptr || out == nullptr) return false;
-  auto* wrap = static_cast<TcpWrap*>(listener->data);
-  if (wrap == nullptr || wrap->user_buffer_base == nullptr || wrap->user_buffer_len == 0) {
-    return false;
-  }
-  *out = uv_buf_init(wrap->user_buffer_base,
-                     static_cast<unsigned int>(wrap->user_buffer_len));
-  return true;
-}
-
-bool TcpUserBufferOnRead(UbiStreamListener* listener,
-                         ssize_t nread,
-                         const uv_buf_t* buf) {
-  (void)buf;
-  if (listener == nullptr) return false;
-  auto* wrap = static_cast<TcpWrap*>(listener->data);
-  if (wrap == nullptr) return false;
-
-  SetState(kUbiReadBytesOrError, static_cast<int32_t>(nread));
-  SetState(kUbiArrayBufferOffset, 0);
-
-  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-  napi_value onread = nullptr;
-  if (self != nullptr &&
-      napi_get_named_property(wrap->env, self, "onread", &onread) == napi_ok &&
-      IsFunction(wrap->env, onread)) {
-    napi_value undefined = nullptr;
-    napi_get_undefined(wrap->env, &undefined);
-    napi_value argv[1] = {undefined};
-    napi_value result = nullptr;
-    UbiMakeCallback(wrap->env, self, onread, 1, argv, &result);
-    (void)UbiHandlePendingExceptionNow(wrap->env, nullptr);
-    if (result != nullptr) {
-      napi_valuetype result_type = napi_undefined;
-      if (napi_typeof(wrap->env, result, &result_type) == napi_ok &&
-          result_type != napi_undefined &&
-          result_type != napi_null) {
-        (void)UpdateUserReadBuffer(wrap, result);
-      }
-    }
-  }
-
-  return true;
-}
-
-void OnAlloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-  auto* wrap = handle != nullptr ? static_cast<TcpWrap*>(handle->data) : nullptr;
-  if (wrap != nullptr &&
-      UbiStreamEmitAlloc(&wrap->listener_state, suggested_size, buf)) {
-    return;
-  }
-  char* base = static_cast<char*>(malloc(suggested_size));
-  *buf = uv_buf_init(base, static_cast<unsigned int>(suggested_size));
-}
-
-void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
-  auto* wrap = static_cast<TcpWrap*>(stream->data);
-  if (wrap == nullptr) {
-    if (buf && buf->base) free(buf->base);
-    return;
-  }
-  if (nread > 0) wrap->bytes_read += static_cast<uint64_t>(nread);
-  if (!UbiStreamEmitRead(&wrap->listener_state, nread, buf)) {
-    if (buf != nullptr && buf->base != nullptr) free(buf->base);
-  }
-}
-
-void OnClosed(uv_handle_t* h) {
-  auto* wrap = static_cast<TcpWrap*>(h->data);
-  if (wrap == nullptr) return;
-  wrap->closed = true;
-  UbiStreamNotifyClosed(&wrap->listener_state);
-  if (!wrap->finalized && wrap->close_cb_ref != nullptr) {
-    napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-    napi_value cb = GetRefValue(wrap->env, wrap->close_cb_ref);
-    if (cb != nullptr) {
-      napi_value ignored = nullptr;
-      UbiMakeCallback(wrap->env, self, cb, 0, nullptr, &ignored);
-    }
-    napi_delete_reference(wrap->env, wrap->close_cb_ref);
-    wrap->close_cb_ref = nullptr;
-  }
-  if (wrap->delete_on_close || wrap->finalized) {
-    delete wrap;
-  }
-}
-
-void TcpFinalize(napi_env env, void* data, void* /*hint*/) {
-  auto* wrap = static_cast<TcpWrap*>(data);
-  if (wrap == nullptr) return;
-  wrap->finalized = true;
-  UbiStreamNotifyClosed(&wrap->listener_state);
-  if (wrap->wrapper_ref != nullptr) {
-    napi_delete_reference(env, wrap->wrapper_ref);
-    wrap->wrapper_ref = nullptr;
-  }
-  if (wrap->close_cb_ref != nullptr) {
-    napi_delete_reference(env, wrap->close_cb_ref);
-    wrap->close_cb_ref = nullptr;
-  }
-  if (wrap->user_read_buffer_ref != nullptr) {
-    napi_delete_reference(env, wrap->user_read_buffer_ref);
-    wrap->user_read_buffer_ref = nullptr;
-  }
-  uv_handle_t* h = reinterpret_cast<uv_handle_t*>(&wrap->handle);
-  if (!wrap->closed) {
-    wrap->delete_on_close = true;
-    if (!uv_is_closing(h)) {
-      uv_close(h, OnClosed);
-    }
-    return;
-  }
-  delete wrap;
-}
-
-napi_value TcpCtor(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
-  auto* wrap = new TcpWrap();
-  wrap->env = env;
-  TcpBindingState& state = EnsureBindingState(env);
-  wrap->async_id = state.next_async_id++;
-  uv_tcp_init(uv_default_loop(), &wrap->handle);
-  wrap->initialized = true;
-  wrap->handle.data = wrap;
-  wrap->default_listener.on_alloc = TcpDefaultOnAlloc;
-  wrap->default_listener.on_read = TcpDefaultOnRead;
-  wrap->default_listener.data = wrap;
-  wrap->user_buffer_listener.on_alloc = TcpUserBufferOnAlloc;
-  wrap->user_buffer_listener.on_read = TcpUserBufferOnRead;
-  wrap->user_buffer_listener.data = wrap;
-  UbiInitStreamListenerState(&wrap->listener_state, &wrap->default_listener);
-  napi_wrap(env, self, wrap, TcpFinalize, nullptr, &wrap->wrapper_ref);
-  const char* mutable_methods[] = {"setNoDelay", "setKeepAlive", "ref", "unref", "close"};
-  for (const char* key : mutable_methods) {
-    napi_value fn = nullptr;
-    if (napi_get_named_property(env, self, key, &fn) == napi_ok && fn != nullptr) {
-      napi_property_descriptor desc = {key, nullptr, nullptr, nullptr, nullptr, fn,
-                                       static_cast<napi_property_attributes>(napi_writable | napi_configurable),
-                                       nullptr};
-      napi_define_properties(env, self, 1, &desc);
-    }
-  }
-  napi_set_named_property(env, self, "isStreamBase", MakeBool(env, true));
-  napi_set_named_property(env, self, "reading", MakeBool(env, false));
-  return self;
-}
-
-bool ExtractByteSpan(napi_env env, napi_value v, const uint8_t** data, size_t* len, std::string* temp_utf8) {
-  bool is_buffer = false;
-  napi_is_buffer(env, v, &is_buffer);
-  if (is_buffer) {
-    void* raw = nullptr;
-    size_t length = 0;
-    if (napi_get_buffer_info(env, v, &raw, &length) == napi_ok && raw != nullptr) {
-      *data = static_cast<const uint8_t*>(raw);
-      *len = length;
-      return true;
-    }
-  }
-
-  bool is_typed = false;
-  napi_is_typedarray(env, v, &is_typed);
-  if (is_typed) {
-    napi_typedarray_type ta_type;
-    size_t length = 0;
-    void* raw = nullptr;
-    napi_value ab = nullptr;
-    size_t offset = 0;
-    if (napi_get_typedarray_info(env, v, &ta_type, &length, &raw, &ab, &offset) == napi_ok && raw != nullptr) {
-      *data = static_cast<const uint8_t*>(raw);
-      *len = length;
-      return true;
-    }
-  }
-  *temp_utf8 = ValueToUtf8(env, v);
-  *data = reinterpret_cast<const uint8_t*>(temp_utf8->data());
-  *len = temp_utf8->size();
-  return true;
-}
-
-napi_value BufferFromWithEncoding(napi_env env, napi_value value, napi_value encoding) {
-  if (env == nullptr || value == nullptr) return value;
-
-  napi_value global = nullptr;
-  napi_value buffer_ctor = nullptr;
-  napi_value from_fn = nullptr;
-  napi_valuetype type = napi_undefined;
-  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
-      napi_get_named_property(env, global, "Buffer", &buffer_ctor) != napi_ok ||
-      buffer_ctor == nullptr ||
-      napi_get_named_property(env, buffer_ctor, "from", &from_fn) != napi_ok ||
-      from_fn == nullptr ||
-      napi_typeof(env, from_fn, &type) != napi_ok ||
-      type != napi_function) {
-    return value;
-  }
-
-  napi_value argv[2] = {value, nullptr};
-  size_t argc = 1;
-  if (encoding != nullptr) {
-    napi_valuetype enc_type = napi_undefined;
-    if (napi_typeof(env, encoding, &enc_type) == napi_ok && enc_type != napi_undefined) {
-      argv[1] = encoding;
-      argc = 2;
-    }
-  }
-
-  napi_value out = nullptr;
-  if (napi_call_function(env, buffer_ctor, from_fn, argc, argv, &out) != napi_ok || out == nullptr) {
-    return value;
-  }
-  return out;
-}
-
-napi_value TcpWriteBufferLike(napi_env env,
-                              TcpWrap* wrap,
-                              napi_value req_obj,
-                              napi_value source_value,
-                              const uint8_t* data,
-                              size_t len,
-                              bool source_is_refable_buffer) {
-  uv_stream_t* stream = reinterpret_cast<uv_stream_t*>(&wrap->handle);
-  wrap->bytes_written += len;
-  size_t sync_written = 0;
-
-  if (len > 0 && data != nullptr) {
-    uv_buf_t try_buf =
-        uv_buf_init(const_cast<char*>(reinterpret_cast<const char*>(data)), static_cast<unsigned int>(len));
-    const int try_rc = uv_try_write(stream, &try_buf, 1);
-    if (try_rc == static_cast<int>(len)) {
-      SetState(kUbiBytesWritten, static_cast<int32_t>(len));
-      SetState(kUbiLastWriteWasAsync, 0);
-      return MakeInt32(env, 0);
-    }
-    if (try_rc > 0) {
-      sync_written = static_cast<size_t>(try_rc);
-    } else if (try_rc < 0 && try_rc != UV_EAGAIN && try_rc != UV_ENOSYS) {
-      SetState(kUbiBytesWritten, static_cast<int32_t>(len));
-      SetState(kUbiLastWriteWasAsync, 0);
-      SetReqError(env, req_obj, try_rc);
-      return MakeInt32(env, try_rc);
-    }
-  }
-
-  const size_t remaining = (len >= sync_written) ? (len - sync_written) : 0;
-  if (remaining == 0) {
-    SetState(kUbiBytesWritten, static_cast<int32_t>(len));
-    SetState(kUbiLastWriteWasAsync, 0);
-    return MakeInt32(env, 0);
-  }
-
-  auto* wr = new WriteReqWrap();
-  wr->env = env;
-  napi_create_reference(env, req_obj, 1, &wr->req_obj_ref);
-  wr->nbufs = 1;
-  wr->nbufs_storage = 1;
-  wr->bufs_storage = new uv_buf_t[1];
-  wr->bufs = wr->bufs_storage;
-  wr->bufs_refs = new napi_ref[1]();
-  wr->bufs_allocs = new char*[1]();
-  if (source_is_refable_buffer &&
-      source_value != nullptr &&
-      data != nullptr &&
-      napi_create_reference(env, source_value, 1, &wr->bufs_refs[0]) == napi_ok &&
-      wr->bufs_refs[0] != nullptr) {
-    wr->bufs_storage[0] =
-        uv_buf_init(const_cast<char*>(reinterpret_cast<const char*>(data + sync_written)),
-                    static_cast<unsigned int>(remaining));
-  } else {
-    char* copy = static_cast<char*>(malloc(remaining));
-    if (copy == nullptr && remaining > 0) {
-      SetState(kUbiBytesWritten, static_cast<int32_t>(len));
-      SetState(kUbiLastWriteWasAsync, 0);
-      SetReqError(env, req_obj, UV_ENOMEM);
-      FreeWriteReq(wr);
-      return MakeInt32(env, UV_ENOMEM);
-    }
-    if (remaining > 0 && copy != nullptr && data != nullptr) memcpy(copy, data + sync_written, remaining);
-    wr->bufs_allocs[0] = copy;
-    wr->bufs_storage[0] = uv_buf_init(copy, static_cast<unsigned int>(remaining));
-  }
-  wr->req.data = wr;
-
-  SetState(kUbiBytesWritten, static_cast<int32_t>(len));
-  SetState(kUbiLastWriteWasAsync, 1);
-
-  int rc = uv_write(&wr->req, stream, wr->bufs, 1, OnWriteDone);
-  if (rc != 0) {
-    SetState(kUbiBytesWritten, static_cast<int32_t>(len));
-    SetState(kUbiLastWriteWasAsync, 0);
-    SetReqError(env, req_obj, rc);
-    FreeWriteReq(wr);
-    return MakeInt32(env, rc);
-  }
-
-  return MakeInt32(env, 0);
-}
-
-napi_value TcpWriteBuffer(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr};
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  bool is_buffer = false;
-  bool is_typed = false;
-  napi_is_buffer(env, argv[1], &is_buffer);
-  if (!is_buffer) napi_is_typedarray(env, argv[1], &is_typed);
-  const uint8_t* data = nullptr;
-  size_t len = 0;
-  std::string temp;
-  ExtractByteSpan(env, argv[1], &data, &len, &temp);
-  return TcpWriteBufferLike(env, wrap, argv[0], argv[1], data, len, is_buffer || is_typed);
-}
-
-napi_value TcpWriteString(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr};
-  napi_value self = nullptr;
-  void* data = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, &data);
-  TcpWrap* wrap = nullptr;
-  if (self != nullptr) {
-    napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  }
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-
-  const char* encoding_name = static_cast<const char*>(data);
-  napi_value encoded = argv[1];
-  if (encoding_name != nullptr && argv[1] != nullptr) {
-    napi_value encoding = nullptr;
-    if (napi_create_string_utf8(env, encoding_name, NAPI_AUTO_LENGTH, &encoding) == napi_ok &&
-        encoding != nullptr) {
-      encoded = BufferFromWithEncoding(env, argv[1], encoding);
-    }
-  }
-
-  const uint8_t* bytes = nullptr;
-  size_t length = 0;
-  std::string temp;
-  ExtractByteSpan(env, encoded, &bytes, &length, &temp);
-  bool is_buffer = false;
-  bool is_typed = false;
-  napi_is_buffer(env, encoded, &is_buffer);
-  if (!is_buffer) napi_is_typedarray(env, encoded, &is_typed);
-  return TcpWriteBufferLike(env, wrap, argv[0], encoded, bytes, length, is_buffer || is_typed);
-}
-
-napi_value TcpWritev(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3] = {nullptr};
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  napi_value req_obj = argv[0];
-  napi_value chunks = argv[1];
-  bool all_buffers = false;
-  if (argc > 2 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &all_buffers);
-
-  uint32_t raw_len = 0;
-  napi_get_array_length(env, chunks, &raw_len);
-  const uint32_t n = all_buffers ? raw_len : (raw_len / 2);
-  if (n == 0) {
-    SetState(kUbiBytesWritten, 0);
-    SetState(kUbiLastWriteWasAsync, 0);
-    return MakeInt32(env, 0);
-  }
-
-  auto* wr = new WriteReqWrap();
-  wr->env = env;
-  napi_create_reference(env, req_obj, 1, &wr->req_obj_ref);
-  wr->bufs_storage = new uv_buf_t[n];
-  wr->bufs_refs = new napi_ref[n]();
-  wr->bufs_allocs = new char*[n]();
-  wr->bufs = wr->bufs_storage;
-  wr->nbufs = n;
-  wr->nbufs_storage = n;
-  size_t total = 0;
-
-  for (uint32_t i = 0; i < n; i++) {
-    napi_value chunk = nullptr;
-    if (all_buffers) {
-      napi_get_element(env, chunks, i, &chunk);
-    } else {
-      napi_get_element(env, chunks, i * 2, &chunk);
-      bool is_buffer = false;
-      napi_is_buffer(env, chunk, &is_buffer);
-      bool is_typed_array = false;
-      if (!is_buffer) napi_is_typedarray(env, chunk, &is_typed_array);
-      if (!is_buffer && !is_typed_array) {
-        napi_value encoding = nullptr;
-        napi_get_element(env, chunks, i * 2 + 1, &encoding);
-        chunk = BufferFromWithEncoding(env, chunk, encoding);
-      }
-    }
-    bool is_buffer = false;
-    bool is_typed = false;
-    napi_is_buffer(env, chunk, &is_buffer);
-    if (!is_buffer) napi_is_typedarray(env, chunk, &is_typed);
-
-    const uint8_t* data = nullptr;
-    size_t len = 0;
-    std::string temp;
-    ExtractByteSpan(env, chunk, &data, &len, &temp);
-
-    if ((is_buffer || is_typed) &&
-        chunk != nullptr &&
-        data != nullptr &&
-        napi_create_reference(env, chunk, 1, &wr->bufs_refs[i]) == napi_ok &&
-        wr->bufs_refs[i] != nullptr) {
-      wr->bufs_storage[i] =
-          uv_buf_init(const_cast<char*>(reinterpret_cast<const char*>(data)),
-                      static_cast<unsigned int>(len));
-    } else {
-      char* copy = static_cast<char*>(malloc(len));
-      if (copy == nullptr && len > 0) {
-        SetState(kUbiBytesWritten, 0);
-        SetState(kUbiLastWriteWasAsync, 0);
-        SetReqError(env, req_obj, UV_ENOMEM);
-        FreeWriteReq(wr);
-        return MakeInt32(env, UV_ENOMEM);
-      }
-      if (len > 0 && copy != nullptr && data != nullptr) memcpy(copy, data, len);
-      wr->bufs_allocs[i] = copy;
-      wr->bufs_storage[i] = uv_buf_init(copy, static_cast<unsigned int>(len));
-    }
-    total += len;
-  }
-
-  wrap->bytes_written += total;
-  if (total > 0) {
-    const int try_rc =
-        uv_try_write(reinterpret_cast<uv_stream_t*>(&wrap->handle), wr->bufs, wr->nbufs);
-    if (try_rc == static_cast<int>(total)) {
-      SetState(kUbiBytesWritten, static_cast<int32_t>(total));
-      SetState(kUbiLastWriteWasAsync, 0);
-      FreeWriteReq(wr);
-      return MakeInt32(env, 0);
-    }
-    if (try_rc > 0) {
-      size_t written = static_cast<size_t>(try_rc);
-      uv_buf_t* vbufs = wr->bufs;
-      uint32_t vcount = wr->nbufs;
-      for (; vcount > 0; vbufs++, vcount--) {
-        if (vbufs[0].len > written) {
-          vbufs[0].base += written;
-          vbufs[0].len -= written;
-          written = 0;
-          break;
-        }
-        written -= vbufs[0].len;
-      }
-      wr->bufs = vbufs;
-      wr->nbufs = vcount;
-    } else if (try_rc < 0 && try_rc != UV_EAGAIN && try_rc != UV_ENOSYS) {
-      SetReqError(env, req_obj, try_rc);
-      SetState(kUbiBytesWritten, static_cast<int32_t>(total));
-      SetState(kUbiLastWriteWasAsync, 0);
-      FreeWriteReq(wr);
-      return MakeInt32(env, try_rc);
-    }
-  }
-
-  if (wr->nbufs == 0) {
-    SetState(kUbiBytesWritten, static_cast<int32_t>(total));
-    SetState(kUbiLastWriteWasAsync, 0);
-    FreeWriteReq(wr);
-    return MakeInt32(env, 0);
-  }
-
-  wr->req.data = wr;
-  SetState(kUbiBytesWritten, static_cast<int32_t>(total));
-  SetState(kUbiLastWriteWasAsync, 1);
-
-  int rc = uv_write(&wr->req,
-                    reinterpret_cast<uv_stream_t*>(&wrap->handle),
-                    wr->bufs,
-                    wr->nbufs,
-                    OnWriteDone);
-  if (rc != 0) {
-    SetState(kUbiBytesWritten, static_cast<int32_t>(total));
-    SetState(kUbiLastWriteWasAsync, 0);
-    SetReqError(env, req_obj, rc);
-    FreeWriteReq(wr);
-  }
-  return MakeInt32(env, rc);
-}
-
-napi_value TcpReadStart(napi_env env, napi_callback_info info) {
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, nullptr, nullptr, &wrap);
-  if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
-  int rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&wrap->handle), OnAlloc, OnRead);
-  napi_value self = GetRefValue(env, wrap->wrapper_ref);
-  if (self != nullptr) {
-    napi_set_named_property(env, self, "reading", MakeBool(env, rc == 0));
-  }
-  return MakeInt32(env, rc);
-}
-
-napi_value TcpReadStop(napi_env env, napi_callback_info info) {
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, nullptr, nullptr, &wrap);
-  if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
-  int rc = uv_read_stop(reinterpret_cast<uv_stream_t*>(&wrap->handle));
-  napi_value self = GetRefValue(env, wrap->wrapper_ref);
-  if (self != nullptr) napi_set_named_property(env, self, "reading", MakeBool(env, false));
-  return MakeInt32(env, rc);
-}
-
-napi_value TcpClose(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr) {
-    napi_value u = nullptr;
-    napi_get_undefined(env, &u);
-    return u;
-  }
-  if (argc > 0 && argv[0] != nullptr) {
-    napi_valuetype t = napi_undefined;
-    napi_typeof(env, argv[0], &t);
-    if (t == napi_function) {
-      if (wrap->close_cb_ref != nullptr) napi_delete_reference(env, wrap->close_cb_ref);
-      napi_create_reference(env, argv[0], 1, &wrap->close_cb_ref);
-    }
-  }
-  UbiStreamNotifyClosed(&wrap->listener_state);
-  if (!wrap->closed && !uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) {
-    uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnClosed);
-  }
-  napi_value u = nullptr;
-  napi_get_undefined(env, &u);
-  return u;
-}
-
-napi_value TcpOpen(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
-  int32_t fd = -1;
-  napi_get_value_int32(env, argv[0], &fd);
-  int rc = uv_tcp_open(&wrap->handle, static_cast<uv_os_sock_t>(fd));
-  return MakeInt32(env, rc);
-}
-
-napi_value TcpSetBlocking(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
-  bool on = false;
-  napi_get_value_bool(env, argv[0], &on);
-  int rc = uv_stream_set_blocking(reinterpret_cast<uv_stream_t*>(&wrap->handle), on ? 1 : 0);
-  return MakeInt32(env, rc);
-}
-
-napi_value TcpBind(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3] = {nullptr};
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  std::string host = ValueToUtf8(env, argv[0]);
-  int32_t port = 0;
-  napi_get_value_int32(env, argv[1], &port);
-  unsigned int flags = 0;
-  if (argc > 2 && argv[2] != nullptr) {
-    uint32_t tmp = 0;
-    napi_get_value_uint32(env, argv[2], &tmp);
-    flags = tmp;
-#ifdef UV_TCP_IPV6ONLY
-    // Match Node: ignore IPv6-only flag on IPv4 sockets.
-    flags &= ~UV_TCP_IPV6ONLY;
-#endif
-  }
-  sockaddr_in addr{};
-  int rc = uv_ip4_addr(host.c_str(), port, &addr);
-  if (rc != 0) return MakeInt32(env, rc);
-  rc = uv_tcp_bind(&wrap->handle, reinterpret_cast<const sockaddr*>(&addr), flags);
-  return MakeInt32(env, rc);
-}
-
-napi_value TcpBind6(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3] = {nullptr};
-  TcpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  std::string host = ValueToUtf8(env, argv[0]);
-  int32_t port = 0;
-  napi_get_value_int32(env, argv[1], &port);
-  unsigned int flags = 0;
-  if (argc > 2 && argv[2] != nullptr) {
-    uint32_t tmp = 0;
-    napi_get_value_uint32(env, argv[2], &tmp);
-    flags = tmp;
-  }
-  sockaddr_in6 addr{};
-  int rc = uv_ip6_addr(host.c_str(), port, &addr);
-  if (rc != 0) return MakeInt32(env, rc);
-  rc = uv_tcp_bind(&wrap->handle, reinterpret_cast<const sockaddr*>(&addr), flags);
-  return MakeInt32(env, rc);
-}
-
 void FillSockAddr(napi_env env, napi_value out, const sockaddr* sa) {
+  if (env == nullptr || out == nullptr || sa == nullptr) return;
   char ip[INET6_ADDRSTRLEN] = {0};
   const char* family = "IPv4";
   int port = 0;
@@ -996,80 +147,176 @@ void FillSockAddr(napi_env env, napi_value out, const sockaddr* sa) {
     uv_ip4_name(a4, ip, sizeof(ip));
     port = ntohs(a4->sin_port);
   }
-  napi_value addr_v = nullptr;
-  napi_value fam_v = nullptr;
-  napi_value port_v = nullptr;
-  napi_create_string_utf8(env, ip, NAPI_AUTO_LENGTH, &addr_v);
-  napi_create_string_utf8(env, family, NAPI_AUTO_LENGTH, &fam_v);
-  napi_create_int32(env, port, &port_v);
-  if (addr_v) napi_set_named_property(env, out, "address", addr_v);
-  if (fam_v) napi_set_named_property(env, out, "family", fam_v);
-  if (port_v) napi_set_named_property(env, out, "port", port_v);
+  napi_value address = nullptr;
+  napi_value family_value = nullptr;
+  napi_value port_value = nullptr;
+  napi_create_string_utf8(env, ip, NAPI_AUTO_LENGTH, &address);
+  napi_create_string_utf8(env, family, NAPI_AUTO_LENGTH, &family_value);
+  napi_create_int32(env, port, &port_value);
+  if (address != nullptr) napi_set_named_property(env, out, "address", address);
+  if (family_value != nullptr) napi_set_named_property(env, out, "family", family_value);
+  if (port_value != nullptr) napi_set_named_property(env, out, "port", port_value);
 }
 
-napi_value TcpGetSockName(napi_env env, napi_callback_info info) {
+void OnAlloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+  auto* wrap = handle != nullptr ? static_cast<TcpWrap*>(handle->data) : nullptr;
+  UbiStreamBaseOnUvAlloc(wrap != nullptr ? &wrap->base : nullptr, suggested_size, buf);
+}
+
+void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+  auto* wrap = stream != nullptr ? static_cast<TcpWrap*>(stream->data) : nullptr;
+  UbiStreamBaseOnUvRead(wrap != nullptr ? &wrap->base : nullptr, nread, buf);
+}
+
+void OnConnectDone(uv_connect_t* req, int status) {
+  auto* cr = static_cast<ConnectReqWrap*>(req->data);
+  if (cr == nullptr) return;
+  napi_value req_obj = GetRefValue(cr->env, cr->req_obj_ref);
+  napi_value tcp_obj = cr->tcp != nullptr ? UbiStreamBaseGetWrapper(&cr->tcp->base) : nullptr;
+  napi_value argv[5] = {
+      UbiStreamBaseMakeInt32(cr->env, status),
+      tcp_obj,
+      req_obj,
+      UbiStreamBaseMakeBool(cr->env, true),
+      UbiStreamBaseMakeBool(cr->env, true),
+  };
+  UbiStreamBaseInvokeReqOnComplete(cr->env, req_obj, status, argv, 5);
+  if (cr->req_obj_ref != nullptr) napi_delete_reference(cr->env, cr->req_obj_ref);
+  delete cr;
+}
+
+napi_value TcpCtor(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value self = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
+  if (self == nullptr) return nullptr;
+
+  int32_t socket_type = kTcpSocket;
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_get_value_int32(env, argv[0], &socket_type);
+  }
+
+  auto* wrap = new TcpWrap();
+  wrap->env = env;
+  wrap->socket_type = socket_type;
+  if (uv_tcp_init(uv_default_loop(), &wrap->handle) != 0) {
+    delete wrap;
+    return UbiStreamBaseUndefined(env);
+  }
+  wrap->handle.data = wrap;
+  const int32_t provider = (socket_type == kTcpServer) ? kUbiProviderTcpServerWrap : kUbiProviderTcpWrap;
+  UbiStreamBaseInit(&wrap->base, env, &kTcpOps, provider);
+  napi_wrap(env, self, wrap, [](napi_env finalize_env, void* data, void*) {
+    auto* tcp_wrap = static_cast<TcpWrap*>(data);
+    if (tcp_wrap == nullptr) return;
+    UbiStreamBaseFinalize(&tcp_wrap->base);
+  }, nullptr, &wrap->base.wrapper_ref);
+  UbiStreamBaseSetInitialStreamProperties(&wrap->base, true, true);
+  return self;
+}
+
+napi_value TcpOpen(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
-  sockaddr_storage storage{};
-  int len = sizeof(storage);
-  int rc = uv_tcp_getsockname(&wrap->handle, reinterpret_cast<sockaddr*>(&storage), &len);
-  if (rc == 0) FillSockAddr(env, argv[0], reinterpret_cast<sockaddr*>(&storage));
-  return MakeInt32(env, rc);
+  if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  int32_t fd = -1;
+  napi_get_value_int32(env, argv[0], &fd);
+  return UbiStreamBaseMakeInt32(env, uv_tcp_open(&wrap->handle, static_cast<uv_os_sock_t>(fd)));
 }
 
-napi_value TcpGetPeerName(napi_env env, napi_callback_info info) {
+napi_value TcpSetBlocking(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
-  sockaddr_storage storage{};
-  int len = sizeof(storage);
-  int rc = uv_tcp_getpeername(&wrap->handle, reinterpret_cast<sockaddr*>(&storage), &len);
-  if (rc == 0) FillSockAddr(env, argv[0], reinterpret_cast<sockaddr*>(&storage));
-  return MakeInt32(env, rc);
+  if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  bool on = false;
+  napi_get_value_bool(env, argv[0], &on);
+  return UbiStreamBaseMakeInt32(env,
+                                uv_stream_set_blocking(reinterpret_cast<uv_stream_t*>(&wrap->handle), on ? 1 : 0));
+}
+
+napi_value TcpBind(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 2) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  std::string host = ValueToUtf8(env, argv[0]);
+  int32_t port = 0;
+  napi_get_value_int32(env, argv[1], &port);
+  unsigned int flags = 0;
+  if (argc > 2 && argv[2] != nullptr) {
+    uint32_t tmp = 0;
+    napi_get_value_uint32(env, argv[2], &tmp);
+    flags = tmp;
+#ifdef UV_TCP_IPV6ONLY
+    flags &= ~UV_TCP_IPV6ONLY;
+#endif
+  }
+  sockaddr_in addr{};
+  int rc = uv_ip4_addr(host.c_str(), port, &addr);
+  if (rc == 0) rc = uv_tcp_bind(&wrap->handle, reinterpret_cast<const sockaddr*>(&addr), flags);
+  return UbiStreamBaseMakeInt32(env, rc);
+}
+
+napi_value TcpBind6(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 2) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  std::string host = ValueToUtf8(env, argv[0]);
+  int32_t port = 0;
+  napi_get_value_int32(env, argv[1], &port);
+  unsigned int flags = 0;
+  if (argc > 2 && argv[2] != nullptr) {
+    uint32_t tmp = 0;
+    napi_get_value_uint32(env, argv[2], &tmp);
+    flags = tmp;
+  }
+  sockaddr_in6 addr{};
+  int rc = uv_ip6_addr(host.c_str(), port, &addr);
+  if (rc == 0) rc = uv_tcp_bind(&wrap->handle, reinterpret_cast<const sockaddr*>(&addr), flags);
+  return UbiStreamBaseMakeInt32(env, rc);
 }
 
 void OnConnection(uv_stream_t* server, int status) {
-  auto* server_wrap = static_cast<TcpWrap*>(server->data);
+  auto* server_wrap = server != nullptr ? static_cast<TcpWrap*>(server->data) : nullptr;
   if (server_wrap == nullptr) return;
   napi_env env = server_wrap->env;
-  napi_value server_obj = GetRefValue(env, server_wrap->wrapper_ref);
+  napi_value server_obj = UbiStreamBaseGetWrapper(&server_wrap->base);
   napi_value onconnection = nullptr;
   if (server_obj == nullptr ||
       napi_get_named_property(env, server_obj, "onconnection", &onconnection) != napi_ok ||
-      onconnection == nullptr) {
+      !IsFunction(env, onconnection)) {
     return;
   }
-  napi_valuetype t = napi_undefined;
-  napi_typeof(env, onconnection, &t);
-  if (t != napi_function) return;
 
-  napi_value undef = nullptr;
-  napi_get_undefined(env, &undef);
-  napi_value argv[2] = {MakeInt32(env, status), undef};
+  napi_value argv[2] = {UbiStreamBaseMakeInt32(env, status), UbiStreamBaseUndefined(env)};
   if (status == 0) {
-    TcpBindingState* binding_state = GetBindingState(env);
-    napi_value ctor = binding_state == nullptr ? nullptr : GetRefValue(env, binding_state->tcp_ctor_ref);
-    if (ctor == nullptr) return;
-    napi_value arg0 = MakeInt32(env, kTcpSocket);
+    napi_value ctor = UbiGetTcpWrapConstructor(env);
+    napi_value arg = UbiStreamBaseMakeInt32(env, kTcpSocket);
     napi_value client_obj = nullptr;
-    napi_new_instance(env, ctor, 1, &arg0, &client_obj);
-    TcpWrap* client_wrap = nullptr;
-    if (client_obj == nullptr ||
-        napi_unwrap(env, client_obj, reinterpret_cast<void**>(&client_wrap)) != napi_ok ||
-        client_wrap == nullptr) {
+    if (ctor == nullptr ||
+        arg == nullptr ||
+        napi_new_instance(env, ctor, 1, &arg, &client_obj) != napi_ok ||
+        client_obj == nullptr) {
       return;
     }
-    // Match Node: if uv_accept fails (e.g. EAGAIN), abort this callback path.
+    TcpWrap* client_wrap = nullptr;
+    if (napi_unwrap(env, client_obj, reinterpret_cast<void**>(&client_wrap)) != napi_ok || client_wrap == nullptr) {
+      return;
+    }
     if (uv_accept(server, reinterpret_cast<uv_stream_t*>(&client_wrap->handle)) != 0) {
       return;
     }
     argv[1] = client_obj;
   }
+
   napi_value ignored = nullptr;
   UbiMakeCallback(env, server_obj, onconnection, 2, argv, &ignored);
 }
@@ -1079,14 +326,20 @@ napi_value TcpListen(napi_env env, napi_callback_info info) {
   napi_value argv[1] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
+  if (wrap == nullptr) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   int32_t backlog = 511;
   if (argc >= 1 && argv[0] != nullptr) napi_get_value_int32(env, argv[0], &backlog);
-  int rc = uv_listen(reinterpret_cast<uv_stream_t*>(&wrap->handle), backlog, OnConnection);
-  return MakeInt32(env, rc);
+  return UbiStreamBaseMakeInt32(
+      env,
+      uv_listen(reinterpret_cast<uv_stream_t*>(&wrap->handle), backlog, OnConnection));
 }
 
-napi_value TcpConnectImpl(napi_env env, TcpWrap* wrap, napi_value req_obj, const std::string& host, int32_t port, bool ipv6) {
+napi_value TcpConnectImpl(napi_env env,
+                         TcpWrap* wrap,
+                         napi_value req_obj,
+                         const std::string& host,
+                         int32_t port,
+                         bool ipv6) {
   auto* cr = new ConnectReqWrap();
   cr->env = env;
   cr->tcp = wrap;
@@ -1094,35 +347,26 @@ napi_value TcpConnectImpl(napi_env env, TcpWrap* wrap, napi_value req_obj, const
   napi_create_reference(env, req_obj, 1, &cr->req_obj_ref);
 
   int rc = 0;
-  if (port >= 0) {
-    if (ipv6) {
-      sockaddr_in6 addr6{};
-      rc = uv_ip6_addr(host.c_str(), port, &addr6);
-      if (rc == 0) {
-        rc = uv_tcp_connect(&cr->req,
-                            &wrap->handle,
-                            reinterpret_cast<const sockaddr*>(&addr6),
-                            OnConnectDone);
-      }
-    } else {
-      sockaddr_in addr4{};
-      rc = uv_ip4_addr(host.c_str(), port, &addr4);
-      if (rc == 0) {
-        rc = uv_tcp_connect(&cr->req,
-                            &wrap->handle,
-                            reinterpret_cast<const sockaddr*>(&addr4),
-                            OnConnectDone);
-      }
+  if (ipv6) {
+    sockaddr_in6 addr6{};
+    rc = uv_ip6_addr(host.c_str(), port, &addr6);
+    if (rc == 0) {
+      rc = uv_tcp_connect(&cr->req, &wrap->handle, reinterpret_cast<const sockaddr*>(&addr6), OnConnectDone);
     }
   } else {
-    rc = UV_EINVAL;
+    sockaddr_in addr4{};
+    rc = uv_ip4_addr(host.c_str(), port, &addr4);
+    if (rc == 0) {
+      rc = uv_tcp_connect(&cr->req, &wrap->handle, reinterpret_cast<const sockaddr*>(&addr4), OnConnectDone);
+    }
   }
+
   if (rc != 0) {
-    SetReqError(env, req_obj, rc);
+    UbiStreamBaseSetReqError(env, req_obj, rc);
     if (cr->req_obj_ref != nullptr) napi_delete_reference(env, cr->req_obj_ref);
     delete cr;
   }
-  return MakeInt32(env, rc);
+  return UbiStreamBaseMakeInt32(env, rc);
 }
 
 napi_value TcpConnect(napi_env env, napi_callback_info info) {
@@ -1130,12 +374,10 @@ napi_value TcpConnect(napi_env env, napi_callback_info info) {
   napi_value argv[3] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  napi_value req_obj = argv[0];
-  std::string host = ValueToUtf8(env, argv[1]);
+  if (wrap == nullptr || argc < 2) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   int32_t port = -1;
   if (argc > 2 && argv[2] != nullptr) napi_get_value_int32(env, argv[2], &port);
-  return TcpConnectImpl(env, wrap, req_obj, host, port, false);
+  return TcpConnectImpl(env, wrap, argv[0], ValueToUtf8(env, argv[1]), port, false);
 }
 
 napi_value TcpConnect6(napi_env env, napi_callback_info info) {
@@ -1143,12 +385,10 @@ napi_value TcpConnect6(napi_env env, napi_callback_info info) {
   napi_value argv[3] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 3) return MakeInt32(env, UV_EINVAL);
-  napi_value req_obj = argv[0];
-  std::string host = ValueToUtf8(env, argv[1]);
+  if (wrap == nullptr || argc < 3) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   int32_t port = 0;
   napi_get_value_int32(env, argv[2], &port);
-  return TcpConnectImpl(env, wrap, req_obj, host, port, true);
+  return TcpConnectImpl(env, wrap, argv[0], ValueToUtf8(env, argv[1]), port, true);
 }
 
 napi_value TcpShutdown(napi_env env, napi_callback_info info) {
@@ -1156,20 +396,74 @@ napi_value TcpShutdown(napi_env env, napi_callback_info info) {
   napi_value argv[1] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
-  auto* sr = new ShutdownReqWrap();
-  sr->env = env;
-  sr->tcp = wrap;
-  sr->req.data = sr;
-  napi_create_reference(env, argv[0], 1, &sr->req_obj_ref);
-  int rc = uv_shutdown(&sr->req, reinterpret_cast<uv_stream_t*>(&wrap->handle), OnShutdownDone);
-  if (rc != 0) {
-    napi_value req_obj = GetRefValue(env, sr->req_obj_ref);
-    SetReqError(env, req_obj, rc);
-    napi_delete_reference(env, sr->req_obj_ref);
-    delete sr;
+  if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  return UbiLibuvStreamShutdown(&wrap->base, argv[0]);
+}
+
+napi_value TcpClose(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr) return UbiStreamBaseUndefined(env);
+  return UbiStreamBaseClose(&wrap->base, argc > 0 ? argv[0] : nullptr);
+}
+
+napi_value TcpReadStart(napi_env env, napi_callback_info info) {
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  if (wrap == nullptr) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  int rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&wrap->handle), OnAlloc, OnRead);
+  UbiStreamBaseSetReading(&wrap->base, rc == 0);
+  return UbiStreamBaseMakeInt32(env, rc);
+}
+
+napi_value TcpReadStop(napi_env env, napi_callback_info info) {
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  if (wrap == nullptr) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  int rc = uv_read_stop(reinterpret_cast<uv_stream_t*>(&wrap->handle));
+  UbiStreamBaseSetReading(&wrap->base, false);
+  return UbiStreamBaseMakeInt32(env, rc);
+}
+
+napi_value TcpWriteBuffer(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 2) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  return UbiLibuvStreamWriteBuffer(&wrap->base, argv[0], argv[1], nullptr, nullptr);
+}
+
+napi_value TcpWriteString(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr};
+  napi_value self = nullptr;
+  void* data = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, &data);
+  TcpWrap* wrap = nullptr;
+  if (self != nullptr) {
+    napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
   }
-  return MakeInt32(env, rc);
+  if (wrap == nullptr || argc < 2) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  return UbiLibuvStreamWriteString(&wrap->base,
+                                   argv[0],
+                                   argv[1],
+                                   static_cast<const char*>(data),
+                                   nullptr,
+                                   nullptr);
+}
+
+napi_value TcpWritev(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 2) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  bool all_buffers = false;
+  if (argc > 2 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &all_buffers);
+  return UbiLibuvStreamWriteV(&wrap->base, argv[0], argv[1], all_buffers, nullptr, nullptr);
 }
 
 napi_value TcpSetNoDelay(napi_env env, napi_callback_info info) {
@@ -1177,11 +471,10 @@ napi_value TcpSetNoDelay(napi_env env, napi_callback_info info) {
   napi_value argv[1] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 1) return MakeInt32(env, UV_EINVAL);
+  if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   bool on = false;
   napi_get_value_bool(env, argv[0], &on);
-  int rc = uv_tcp_nodelay(&wrap->handle, on ? 1 : 0);
-  return MakeInt32(env, rc);
+  return UbiStreamBaseMakeInt32(env, uv_tcp_nodelay(&wrap->handle, on ? 1 : 0));
 }
 
 napi_value TcpSetKeepAlive(napi_env env, napi_callback_info info) {
@@ -1189,64 +482,69 @@ napi_value TcpSetKeepAlive(napi_env env, napi_callback_info info) {
   napi_value argv[2] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
+  if (wrap == nullptr || argc < 2) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   bool on = false;
   int32_t delay = 0;
   napi_get_value_bool(env, argv[0], &on);
   napi_get_value_int32(env, argv[1], &delay);
-  int rc = uv_tcp_keepalive(&wrap->handle, on ? 1 : 0, static_cast<unsigned int>(delay));
-  return MakeInt32(env, rc);
+  return UbiStreamBaseMakeInt32(env,
+                                uv_tcp_keepalive(&wrap->handle, on ? 1 : 0, static_cast<unsigned int>(delay)));
 }
 
 napi_value TcpRef(napi_env env, napi_callback_info info) {
   TcpWrap* wrap = nullptr;
   GetThis(env, info, nullptr, nullptr, &wrap);
-  if (wrap != nullptr) uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
-  napi_value u = nullptr;
-  napi_get_undefined(env, &u);
-  return u;
+  if (wrap != nullptr) UbiStreamBaseRef(&wrap->base);
+  return UbiStreamBaseUndefined(env);
 }
 
 napi_value TcpUnref(napi_env env, napi_callback_info info) {
   TcpWrap* wrap = nullptr;
   GetThis(env, info, nullptr, nullptr, &wrap);
-  if (wrap != nullptr) uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
-  napi_value u = nullptr;
-  napi_get_undefined(env, &u);
-  return u;
+  if (wrap != nullptr) UbiStreamBaseUnref(&wrap->base);
+  return UbiStreamBaseUndefined(env);
+}
+
+napi_value TcpHasRef(napi_env env, napi_callback_info info) {
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return UbiStreamBaseHasRefValue(wrap != nullptr ? &wrap->base : nullptr);
 }
 
 napi_value TcpGetAsyncId(napi_env env, napi_callback_info info) {
   TcpWrap* wrap = nullptr;
   GetThis(env, info, nullptr, nullptr, &wrap);
-  napi_value out = nullptr;
-  napi_create_int64(env, wrap != nullptr ? wrap->async_id : -1, &out);
-  return out;
+  return UbiStreamBaseGetAsyncId(wrap != nullptr ? &wrap->base : nullptr);
 }
 
 napi_value TcpGetProviderType(napi_env env, napi_callback_info info) {
-  (void)info;
-  return MakeInt32(env, kTcpSocket);
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return UbiStreamBaseGetProviderType(wrap != nullptr ? &wrap->base : nullptr);
 }
 
 napi_value TcpAsyncReset(napi_env env, napi_callback_info info) {
   TcpWrap* wrap = nullptr;
   GetThis(env, info, nullptr, nullptr, &wrap);
-  if (wrap != nullptr) {
-    TcpBindingState& state = EnsureBindingState(env);
-    wrap->async_id = state.next_async_id++;
-  }
-  napi_value u = nullptr;
-  napi_get_undefined(env, &u);
-  return u;
+  return UbiStreamBaseAsyncReset(wrap != nullptr ? &wrap->base : nullptr);
 }
 
 napi_value TcpReset(napi_env env, napi_callback_info info) {
-  return TcpClose(env, info);
-}
-
-napi_value TcpFchmod(napi_env env, napi_callback_info info) {
-  return MakeInt32(env, UV_ENOTSUP);
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr) return UbiStreamBaseMakeInt32(env, UV_EBADF);
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
+  if (wrap->base.closed || wrap->base.closing || uv_is_closing(handle)) {
+    return UbiStreamBaseMakeInt32(env, 0);
+  }
+  int rc = uv_tcp_close_reset(&wrap->handle, TcpAfterClose);
+  if (rc == 0) {
+    wrap->base.closing = true;
+    if (argc > 0) UbiStreamBaseSetCloseCallback(&wrap->base, argv[0]);
+  }
+  return UbiStreamBaseMakeInt32(env, rc);
 }
 
 napi_value TcpUseUserBuffer(napi_env env, napi_callback_info info) {
@@ -1254,52 +552,78 @@ napi_value TcpUseUserBuffer(napi_env env, napi_callback_info info) {
   napi_value argv[1] = {nullptr};
   TcpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
-  if (wrap == nullptr || argc < 1 || argv[0] == nullptr) return MakeInt32(env, UV_EINVAL);
+  if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  return UbiStreamBaseUseUserBuffer(&wrap->base, argv[0]);
+}
 
-  if (!UpdateUserReadBuffer(wrap, argv[0])) return MakeInt32(env, UV_EINVAL);
-  if (!wrap->user_buffer_listener_active) {
-    UbiPushStreamListener(&wrap->listener_state, &wrap->user_buffer_listener);
-    wrap->user_buffer_listener_active = true;
-  }
-  return MakeInt32(env, 0);
+napi_value TcpGetSockName(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  sockaddr_storage storage{};
+  int len = sizeof(storage);
+  int rc = uv_tcp_getsockname(&wrap->handle, reinterpret_cast<sockaddr*>(&storage), &len);
+  if (rc == 0) FillSockAddr(env, argv[0], reinterpret_cast<const sockaddr*>(&storage));
+  return UbiStreamBaseMakeInt32(env, rc);
+}
+
+napi_value TcpGetPeerName(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
+  sockaddr_storage storage{};
+  int len = sizeof(storage);
+  int rc = uv_tcp_getpeername(&wrap->handle, reinterpret_cast<sockaddr*>(&storage), &len);
+  if (rc == 0) FillSockAddr(env, argv[0], reinterpret_cast<const sockaddr*>(&storage));
+  return UbiStreamBaseMakeInt32(env, rc);
+}
+
+napi_value TcpGetOnRead(napi_env env, napi_callback_info info) {
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return UbiStreamBaseGetOnRead(wrap != nullptr ? &wrap->base : nullptr);
+}
+
+napi_value TcpSetOnRead(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, &argc, argv, &wrap);
+  return UbiStreamBaseSetOnRead(wrap != nullptr ? &wrap->base : nullptr, argc > 0 ? argv[0] : nullptr);
 }
 
 napi_value TcpBytesReadGetter(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   TcpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  napi_value out = nullptr;
-  napi_create_double(env, static_cast<double>(wrap != nullptr ? wrap->bytes_read : 0), &out);
-  return out;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return UbiStreamBaseGetBytesRead(wrap != nullptr ? &wrap->base : nullptr);
 }
 
 napi_value TcpBytesWrittenGetter(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   TcpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  napi_value out = nullptr;
-  napi_create_double(env, static_cast<double>(wrap != nullptr ? wrap->bytes_written : 0), &out);
-  return out;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return UbiStreamBaseGetBytesWritten(wrap != nullptr ? &wrap->base : nullptr);
 }
 
 napi_value TcpFdGetter(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   TcpWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  int32_t fd = -1;
-  if (wrap != nullptr) {
-    uv_os_fd_t raw = -1;
-    if (uv_fileno(reinterpret_cast<const uv_handle_t*>(&wrap->handle), &raw) == 0) {
-      fd = static_cast<int32_t>(raw);
-    }
-  }
-  return MakeInt32(env, fd);
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return UbiStreamBaseGetFd(wrap != nullptr ? &wrap->base : nullptr);
+}
+
+napi_value TcpExternalStreamGetter(napi_env env, napi_callback_info info) {
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return UbiStreamBaseGetExternal(wrap != nullptr ? &wrap->base : nullptr);
+}
+
+napi_value TcpWriteQueueSizeGetter(napi_env env, napi_callback_info info) {
+  TcpWrap* wrap = nullptr;
+  GetThis(env, info, nullptr, nullptr, &wrap);
+  return UbiStreamBaseGetWriteQueueSize(wrap != nullptr ? &wrap->base : nullptr);
 }
 
 napi_value ConnectWrapCtor(napi_env env, napi_callback_info info) {
@@ -1310,46 +634,43 @@ napi_value ConnectWrapCtor(napi_env env, napi_callback_info info) {
 }
 
 void SetNamedU32(napi_env env, napi_value obj, const char* key, uint32_t value) {
-  napi_value v = nullptr;
-  napi_create_uint32(env, value, &v);
-  if (v != nullptr) napi_set_named_property(env, obj, key, v);
+  napi_value out = nullptr;
+  napi_create_uint32(env, value, &out);
+  if (out != nullptr) napi_set_named_property(env, obj, key, out);
 }
 
 }  // namespace
 
 uv_stream_t* UbiTcpWrapGetStream(napi_env env, napi_value value) {
   if (env == nullptr || value == nullptr) return nullptr;
-  napi_valuetype t = napi_undefined;
-  if (napi_typeof(env, value, &t) != napi_ok || t != napi_object) return nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) return nullptr;
   TcpWrap* wrap = nullptr;
   if (napi_unwrap(env, value, reinterpret_cast<void**>(&wrap)) != napi_ok || wrap == nullptr) return nullptr;
-  uv_handle_t* h = reinterpret_cast<uv_handle_t*>(&wrap->handle);
-  if (h == nullptr || h->data != wrap || h->type != UV_TCP) return nullptr;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
+  if (handle->data != wrap || handle->type != UV_TCP) return nullptr;
   return reinterpret_cast<uv_stream_t*>(&wrap->handle);
 }
 
 bool UbiTcpWrapPushStreamListener(uv_stream_t* stream, UbiStreamListener* listener) {
   if (stream == nullptr || listener == nullptr) return false;
   auto* wrap = static_cast<TcpWrap*>(stream->data);
-  if (wrap == nullptr) return false;
-  UbiPushStreamListener(&wrap->listener_state, listener);
-  return true;
+  return wrap != nullptr && UbiStreamBasePushListener(&wrap->base, listener);
 }
 
 bool UbiTcpWrapRemoveStreamListener(uv_stream_t* stream, UbiStreamListener* listener) {
   if (stream == nullptr || listener == nullptr) return false;
   auto* wrap = static_cast<TcpWrap*>(stream->data);
-  if (wrap == nullptr) return false;
-  return UbiRemoveStreamListener(&wrap->listener_state, listener);
+  return wrap != nullptr && UbiStreamBaseRemoveListener(&wrap->base, listener);
 }
 
 napi_value UbiGetTcpWrapConstructor(napi_env env) {
   TcpBindingState* state = GetBindingState(env);
-  napi_value ctor = state == nullptr ? nullptr : GetRefValue(env, state->tcp_ctor_ref);
+  napi_value ctor = state != nullptr ? GetRefValue(env, state->tcp_ctor_ref) : nullptr;
   if (ctor != nullptr) return ctor;
   napi_value binding = UbiInstallTcpWrapBinding(env);
   if (binding == nullptr) return nullptr;
-  if (napi_get_named_property(env, binding, "TCP", &ctor) != napi_ok || ctor == nullptr) return nullptr;
+  if (napi_get_named_property(env, binding, "TCP", &ctor) != napi_ok) return nullptr;
   return ctor;
 }
 
@@ -1393,15 +714,18 @@ napi_value UbiInstallTcpWrapBinding(napi_env env) {
        static_cast<napi_property_attributes>(napi_writable | napi_configurable), nullptr},
       {"unref", nullptr, TcpUnref, nullptr, nullptr, nullptr,
        static_cast<napi_property_attributes>(napi_writable | napi_configurable), nullptr},
+      {"hasRef", nullptr, TcpHasRef, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"getAsyncId", nullptr, TcpGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"getProviderType", nullptr, TcpGetProviderType, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"asyncReset", nullptr, TcpAsyncReset, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"reset", nullptr, TcpReset, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"fchmod", nullptr, TcpFchmod, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"useUserBuffer", nullptr, TcpUseUserBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"onread", nullptr, nullptr, TcpGetOnRead, TcpSetOnRead, nullptr, napi_default, nullptr},
       {"bytesRead", nullptr, nullptr, TcpBytesReadGetter, nullptr, nullptr, napi_default, nullptr},
       {"bytesWritten", nullptr, nullptr, TcpBytesWrittenGetter, nullptr, nullptr, napi_default, nullptr},
       {"fd", nullptr, nullptr, TcpFdGetter, nullptr, nullptr, napi_default, nullptr},
+      {"_externalStream", nullptr, nullptr, TcpExternalStreamGetter, nullptr, nullptr, napi_default, nullptr},
+      {"writeQueueSize", nullptr, nullptr, TcpWriteQueueSizeGetter, nullptr, nullptr, napi_default, nullptr},
   };
 
   napi_value tcp_ctor = nullptr;
@@ -1416,10 +740,7 @@ napi_value UbiInstallTcpWrapBinding(napi_env env) {
       tcp_ctor == nullptr) {
     return nullptr;
   }
-  if (state.tcp_ctor_ref != nullptr) {
-    napi_delete_reference(env, state.tcp_ctor_ref);
-    state.tcp_ctor_ref = nullptr;
-  }
+  if (state.tcp_ctor_ref != nullptr) napi_delete_reference(env, state.tcp_ctor_ref);
   napi_create_reference(env, tcp_ctor, 1, &state.tcp_ctor_ref);
 
   napi_value connect_wrap_ctor = nullptr;
@@ -1434,10 +755,7 @@ napi_value UbiInstallTcpWrapBinding(napi_env env) {
       connect_wrap_ctor == nullptr) {
     return nullptr;
   }
-  if (state.connect_wrap_ctor_ref != nullptr) {
-    napi_delete_reference(env, state.connect_wrap_ctor_ref);
-    state.connect_wrap_ctor_ref = nullptr;
-  }
+  if (state.connect_wrap_ctor_ref != nullptr) napi_delete_reference(env, state.connect_wrap_ctor_ref);
   napi_create_reference(env, connect_wrap_ctor, 1, &state.connect_wrap_ctor_ref);
 
   napi_value constants = nullptr;
@@ -1451,11 +769,7 @@ napi_value UbiInstallTcpWrapBinding(napi_env env) {
   napi_set_named_property(env, binding, "TCPConnectWrap", connect_wrap_ctor);
   napi_set_named_property(env, binding, "constants", constants);
 
-  if (state.tcp_binding_ref != nullptr) {
-    napi_delete_reference(env, state.tcp_binding_ref);
-    state.tcp_binding_ref = nullptr;
-  }
+  if (state.tcp_binding_ref != nullptr) napi_delete_reference(env, state.tcp_binding_ref);
   napi_create_reference(env, binding, 1, &state.tcp_binding_ref);
-
   return binding;
 }
