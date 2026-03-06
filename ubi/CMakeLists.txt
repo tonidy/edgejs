@@ -319,6 +319,7 @@ add_library(ubi_runtime STATIC
   src/ubi_path.cc
   src/ubi_encoding.cc
   src/ubi_string_decoder.cc
+  src/ubi_handle_wrap.cc
   src/ubi_async_wrap.cc
   src/ubi_http_parser.cc
   src/ubi_js_udp_wrap.cc

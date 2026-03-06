@@ -9,47 +9,32 @@
 // #include "ubi_async_wrap.h"
 #include "ubi_active_resource.h"
 #include "ubi_env_loop.h"
+#include "ubi_handle_wrap.h"
 #include "ubi_runtime.h"
 
 namespace {
 
 struct SignalWrap {
-  napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
-  napi_ref close_cb_ref = nullptr;
-  void* active_handle_token = nullptr;
+  UbiHandleWrap handle_wrap{};
   uv_signal_t handle{};
-  bool initialized = false;
-  bool closed = false;
-  bool finalized = false;
-  bool delete_on_close = false;
   bool active = false;
   bool destroy_queued = false;
   // int64_t async_id = 0;
 };
 
-napi_value GetRefValue(napi_env env, napi_ref ref);
-
 bool SignalWrapHasRef(void* data) {
   auto* wrap = static_cast<SignalWrap*>(data);
-  if (wrap == nullptr || !wrap->initialized || wrap->closed) return false;
-  return uv_has_ref(reinterpret_cast<const uv_handle_t*>(&wrap->handle)) != 0;
+  return wrap != nullptr &&
+         UbiHandleWrapHasRef(&wrap->handle_wrap, reinterpret_cast<const uv_handle_t*>(&wrap->handle));
 }
 
 napi_value SignalWrapGetActiveOwner(napi_env env, void* data) {
   auto* wrap = static_cast<SignalWrap*>(data);
-  return wrap != nullptr ? GetRefValue(env, wrap->wrapper_ref) : nullptr;
+  return wrap != nullptr ? UbiHandleWrapGetActiveOwner(env, wrap->handle_wrap.wrapper_ref) : nullptr;
 }
 
 std::mutex g_handled_signals_mutex;
 std::map<int, int64_t> g_handled_signals;
-
-napi_value GetRefValue(napi_env env, napi_ref ref) {
-  if (ref == nullptr) return nullptr;
-  napi_value out = nullptr;
-  if (napi_get_reference_value(env, ref, &out) != napi_ok) return nullptr;
-  return out;
-}
 
 napi_value MakeInt32(napi_env env, int32_t value) {
   napi_value out = nullptr;
@@ -104,41 +89,35 @@ void QueueDestroy(SignalWrap* wrap) {
 void OnSignal(uv_signal_t* handle, int signum) {
   auto* wrap = static_cast<SignalWrap*>(handle->data);
   if (wrap == nullptr) return;
-  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+  napi_value self = UbiHandleWrapGetRefValue(wrap->handle_wrap.env, wrap->handle_wrap.wrapper_ref);
   if (self == nullptr) return;
   napi_value onsignal = nullptr;
-  if (napi_get_named_property(wrap->env, self, "onsignal", &onsignal) != napi_ok || onsignal == nullptr) return;
+  if (napi_get_named_property(wrap->handle_wrap.env, self, "onsignal", &onsignal) != napi_ok ||
+      onsignal == nullptr) {
+    return;
+  }
   napi_valuetype type = napi_undefined;
-  if (napi_typeof(wrap->env, onsignal, &type) != napi_ok || type != napi_function) return;
-  napi_value arg = MakeInt32(wrap->env, signum);
+  if (napi_typeof(wrap->handle_wrap.env, onsignal, &type) != napi_ok || type != napi_function) return;
+  napi_value arg = MakeInt32(wrap->handle_wrap.env, signum);
   napi_value argv[1] = {arg};
   napi_value ignored = nullptr;
-  UbiMakeCallback(wrap->env, self, onsignal, 1, argv, &ignored);
+  UbiMakeCallback(wrap->handle_wrap.env, self, onsignal, 1, argv, &ignored);
 }
 
 void OnClosed(uv_handle_t* handle) {
   auto* wrap = static_cast<SignalWrap*>(handle->data);
   if (wrap == nullptr) return;
-  wrap->closed = true;
+  wrap->handle_wrap.state = kUbiHandleClosed;
   QueueDestroy(wrap);
 
-  if (!wrap->finalized && wrap->close_cb_ref != nullptr) {
-    napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-    napi_value cb = GetRefValue(wrap->env, wrap->close_cb_ref);
-    if (cb != nullptr) {
-      napi_value ignored = nullptr;
-      UbiMakeCallback(wrap->env, self, cb, 0, nullptr, &ignored);
-    }
-    napi_delete_reference(wrap->env, wrap->close_cb_ref);
-    wrap->close_cb_ref = nullptr;
+  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
+
+  if (wrap->handle_wrap.active_handle_token != nullptr) {
+    UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->handle_wrap.active_handle_token);
+    wrap->handle_wrap.active_handle_token = nullptr;
   }
 
-  if (wrap->active_handle_token != nullptr) {
-    UbiUnregisterActiveHandle(wrap->env, wrap->active_handle_token);
-    wrap->active_handle_token = nullptr;
-  }
-
-  if (wrap->delete_on_close || wrap->finalized) {
+  if (wrap->handle_wrap.delete_on_close || wrap->handle_wrap.finalized) {
     delete wrap;
   }
 }
@@ -146,19 +125,12 @@ void OnClosed(uv_handle_t* handle) {
 void SignalFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<SignalWrap*>(data);
   if (wrap == nullptr) return;
-  wrap->finalized = true;
-  if (wrap->wrapper_ref != nullptr) {
-    napi_delete_reference(env, wrap->wrapper_ref);
-    wrap->wrapper_ref = nullptr;
-  }
-  if (wrap->close_cb_ref != nullptr) {
-    napi_delete_reference(env, wrap->close_cb_ref);
-    wrap->close_cb_ref = nullptr;
-  }
-  if (!wrap->initialized || wrap->closed) {
-    if (wrap->active_handle_token != nullptr) {
-      UbiUnregisterActiveHandle(env, wrap->active_handle_token);
-      wrap->active_handle_token = nullptr;
+  wrap->handle_wrap.finalized = true;
+  UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
+  if (wrap->handle_wrap.state == kUbiHandleUninitialized || wrap->handle_wrap.state == kUbiHandleClosed) {
+    if (wrap->handle_wrap.active_handle_token != nullptr) {
+      UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
+      wrap->handle_wrap.active_handle_token = nullptr;
     }
     QueueDestroy(wrap);
     delete wrap;
@@ -168,9 +140,10 @@ void SignalFinalize(napi_env env, void* data, void* /*hint*/) {
     DecreaseSignalHandlerCount(wrap->handle.signum);
     wrap->active = false;
   }
-  wrap->delete_on_close = true;
+  wrap->handle_wrap.delete_on_close = true;
   uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
   if (!uv_is_closing(handle)) {
+    wrap->handle_wrap.state = kUbiHandleClosing;
     uv_close(handle, OnClosed);
   }
   return;
@@ -182,17 +155,17 @@ napi_value SignalCtor(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
 
   auto* wrap = new SignalWrap();
-  wrap->env = env;
+  UbiHandleWrapInit(&wrap->handle_wrap, env);
   // wrap->async_id = UbiAsyncWrapNewAsyncId(env);
 
   uv_loop_t* loop = UbiGetEnvLoop(env);
   int rc = loop != nullptr ? uv_signal_init(loop, &wrap->handle) : UV_EINVAL;
   if (rc == 0) {
-    wrap->initialized = true;
+    wrap->handle_wrap.state = kUbiHandleInitialized;
     wrap->handle.data = wrap;
   }
-  napi_wrap(env, self, wrap, SignalFinalize, nullptr, &wrap->wrapper_ref);
-  wrap->active_handle_token =
+  napi_wrap(env, self, wrap, SignalFinalize, nullptr, &wrap->handle_wrap.wrapper_ref);
+  wrap->handle_wrap.active_handle_token =
       UbiRegisterActiveHandle(env, self, "SIGNALWRAP", SignalWrapHasRef, SignalWrapGetActiveOwner, wrap);
 
   // UbiAsyncWrapEmitInit(env,
@@ -213,7 +186,7 @@ napi_value SignalStart(napi_env env, napi_callback_info info) {
 
   SignalWrap* wrap = nullptr;
   if (!UnwrapSignalWrap(env, self, &wrap)) return nullptr;
-  if (!wrap->initialized) return MakeInt32(env, UV_EINVAL);
+  if (wrap->handle_wrap.state != kUbiHandleInitialized) return MakeInt32(env, UV_EINVAL);
   if (argc < 1 || argv[0] == nullptr) return MakeInt32(env, UV_EINVAL);
 
   int32_t signum = 0;
@@ -234,7 +207,7 @@ napi_value SignalStop(napi_env env, napi_callback_info info) {
 
   SignalWrap* wrap = nullptr;
   if (!UnwrapSignalWrap(env, self, &wrap)) return nullptr;
-  if (!wrap->initialized) return MakeInt32(env, UV_EINVAL);
+  if (wrap->handle_wrap.state != kUbiHandleInitialized) return MakeInt32(env, UV_EINVAL);
 
   if (wrap->active) {
     wrap->active = false;
@@ -253,11 +226,16 @@ napi_value SignalClose(napi_env env, napi_callback_info info) {
   SignalWrap* wrap = nullptr;
   if (!UnwrapSignalWrap(env, self, &wrap)) return nullptr;
 
+  if (wrap->handle_wrap.state != kUbiHandleInitialized) {
+    napi_value out = nullptr;
+    napi_get_undefined(env, &out);
+    return out;
+  }
+
   if (argc >= 1 && argv[0] != nullptr) {
     napi_valuetype type = napi_undefined;
     if (napi_typeof(env, argv[0], &type) == napi_ok && type == napi_function) {
-      if (wrap->close_cb_ref != nullptr) napi_delete_reference(env, wrap->close_cb_ref);
-      napi_create_reference(env, argv[0], 1, &wrap->close_cb_ref);
+      UbiHandleWrapSetOnCloseCallback(env, self, argv[0]);
     }
   }
 
@@ -266,9 +244,10 @@ napi_value SignalClose(napi_env env, napi_callback_info info) {
     wrap->active = false;
   }
 
-  if (!wrap->closed && wrap->initialized) {
+  if (wrap->handle_wrap.state == kUbiHandleInitialized) {
     uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
     if (!uv_is_closing(handle)) {
+      wrap->handle_wrap.state = kUbiHandleClosing;
       uv_close(handle, OnClosed);
     }
   } else {
@@ -286,7 +265,7 @@ napi_value SignalRef(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   SignalWrap* wrap = nullptr;
   if (!UnwrapSignalWrap(env, self, &wrap)) return nullptr;
-  if (wrap->initialized) uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+  if (wrap->handle_wrap.state == kUbiHandleInitialized) uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
   napi_value out = nullptr;
   napi_get_undefined(env, &out);
   return out;
@@ -298,7 +277,7 @@ napi_value SignalUnref(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   SignalWrap* wrap = nullptr;
   if (!UnwrapSignalWrap(env, self, &wrap)) return nullptr;
-  if (wrap->initialized) uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+  if (wrap->handle_wrap.state == kUbiHandleInitialized) uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
   napi_value out = nullptr;
   napi_get_undefined(env, &out);
   return out;
@@ -310,8 +289,7 @@ napi_value SignalHasRef(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   SignalWrap* wrap = nullptr;
   if (!UnwrapSignalWrap(env, self, &wrap)) return nullptr;
-  bool has_ref = wrap->initialized &&
-                 uv_has_ref(reinterpret_cast<const uv_handle_t*>(&wrap->handle)) != 0;
+  bool has_ref = UbiHandleWrapHasRef(&wrap->handle_wrap, reinterpret_cast<const uv_handle_t*>(&wrap->handle));
   napi_value out = nullptr;
   napi_get_boolean(env, has_ref, &out);
   return out;

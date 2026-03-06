@@ -1242,33 +1242,78 @@ TEST_F(Test1CliPhase01, ProcessWrapCloseMatchesHandleWrapNoopAndCallbackSemantic
   const auto ubi_path = ResolveBuiltUbiBinary();
   ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
 
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_process_wrap_close_semantics",
+      "const assert = require('assert');\n"
+      "const { spawn } = require('child_process');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const Process = internalBinding('process_wrap').Process;\n"
+      "let uninitializedCloseCalls = 0;\n"
+      "new Process().close(() => { uninitializedCloseCalls++; });\n"
+      "setImmediate(() => {\n"
+      "  assert.strictEqual(uninitializedCloseCalls, 0);\n"
+      "  const cp = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 50)']);\n"
+      "  const calls = [];\n"
+      "  cp._handle.close(() => calls.push('first'));\n"
+      "  cp._handle.close(() => calls.push('second'));\n"
+      "  setTimeout(() => {\n"
+      "    assert.deepStrictEqual(calls, ['first']);\n"
+      "    console.log('process-wrap-close:ok');\n"
+      "  }, 25);\n"
+      "});\n");
+
   const CommandResult result = RunBuiltBinaryAndCapture(
       ubi_path,
-      {"--expose-internals",
-       "-e",
-       "const assert = require('assert');"
-       "const { spawn } = require('child_process');"
-       "const Process = internalBinding('process_wrap').Process;"
-       "let uninitializedCloseCalls = 0;"
-       "new Process().close(() => { uninitializedCloseCalls++; });"
-       "setImmediate(() => {"
-       "  assert.strictEqual(uninitializedCloseCalls, 0);"
-       "  const cp = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 50)']);"
-       "  const calls = [];"
-       "  cp._handle.close(() => calls.push('first'));"
-       "  cp._handle.close(() => calls.push('second'));"
-       "  setTimeout(() => {"
-       "    assert.deepStrictEqual(calls, ['first']);"
-       "    console.log('process-wrap-close:ok');"
-       "  }, 25);"
-       "});"},
-      "ubi_phase01_process_wrap_close_semantics");
+      {"--expose-internals", script_path},
+      "ubi_phase01_process_wrap_close_semantics_run");
+
+  RemoveTempScript(script_path);
 
   ASSERT_NE(result.status, -1);
   ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
-  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
   EXPECT_NE(result.stdout_output.find("process-wrap-close:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, SignalWrapCloseMatchesHandleWrapCallbackSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "signal_wrap close semantics check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_signal_wrap_close_semantics",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const Signal = internalBinding('signal_wrap').Signal;\n"
+      "const signal = new Signal();\n"
+      "const calls = [];\n"
+      "signal.close(() => calls.push('first'));\n"
+      "signal.close(() => calls.push('second'));\n"
+      "setTimeout(() => {\n"
+      "  assert.deepStrictEqual(calls, ['first']);\n"
+      "  console.log('signal-wrap-close:ok');\n"
+      "}, 25);\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--expose-internals", script_path},
+      "ubi_phase01_signal_wrap_close_semantics_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("signal-wrap-close:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
 

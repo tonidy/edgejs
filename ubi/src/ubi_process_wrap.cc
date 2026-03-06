@@ -19,50 +19,23 @@
 #include "ubi_active_resource.h"
 #include "ubi_async_wrap.h"
 #include "ubi_env_loop.h"
-#include "ubi_module_loader.h"
+#include "ubi_handle_wrap.h"
 #include "ubi_runtime.h"
 #include "ubi_stream_base.h"
 
 namespace {
 
-struct ProcessSymbolCache {
-  napi_ref symbols_ref = nullptr;
-  napi_ref owner_symbol_ref = nullptr;
-};
-
 struct ProcessWrap {
-  enum State : uint8_t {
-    kUninitialized = 0,
-    kInitialized,
-    kClosing,
-    kClosed,
-  };
-
-  napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
-  napi_ref close_cb_ref = nullptr;
-  void* active_handle_token = nullptr;
+  UbiHandleWrap handle_wrap{};
   int32_t pid = 0;
   bool alive = false;
-  bool finalized = false;
-  bool delete_on_close = false;
   bool destroy_queued = false;
-  bool wrapper_ref_held = false;
   int64_t async_id = 0;
-  State state = kUninitialized;
   uv_process_t process{};
 };
 
 std::mutex g_live_child_pids_mutex;
 std::unordered_set<int32_t> g_live_child_pids;
-std::unordered_map<napi_env, ProcessSymbolCache> g_symbol_cache;
-
-napi_value GetRefValue(napi_env env, napi_ref ref) {
-  if (env == nullptr || ref == nullptr) return nullptr;
-  napi_value value = nullptr;
-  if (napi_get_reference_value(env, ref, &value) != napi_ok || value == nullptr) return nullptr;
-  return value;
-}
 
 napi_value MakeInt32(napi_env env, int32_t value) {
   napi_value out = nullptr;
@@ -114,28 +87,6 @@ bool ProcessExists(int32_t pid) {
   if (pid <= 0) return false;
   if (kill(pid, 0) == 0) return true;
   return errno == EPERM;
-}
-
-void HoldWrapperRef(ProcessWrap* wrap) {
-  if (wrap == nullptr || wrap->env == nullptr || wrap->wrapper_ref == nullptr || wrap->wrapper_ref_held) return;
-  uint32_t ref_count = 0;
-  if (napi_reference_ref(wrap->env, wrap->wrapper_ref, &ref_count) == napi_ok) {
-    wrap->wrapper_ref_held = true;
-  }
-}
-
-void ReleaseWrapperRef(ProcessWrap* wrap) {
-  if (wrap == nullptr || wrap->env == nullptr || wrap->wrapper_ref == nullptr || !wrap->wrapper_ref_held) return;
-  uint32_t ref_count = 0;
-  if (napi_reference_unref(wrap->env, wrap->wrapper_ref, &ref_count) == napi_ok) {
-    wrap->wrapper_ref_held = false;
-  }
-}
-
-void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
-  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
-  napi_delete_reference(env, *ref);
-  *ref = nullptr;
 }
 
 void ThrowIllegalInvocation(napi_env env) {
@@ -210,101 +161,21 @@ bool GetStringProperty(napi_env env, napi_value obj, const char* key, std::strin
   return true;
 }
 
-napi_value ResolveInternalBinding(napi_env env, const char* name) {
-  if (env == nullptr || name == nullptr) return nullptr;
-  napi_value global = internal_binding::GetGlobal(env);
-  if (global == nullptr) return nullptr;
-
-  napi_value internal_binding = UbiGetInternalBinding(env);
-  if (internal_binding == nullptr) {
-    if (napi_get_named_property(env, global, "internalBinding", &internal_binding) != napi_ok ||
-        internal_binding == nullptr) {
-      return nullptr;
-    }
-  }
-
-  napi_valuetype type = napi_undefined;
-  if (napi_typeof(env, internal_binding, &type) != napi_ok || type != napi_function) return nullptr;
-
-  napi_value binding_name = nullptr;
-  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &binding_name) != napi_ok || binding_name == nullptr) {
-    return nullptr;
-  }
-
-  napi_value binding = nullptr;
-  napi_value argv[1] = {binding_name};
-  if (napi_call_function(env, global, internal_binding, 1, argv, &binding) != napi_ok || binding == nullptr) {
-    bool pending = false;
-    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
-      napi_value ignored = nullptr;
-      napi_get_and_clear_last_exception(env, &ignored);
-    }
-    return nullptr;
-  }
-  return binding;
-}
-
-ProcessSymbolCache& GetSymbolCache(napi_env env) {
-  return g_symbol_cache[env];
-}
-
-napi_value GetSymbolsBinding(napi_env env) {
-  ProcessSymbolCache& cache = GetSymbolCache(env);
-  napi_value binding = GetRefValue(env, cache.symbols_ref);
-  if (binding != nullptr) return binding;
-
-  binding = ResolveInternalBinding(env, "symbols");
-  if (binding == nullptr) return nullptr;
-
-  DeleteRefIfPresent(env, &cache.symbols_ref);
-  napi_create_reference(env, binding, 1, &cache.symbols_ref);
-  return binding;
-}
-
-napi_value GetOwnerSymbol(napi_env env) {
-  ProcessSymbolCache& cache = GetSymbolCache(env);
-  napi_value symbol = GetRefValue(env, cache.owner_symbol_ref);
-  if (symbol != nullptr) return symbol;
-
-  napi_value symbols = GetSymbolsBinding(env);
-  if (symbols == nullptr) return nullptr;
-  if (napi_get_named_property(env, symbols, "owner_symbol", &symbol) != napi_ok || symbol == nullptr) {
-    return nullptr;
-  }
-
-  DeleteRefIfPresent(env, &cache.owner_symbol_ref);
-  napi_create_reference(env, symbol, 1, &cache.owner_symbol_ref);
-  return symbol;
-}
-
 napi_value GetActiveOwner(napi_env env, void* data) {
   auto* wrap = static_cast<ProcessWrap*>(data);
-  napi_value wrapper = wrap != nullptr ? GetRefValue(env, wrap->wrapper_ref) : nullptr;
-  if (wrapper == nullptr) return nullptr;
-
-  napi_value owner_symbol = GetOwnerSymbol(env);
-  if (owner_symbol != nullptr) {
-    napi_value owner = nullptr;
-    if (napi_get_property(env, wrapper, owner_symbol, &owner) == napi_ok && owner != nullptr) {
-      napi_valuetype type = napi_undefined;
-      if (napi_typeof(env, owner, &type) == napi_ok && type != napi_undefined && type != napi_null) {
-        return owner;
-      }
-    }
-  }
-  return wrapper;
+  return wrap != nullptr ? UbiHandleWrapGetActiveOwner(env, wrap->handle_wrap.wrapper_ref) : nullptr;
 }
 
 bool HasRef(void* data) {
   auto* wrap = static_cast<ProcessWrap*>(data);
-  if (wrap == nullptr || wrap->state != ProcessWrap::kInitialized) return false;
-  return uv_has_ref(reinterpret_cast<const uv_handle_t*>(&wrap->process)) != 0;
+  return wrap != nullptr &&
+         UbiHandleWrapHasRef(&wrap->handle_wrap, reinterpret_cast<const uv_handle_t*>(&wrap->process));
 }
 
 void QueueDestroy(ProcessWrap* wrap) {
   if (wrap == nullptr || wrap->destroy_queued || wrap->async_id <= 0) return;
   wrap->destroy_queued = true;
-  UbiAsyncWrapQueueDestroyId(wrap->env, wrap->async_id);
+  UbiAsyncWrapQueueDestroyId(wrap->handle_wrap.env, wrap->async_id);
 }
 
 const char* SignalNameFromNumber(int sig) {
@@ -438,65 +309,59 @@ bool ParseStdioOptions(napi_env env, napi_value js_options, std::vector<uv_stdio
   return true;
 }
 
-void InvokeCloseCallback(ProcessWrap* wrap) {
-  if (wrap == nullptr || wrap->env == nullptr || wrap->close_cb_ref == nullptr || wrap->finalized) return;
-  napi_value callback = GetRefValue(wrap->env, wrap->close_cb_ref);
-  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-  if (callback != nullptr) {
-    napi_value ignored = nullptr;
-    UbiMakeCallback(wrap->env, self, callback, 0, nullptr, &ignored);
-  }
-  DeleteRefIfPresent(wrap->env, &wrap->close_cb_ref);
-}
-
 void OnProcessClose(uv_handle_t* handle) {
   auto* wrap = static_cast<ProcessWrap*>(handle->data);
   if (wrap == nullptr) return;
 
-  wrap->state = ProcessWrap::kClosed;
+  wrap->handle_wrap.state = kUbiHandleClosed;
   wrap->alive = false;
   UntrackLiveChildPid(wrap->pid);
 
-  ReleaseWrapperRef(wrap);
-  InvokeCloseCallback(wrap);
+  UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
+  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
 
-  if (wrap->active_handle_token != nullptr) {
-    UbiUnregisterActiveHandle(wrap->env, wrap->active_handle_token);
-    wrap->active_handle_token = nullptr;
+  if (wrap->handle_wrap.active_handle_token != nullptr) {
+    UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->handle_wrap.active_handle_token);
+    wrap->handle_wrap.active_handle_token = nullptr;
   }
 
   QueueDestroy(wrap);
 
-  if (wrap->delete_on_close || wrap->finalized) {
+  if (wrap->handle_wrap.delete_on_close || wrap->handle_wrap.finalized) {
     delete wrap;
   }
 }
 
 void EmitOnExit(ProcessWrap* wrap, int64_t exit_status, int term_signal) {
-  if (wrap == nullptr || wrap->env == nullptr || wrap->wrapper_ref == nullptr || wrap->finalized) return;
-  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+  if (wrap == nullptr ||
+      wrap->handle_wrap.env == nullptr ||
+      wrap->handle_wrap.wrapper_ref == nullptr ||
+      wrap->handle_wrap.finalized) {
+    return;
+  }
+  napi_value self = UbiHandleWrapGetRefValue(wrap->handle_wrap.env, wrap->handle_wrap.wrapper_ref);
   if (self == nullptr) return;
 
   napi_value onexit = nullptr;
   bool has_onexit = false;
-  if (napi_has_named_property(wrap->env, self, "onexit", &has_onexit) != napi_ok || !has_onexit) return;
-  if (napi_get_named_property(wrap->env, self, "onexit", &onexit) != napi_ok || onexit == nullptr) return;
+  if (napi_has_named_property(wrap->handle_wrap.env, self, "onexit", &has_onexit) != napi_ok || !has_onexit) return;
+  if (napi_get_named_property(wrap->handle_wrap.env, self, "onexit", &onexit) != napi_ok || onexit == nullptr) return;
 
   napi_valuetype type = napi_undefined;
-  if (napi_typeof(wrap->env, onexit, &type) != napi_ok || type != napi_function) return;
+  if (napi_typeof(wrap->handle_wrap.env, onexit, &type) != napi_ok || type != napi_function) return;
 
   napi_value argv[2] = {nullptr, nullptr};
-  argv[0] = MakeInt32(wrap->env, static_cast<int32_t>(exit_status));
-  napi_create_string_utf8(wrap->env, SignalNameFromNumber(term_signal), NAPI_AUTO_LENGTH, &argv[1]);
+  argv[0] = MakeInt32(wrap->handle_wrap.env, static_cast<int32_t>(exit_status));
+  napi_create_string_utf8(wrap->handle_wrap.env, SignalNameFromNumber(term_signal), NAPI_AUTO_LENGTH, &argv[1]);
 
   napi_value ignored = nullptr;
   UbiAsyncWrapMakeCallback(
-      wrap->env, wrap->async_id, self, self, onexit, 2, argv, &ignored, 0);
+      wrap->handle_wrap.env, wrap->async_id, self, self, onexit, 2, argv, &ignored, 0);
 }
 
 void OnProcessExit(uv_process_t* process, int64_t exit_status, int term_signal) {
   auto* wrap = static_cast<ProcessWrap*>(process->data);
-  if (wrap == nullptr || wrap->state == ProcessWrap::kClosed) return;
+  if (wrap == nullptr || wrap->handle_wrap.state == kUbiHandleClosed) return;
   wrap->alive = false;
   UntrackLiveChildPid(wrap->pid);
   EmitOnExit(wrap, exit_status, term_signal);
@@ -506,34 +371,33 @@ void ProcessFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<ProcessWrap*>(data);
   if (wrap == nullptr) return;
 
-  wrap->finalized = true;
-  DeleteRefIfPresent(env, &wrap->close_cb_ref);
-  DeleteRefIfPresent(env, &wrap->wrapper_ref);
+  wrap->handle_wrap.finalized = true;
+  UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
 
-  if (wrap->state == ProcessWrap::kUninitialized || wrap->state == ProcessWrap::kClosed) {
-    if (wrap->active_handle_token != nullptr) {
-      UbiUnregisterActiveHandle(env, wrap->active_handle_token);
-      wrap->active_handle_token = nullptr;
+  if (wrap->handle_wrap.state == kUbiHandleUninitialized || wrap->handle_wrap.state == kUbiHandleClosed) {
+    if (wrap->handle_wrap.active_handle_token != nullptr) {
+      UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
+      wrap->handle_wrap.active_handle_token = nullptr;
     }
     QueueDestroy(wrap);
     delete wrap;
     return;
   }
 
-  wrap->delete_on_close = true;
+  wrap->handle_wrap.delete_on_close = true;
   wrap->alive = false;
   UntrackLiveChildPid(wrap->pid);
   uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->process);
-  if (wrap->state == ProcessWrap::kInitialized && !uv_is_closing(handle)) {
-    wrap->state = ProcessWrap::kClosing;
+  if (wrap->handle_wrap.state == kUbiHandleInitialized && !uv_is_closing(handle)) {
+    wrap->handle_wrap.state = kUbiHandleClosing;
     uv_close(handle, OnProcessClose);
     return;
   }
 
-  if (wrap->state != ProcessWrap::kClosing) {
-    if (wrap->active_handle_token != nullptr) {
-      UbiUnregisterActiveHandle(env, wrap->active_handle_token);
-      wrap->active_handle_token = nullptr;
+  if (wrap->handle_wrap.state != kUbiHandleClosing) {
+    if (wrap->handle_wrap.active_handle_token != nullptr) {
+      UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
+      wrap->handle_wrap.active_handle_token = nullptr;
     }
     QueueDestroy(wrap);
     delete wrap;
@@ -548,23 +412,19 @@ napi_value ProcessCtor(napi_env env, napi_callback_info info) {
   }
 
   auto* wrap = new ProcessWrap();
-  wrap->env = env;
+  UbiHandleWrapInit(&wrap->handle_wrap, env);
   wrap->async_id = UbiAsyncWrapNextId(env);
   wrap->pid = 0;
   wrap->alive = false;
-  wrap->finalized = false;
-  wrap->delete_on_close = false;
   wrap->destroy_queued = false;
-  wrap->wrapper_ref_held = false;
-  wrap->state = ProcessWrap::kUninitialized;
   wrap->process = {};
 
-  if (napi_wrap(env, self, wrap, ProcessFinalize, nullptr, &wrap->wrapper_ref) != napi_ok) {
+  if (napi_wrap(env, self, wrap, ProcessFinalize, nullptr, &wrap->handle_wrap.wrapper_ref) != napi_ok) {
     delete wrap;
     return internal_binding::Undefined(env);
   }
 
-  wrap->active_handle_token =
+  wrap->handle_wrap.active_handle_token =
       UbiRegisterActiveHandle(env, self, "PROCESSWRAP", HasRef, GetActiveOwner, wrap);
 
   SetPidUndefined(env, self);
@@ -584,7 +444,7 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
 
   ProcessWrap* wrap = nullptr;
   if (!UnwrapProcess(env, self, &wrap)) return nullptr;
-  if (wrap->state != ProcessWrap::kUninitialized) return MakeInt32(env, UV_EINVAL);
+  if (wrap->handle_wrap.state != kUbiHandleUninitialized) return MakeInt32(env, UV_EINVAL);
 
   napi_valuetype options_type = napi_undefined;
   if (napi_typeof(env, argv[0], &options_type) != napi_ok || options_type != napi_object) {
@@ -661,12 +521,15 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   wrap->process = {};
   wrap->process.data = wrap;
   wrap->alive = false;
-  wrap->delete_on_close = false;
-  wrap->state = ProcessWrap::kUninitialized;
+  wrap->handle_wrap.delete_on_close = false;
+  wrap->handle_wrap.state = kUbiHandleUninitialized;
 
   const int rc = uv_spawn(loop, &wrap->process, &options);
+  wrap->handle_wrap.state = kUbiHandleInitialized;
+  UbiHandleWrapHoldWrapperRef(&wrap->handle_wrap);
   if (rc != 0) {
     wrap->pid = 0;
+    wrap->alive = false;
     SetPidUndefined(env, self);
     if (DebugProcessWrapEnabled()) {
       std::cerr << "[ubi-process-wrap] spawn file=" << file << " rc=" << rc << "\n";
@@ -674,11 +537,9 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
     return MakeInt32(env, rc);
   }
 
-  wrap->state = ProcessWrap::kInitialized;
   wrap->pid = static_cast<int32_t>(wrap->process.pid);
   wrap->alive = true;
   TrackLiveChildPid(wrap->pid);
-  HoldWrapperRef(wrap);
   SetPidProperty(env, self, wrap->pid);
 
   if (DebugProcessWrapEnabled()) {
@@ -697,7 +558,7 @@ napi_value ProcessKill(napi_env env, napi_callback_info info) {
 
   ProcessWrap* wrap = nullptr;
   if (!UnwrapProcess(env, self, &wrap)) return nullptr;
-  if (wrap->state != ProcessWrap::kInitialized) return MakeInt32(env, UV_ESRCH);
+  if (wrap->handle_wrap.state != kUbiHandleInitialized) return MakeInt32(env, UV_ESRCH);
 
   int32_t signal = SIGTERM;
   if (argc >= 1 && argv[0] != nullptr && napi_get_value_int32(env, argv[0], &signal) != napi_ok) {
@@ -730,15 +591,14 @@ napi_value ProcessClose(napi_env env, napi_callback_info info) {
   ProcessWrap* wrap = nullptr;
   if (!UnwrapProcess(env, self, &wrap)) return nullptr;
 
-  if (wrap->state != ProcessWrap::kInitialized) {
+  if (wrap->handle_wrap.state != kUbiHandleInitialized) {
     return internal_binding::Undefined(env);
   }
 
   if (argc >= 1 && argv[0] != nullptr) {
     napi_valuetype type = napi_undefined;
     if (napi_typeof(env, argv[0], &type) == napi_ok && type == napi_function) {
-      DeleteRefIfPresent(env, &wrap->close_cb_ref);
-      napi_create_reference(env, argv[0], 1, &wrap->close_cb_ref);
+      UbiHandleWrapSetOnCloseCallback(env, self, argv[0]);
     }
   }
 
@@ -747,7 +607,7 @@ napi_value ProcessClose(napi_env env, napi_callback_info info) {
 
   uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->process);
   if (!uv_is_closing(handle)) {
-    wrap->state = ProcessWrap::kClosing;
+    wrap->handle_wrap.state = kUbiHandleClosing;
     uv_close(handle, OnProcessClose);
   }
 
@@ -756,7 +616,7 @@ napi_value ProcessClose(napi_env env, napi_callback_info info) {
 
 napi_value ProcessRef(napi_env env, napi_callback_info info) {
   ProcessWrap* wrap = GetThis(env, info, nullptr);
-  if (wrap != nullptr && wrap->state == ProcessWrap::kInitialized) {
+  if (wrap != nullptr && wrap->handle_wrap.state == kUbiHandleInitialized) {
     uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->process));
   }
   return internal_binding::Undefined(env);
@@ -764,7 +624,7 @@ napi_value ProcessRef(napi_env env, napi_callback_info info) {
 
 napi_value ProcessUnref(napi_env env, napi_callback_info info) {
   ProcessWrap* wrap = GetThis(env, info, nullptr);
-  if (wrap != nullptr && wrap->state == ProcessWrap::kInitialized) {
+  if (wrap != nullptr && wrap->handle_wrap.state == kUbiHandleInitialized) {
     uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->process));
   }
   return internal_binding::Undefined(env);
