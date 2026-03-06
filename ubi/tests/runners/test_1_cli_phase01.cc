@@ -1543,3 +1543,130 @@ TEST_F(Test1CliPhase01, OsConstantsExposeNodeLikeShapeAndCoverage) {
   EXPECT_NE(result.stdout_output.find("os-constants-shape:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
+
+TEST_F(Test1CliPhase01, SpawnSyncBindingMatchesNodeOptionParsingForCoreFields) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "spawn_sync binding option-parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_spawn_sync_binding_options",
+      "const assert = require('assert');\n"
+      "const binding = process.binding('spawn_sync');\n"
+      "const base = {\n"
+      "  file: process.execPath,\n"
+      "  args: [process.execPath, '-e', ''],\n"
+      "  stdio: [],\n"
+      "};\n"
+      "let result = binding.spawn({ ...base, args: 1 });\n"
+      "assert.strictEqual(result.error, -22);\n"
+      "assert.strictEqual(result.output, null);\n"
+      "result = binding.spawn({ ...base, envPairs: 1 });\n"
+      "assert.strictEqual(result.error, -22);\n"
+      "assert.strictEqual(result.output, null);\n"
+      "result = binding.spawn({ ...base, detached: true, killSignal: 0 });\n"
+      "assert.strictEqual(result.error, undefined);\n"
+      "assert.strictEqual(result.status, 0);\n"
+      "assert.ok(Array.isArray(result.output));\n"
+      "if (typeof process.getuid === 'function') {\n"
+      "  result = binding.spawn({ ...base, uid: process.getuid() });\n"
+      "  assert.strictEqual(result.error, undefined);\n"
+      "  assert.strictEqual(result.status, 0);\n"
+      "}\n"
+      "if (typeof process.getgid === 'function') {\n"
+      "  result = binding.spawn({ ...base, gid: process.getgid() });\n"
+      "  assert.strictEqual(result.error, undefined);\n"
+      "  assert.strictEqual(result.status, 0);\n"
+      "}\n"
+      "console.log('spawn-sync-binding-options:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {script_path},
+          "ubi_phase01_cli_spawn_sync_binding_options_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("spawn-sync-binding-options:ok"), std::string::npos)
+      << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, SpawnSyncBindingBuildsNodeStyleOutputForExtraPipeFds) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "spawn_sync binding output-shape check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_spawn_sync_binding_output_shape",
+      "const assert = require('assert');\n"
+      "const binding = process.binding('spawn_sync');\n"
+      "const result = binding.spawn({\n"
+      "  file: process.execPath,\n"
+      "  args: [process.execPath, '-e', \"require('fs').writeSync(3, 'fd3-out')\"],\n"
+      "  stdio: ['ignore', 'ignore', 'ignore', 'pipe'],\n"
+      "});\n"
+      "assert.strictEqual(result.error, undefined);\n"
+      "assert.strictEqual(result.status, 0);\n"
+      "assert.ok(Array.isArray(result.output));\n"
+      "assert.strictEqual(result.output.length, 4);\n"
+      "assert.strictEqual(result.output[0], null);\n"
+      "assert.strictEqual(result.output[1], null);\n"
+      "assert.strictEqual(result.output[2], null);\n"
+      "assert.strictEqual(result.output[3].toString(), 'fd3-out');\n"
+      "console.log('spawn-sync-binding-output-shape:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {script_path},
+          "ubi_phase01_cli_spawn_sync_binding_output_shape_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("spawn-sync-binding-output-shape:ok"), std::string::npos)
+      << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, CliResolvesEntryWithoutJsExtensionLikeNode) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "entry resolution check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_entry_noext",
+      "console.log('entry-noext-ok');\n");
+  ASSERT_GE(script_path.size(), 3u);
+  const std::string extensionless = script_path.substr(0, script_path.size() - 3);
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {extensionless},
+          "ubi_phase01_cli_entry_noext_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("entry-noext-ok"), std::string::npos) << result.stdout_output;
+#endif
+}

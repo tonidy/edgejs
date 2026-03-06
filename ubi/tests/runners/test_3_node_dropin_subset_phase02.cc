@@ -2439,7 +2439,11 @@ DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_closeFromNo
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_closed_channel_segfaultFromNodeTest, "parallel/test-child-process-fork-closed-channel-segfault.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_detachedFromNodeTest, "parallel/test-child-process-fork-detached.js")
 TEST_F(Test3NodeDropinSubsetPhase02, RawExpandedChildProcess_test_child_process_fork_dgramFromNodeTest) {
-  GTEST_SKIP() << "Raw child-process fork dgram passes standalone but can leak an orphan child under ctest.";
+  std::string error;
+  const int exit_code =
+      RunRawNodeTestScriptInSubprocess("parallel/test-child-process-fork-dgram.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
 }
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_exec_argvFromNodeTest, "parallel/test-child-process-fork-exec-argv.js")
 DEFINE_RAW_NODE_TEST(RawExpandedChildProcess_test_child_process_fork_exec_pathFromNodeTest, "parallel/test-child-process-fork-exec-path.js")

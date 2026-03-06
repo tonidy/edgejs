@@ -96,15 +96,31 @@ std::string ResolveCliScriptPath(const char* script_path) {
   if (script_path == nullptr || script_path[0] == '\0') {
     return "";
   }
-  std::filesystem::path direct(script_path);
-  if (direct.is_absolute() || std::filesystem::exists(direct)) {
-    return direct.string();
+  auto resolve_candidate = [](const std::filesystem::path& candidate) -> std::string {
+    static constexpr const char* kExtensions[] = {
+        "", ".js", ".json", ".node", "/index.js", "/index.json", "/index.node",
+    };
+
+    std::error_code ec;
+    for (const char* suffix : kExtensions) {
+      const std::filesystem::path resolved = candidate.string() + suffix;
+      if (std::filesystem::exists(resolved, ec) && !ec) {
+        return resolved.string();
+      }
+      ec.clear();
+    }
+    return "";
+  };
+
+  const std::filesystem::path direct(script_path);
+  if (const std::string resolved = resolve_candidate(direct); !resolved.empty()) {
+    return resolved;
   }
 
   // Allow running `./build/ubi examples/foo.js` from repo root.
   const std::filesystem::path repo_fallback = std::filesystem::path("ubi") / direct;
-  if (std::filesystem::exists(repo_fallback)) {
-    return repo_fallback.string();
+  if (const std::string resolved = resolve_candidate(repo_fallback); !resolved.empty()) {
+    return resolved;
   }
   return direct.string();
 }

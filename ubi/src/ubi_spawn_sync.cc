@@ -1,10 +1,13 @@
 #include "ubi_spawn_sync.h"
 
 #include <cerrno>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -33,17 +36,39 @@ struct SpawnOptions {
   int64_t timeout_ms = 0;
   int64_t max_buffer = 1024 * 1024;
   int32_t kill_signal = SIGTERM;
+  bool detached = false;
+  bool windows_hide = false;
+  bool windows_verbatim_arguments = false;
+  bool has_uid = false;
+  bool has_gid = false;
+  int32_t uid = 0;
+  int32_t gid = 0;
   std::vector<std::string> env_pairs;
   std::vector<StdioSpec> stdio;
 };
 
 struct SpawnSyncRunner;
 
+struct OutputChunk {
+  static constexpr unsigned int kBufferSize = 65536;
+
+  char data[kBufferSize];
+  unsigned int used = 0;
+  std::unique_ptr<OutputChunk> next;
+};
+
+enum class PipeLifecycle {
+  kUninitialized = 0,
+  kInitialized,
+  kStarted,
+  kClosing,
+  kClosed,
+};
+
 struct SyncPipe {
   SpawnSyncRunner* runner = nullptr;
   uint32_t child_fd = 0;
   uv_pipe_t pipe{};
-  bool initialized = false;
   bool readable = false;
   bool writable = false;
   bool shutdown_pending = false;
@@ -51,7 +76,9 @@ struct SyncPipe {
   uv_shutdown_t shutdown_req{};
   std::vector<uint8_t> input_storage;
   uv_buf_t input_buf{};
-  std::vector<uint8_t> output;
+  std::unique_ptr<OutputChunk> first_output;
+  OutputChunk* last_output = nullptr;
+  PipeLifecycle lifecycle = PipeLifecycle::kUninitialized;
 };
 
 struct SpawnSyncRunner {
@@ -126,6 +153,33 @@ bool GetBoolMaybe(napi_env env, napi_value obj, const char* name, bool* out) {
   napi_value value = nullptr;
   if (!GetNamedProperty(env, obj, name, &value) || value == nullptr) return false;
   return napi_get_value_bool(env, value, out) == napi_ok;
+}
+
+bool GetCoercedBoolMaybe(napi_env env, napi_value obj, const char* name, bool* out) {
+  if (out == nullptr) return false;
+  napi_value value = nullptr;
+  if (!GetNamedProperty(env, obj, name, &value) || value == nullptr || IsNullOrUndefined(env, value)) return false;
+  napi_value bool_value = nullptr;
+  if (napi_coerce_to_bool(env, value, &bool_value) != napi_ok || bool_value == nullptr) return false;
+  return napi_get_value_bool(env, bool_value, out) == napi_ok;
+}
+
+bool GetStrictInt32Maybe(napi_env env, napi_value obj, const char* name, int32_t* out) {
+  if (out == nullptr) return false;
+  napi_value value = nullptr;
+  if (!GetNamedProperty(env, obj, name, &value) || value == nullptr || IsNullOrUndefined(env, value)) return false;
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_number) return false;
+
+  double number = 0;
+  if (napi_get_value_double(env, value, &number) != napi_ok) return false;
+  if (!std::isfinite(number) || number < static_cast<double>(INT32_MIN) ||
+      number > static_cast<double>(INT32_MAX) || std::trunc(number) != number) {
+    return false;
+  }
+
+  return napi_get_value_int32(env, value, out) == napi_ok;
 }
 
 void SetDefaultStdioSpec(uint32_t child_fd, StdioSpec* spec) {
@@ -377,7 +431,8 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
   napi_value args_val = nullptr;
   bool has_args = GetNamedProperty(env, value, "args", &args_val);
   bool is_array = false;
-  if (has_args && napi_is_array(env, args_val, &is_array) == napi_ok && is_array) {
+  if (has_args) {
+    if (napi_is_array(env, args_val, &is_array) != napi_ok || !is_array) return false;
     uint32_t len = 0;
     if (napi_get_array_length(env, args_val, &len) == napi_ok) {
       out->args.reserve(static_cast<size_t>(len));
@@ -396,10 +451,7 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
 
   napi_value cwd_val = nullptr;
   if (GetNamedProperty(env, value, "cwd", &cwd_val)) {
-    napi_valuetype cwd_t = napi_undefined;
-    if (napi_typeof(env, cwd_val, &cwd_t) == napi_ok && cwd_t == napi_string) {
-      out->cwd = ValueToUtf8(env, cwd_val);
-    }
+    if (!IsNullOrUndefined(env, cwd_val) && !CoerceValueToUtf8(env, cwd_val, &out->cwd)) return false;
   }
 
   napi_value timeout_val = nullptr;
@@ -432,7 +484,8 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
   napi_value env_pairs_val = nullptr;
   bool has_env_pairs = GetNamedProperty(env, value, "envPairs", &env_pairs_val);
   bool env_is_array = false;
-  if (has_env_pairs && napi_is_array(env, env_pairs_val, &env_is_array) == napi_ok && env_is_array) {
+  if (has_env_pairs && !IsNullOrUndefined(env, env_pairs_val)) {
+    if (napi_is_array(env, env_pairs_val, &env_is_array) != napi_ok || !env_is_array) return false;
     uint32_t len = 0;
     if (napi_get_array_length(env, env_pairs_val, &len) == napi_ok) {
       out->env_pairs.reserve(static_cast<size_t>(len));
@@ -453,10 +506,26 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
     if (ks_t != napi_undefined && ks_t != napi_null) {
       if (ks_t != napi_number) return false;
       int32_t ks = SIGTERM;
-      if (napi_get_value_int32(env, kill_signal_val, &ks) == napi_ok && ks > 0) {
+      if (napi_get_value_int32(env, kill_signal_val, &ks) == napi_ok) {
         out->kill_signal = ks;
       }
     }
+  }
+
+  (void)GetCoercedBoolMaybe(env, value, "detached", &out->detached);
+  (void)GetCoercedBoolMaybe(env, value, "windowsHide", &out->windows_hide);
+  (void)GetCoercedBoolMaybe(env, value, "windowsVerbatimArguments", &out->windows_verbatim_arguments);
+
+  out->has_uid = GetStrictInt32Maybe(env, value, "uid", &out->uid);
+  if (!out->has_uid) {
+    napi_value uid_val = nullptr;
+    if (GetNamedProperty(env, value, "uid", &uid_val) && !IsNullOrUndefined(env, uid_val)) return false;
+  }
+
+  out->has_gid = GetStrictInt32Maybe(env, value, "gid", &out->gid);
+  if (!out->has_gid) {
+    napi_value gid_val = nullptr;
+    if (GetNamedProperty(env, value, "gid", &gid_val) && !IsNullOrUndefined(env, gid_val)) return false;
   }
 
   out->stdio.resize(3);
@@ -563,6 +632,43 @@ void SetPipeErrorIfUnset(SpawnSyncRunner* runner, int error) {
   if (runner->pipe_error == 0) runner->pipe_error = error;
 }
 
+OutputChunk* EnsureOutputChunk(SyncPipe* pipe) {
+  if (pipe == nullptr) return nullptr;
+  if (pipe->last_output != nullptr && pipe->last_output->used < OutputChunk::kBufferSize) {
+    return pipe->last_output;
+  }
+
+  std::unique_ptr<OutputChunk> chunk(new (std::nothrow) OutputChunk());
+  if (!chunk) return nullptr;
+
+  OutputChunk* raw = chunk.get();
+  if (!pipe->first_output) {
+    pipe->first_output = std::move(chunk);
+  } else {
+    pipe->last_output->next = std::move(chunk);
+  }
+  pipe->last_output = raw;
+  return raw;
+}
+
+size_t GetPipeOutputLength(const SyncPipe& pipe) {
+  size_t length = 0;
+  for (const OutputChunk* chunk = pipe.first_output.get(); chunk != nullptr; chunk = chunk->next.get()) {
+    length += chunk->used;
+  }
+  return length;
+}
+
+void CopyPipeOutput(const SyncPipe& pipe, uint8_t* dest) {
+  if (dest == nullptr) return;
+  size_t offset = 0;
+  for (const OutputChunk* chunk = pipe.first_output.get(); chunk != nullptr; chunk = chunk->next.get()) {
+    if (chunk->used == 0) continue;
+    std::memcpy(dest + offset, chunk->data, chunk->used);
+    offset += chunk->used;
+  }
+}
+
 void CloseHandleIfNeeded(uv_handle_t* handle) {
   if (handle == nullptr) return;
   if (!uv_is_closing(handle)) uv_close(handle, UvCloseNoop);
@@ -573,9 +679,21 @@ void WalkAndCloseHandle(uv_handle_t* handle, void* /*arg*/) {
   if (!uv_is_closing(handle)) uv_close(handle, UvCloseNoop);
 }
 
+void OnPipeClosed(uv_handle_t* handle) {
+  if (handle == nullptr) return;
+  auto* pipe = static_cast<SyncPipe*>(handle->data);
+  if (pipe == nullptr) return;
+  pipe->lifecycle = PipeLifecycle::kClosed;
+}
+
 void ClosePipeIfNeeded(SyncPipe* pipe) {
-  if (pipe == nullptr || !pipe->initialized) return;
-  CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&pipe->pipe));
+  if (pipe == nullptr) return;
+  if (pipe->lifecycle != PipeLifecycle::kInitialized && pipe->lifecycle != PipeLifecycle::kStarted) return;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&pipe->pipe);
+  if (!uv_is_closing(handle)) {
+    uv_close(handle, OnPipeClosed);
+    pipe->lifecycle = PipeLifecycle::kClosing;
+  }
 }
 
 void CloseAllPipes(SpawnSyncRunner* runner) {
@@ -587,7 +705,10 @@ void CloseAllPipes(SpawnSyncRunner* runner) {
 
 void CloseTimerIfNeeded(SpawnSyncRunner* runner) {
   if (runner == nullptr || !runner->timer_initialized) return;
-  CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(&runner->timer));
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&runner->timer);
+  uv_ref(handle);
+  if (!uv_is_closing(handle)) uv_close(handle, UvCloseNoop);
+  runner->timer_initialized = false;
 }
 
 void KillAndClose(SpawnSyncRunner* runner) {
@@ -622,7 +743,8 @@ void PipeShutdownCallback(uv_shutdown_t* req, int status) {
 }
 
 void StartPipeShutdown(SyncPipe* pipe) {
-  if (pipe == nullptr || !pipe->initialized) return;
+  if (pipe == nullptr) return;
+  if (pipe->lifecycle != PipeLifecycle::kInitialized && pipe->lifecycle != PipeLifecycle::kStarted) return;
   uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&pipe->pipe);
   if (uv_is_closing(handle) || pipe->shutdown_pending) return;
 
@@ -651,14 +773,23 @@ void PipeWriteCallback(uv_write_t* req, int status) {
   StartPipeShutdown(pipe);
 }
 
-void AllocReadBuffer(uv_handle_t* /*handle*/, size_t suggested_size, uv_buf_t* buf) {
+void AllocReadBuffer(uv_handle_t* handle, size_t /*suggested_size*/, uv_buf_t* buf) {
   if (buf == nullptr) return;
-  char* base = static_cast<char*>(std::malloc(suggested_size));
-  if (base == nullptr) {
+  auto* pipe = handle == nullptr ? nullptr : static_cast<SyncPipe*>(handle->data);
+  if (pipe == nullptr || pipe->runner == nullptr || pipe->lifecycle != PipeLifecycle::kStarted) {
     *buf = uv_buf_init(nullptr, 0);
     return;
   }
-  *buf = uv_buf_init(base, static_cast<unsigned int>(suggested_size));
+
+  OutputChunk* chunk = EnsureOutputChunk(pipe);
+  if (chunk == nullptr) {
+    SetErrorIfUnset(pipe->runner, UV_ENOMEM);
+    KillAndClose(pipe->runner);
+    *buf = uv_buf_init(nullptr, 0);
+    return;
+  }
+
+  *buf = uv_buf_init(chunk->data + chunk->used, OutputChunk::kBufferSize - chunk->used);
 }
 
 void OnProcessExit(uv_process_t* process, int64_t exit_status, int term_signal) {
@@ -688,23 +819,20 @@ void OnPipeRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   auto* pipe = stream == nullptr ? nullptr : static_cast<SyncPipe*>(stream->data);
   auto* runner = pipe != nullptr ? pipe->runner : nullptr;
 
-  if (nread > 0 && pipe != nullptr && runner != nullptr && buf != nullptr && buf->base != nullptr) {
-    const uint8_t* begin = reinterpret_cast<const uint8_t*>(buf->base);
-    const uint8_t* end = begin + static_cast<size_t>(nread);
-    pipe->output.insert(pipe->output.end(), begin, end);
+  if (nread > 0 && pipe != nullptr && runner != nullptr && pipe->last_output != nullptr &&
+      buf != nullptr && buf->base != nullptr) {
+    pipe->last_output->used += static_cast<unsigned int>(nread);
     runner->buffered_output_size += nread;
     if (runner->max_buffer > 0 && runner->buffered_output_size > runner->max_buffer) {
       SetErrorIfUnset(runner, UV_ENOBUFS);
       KillAndClose(runner);
     }
   } else if (nread == UV_EOF) {
-    if (stream != nullptr) CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(stream));
+    ClosePipeIfNeeded(pipe);
   } else if (nread < 0) {
     if (runner != nullptr) SetPipeErrorIfUnset(runner, static_cast<int>(nread));
-    if (stream != nullptr) CloseHandleIfNeeded(reinterpret_cast<uv_handle_t*>(stream));
+    ClosePipeIfNeeded(pipe);
   }
-
-  if (buf != nullptr && buf->base != nullptr) std::free(buf->base);
 }
 
 int GetFinalError(const SpawnSyncRunner& runner) {
@@ -760,17 +888,18 @@ napi_value BuildOutputArray(napi_env env, const SpawnSyncRunner& runner) {
 
   for (uint32_t i = 0; i < runner.pipes.size(); ++i) {
     const SyncPipe& pipe = runner.pipes[i];
-    if (!pipe.initialized || !pipe.writable) {
+    if (pipe.lifecycle == PipeLifecycle::kUninitialized || !pipe.writable) {
       napi_set_element(env, output, i, null_value);
       continue;
     }
 
     napi_value buffer = nullptr;
-    napi_create_buffer_copy(env,
-                            pipe.output.size(),
-                            pipe.output.empty() ? nullptr : pipe.output.data(),
-                            nullptr,
-                            &buffer);
+    const size_t output_length = GetPipeOutputLength(pipe);
+    void* buffer_data = nullptr;
+    napi_create_buffer(env, output_length, &buffer_data, &buffer);
+    if (output_length > 0 && buffer_data != nullptr) {
+      CopyPipeOutput(pipe, static_cast<uint8_t*>(buffer_data));
+    }
     napi_set_element(env, output, i, buffer);
   }
 
@@ -823,11 +952,11 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
           SetErrorIfUnset(&runner, rc);
           break;
         }
-        pipe.initialized = true;
         pipe.readable = spec.readable;
         pipe.writable = spec.writable;
         pipe.pipe.data = &pipe;
         pipe.input_storage = spec.input;
+        pipe.lifecycle = PipeLifecycle::kInitialized;
         runner.stdio[i].flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE |
                                                              (pipe.readable ? UV_READABLE_PIPE : 0) |
                                                              (pipe.writable ? UV_WRITABLE_PIPE : 0));
@@ -858,8 +987,20 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
     uv_options.file = options.file.c_str();
     uv_options.args = exec_args.data();
     uv_options.exit_cb = OnProcessExit;
+    uv_options.flags = 0;
     if (!options.cwd.empty()) uv_options.cwd = options.cwd.c_str();
     if (!exec_env.empty()) uv_options.env = exec_env.data();
+    if (options.detached) uv_options.flags |= UV_PROCESS_DETACHED;
+    if (options.windows_hide) uv_options.flags |= UV_PROCESS_WINDOWS_HIDE;
+    if (options.windows_verbatim_arguments) uv_options.flags |= UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS;
+    if (options.has_uid) {
+      uv_options.flags |= UV_PROCESS_SETUID;
+      uv_options.uid = static_cast<uv_uid_t>(options.uid);
+    }
+    if (options.has_gid) {
+      uv_options.flags |= UV_PROCESS_SETGID;
+      uv_options.gid = static_cast<uv_gid_t>(options.gid);
+    }
     uv_options.stdio_count = static_cast<int>(runner.stdio.size());
     uv_options.stdio = runner.stdio.data();
 
@@ -874,7 +1015,8 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
 
   if (runner.process_spawned) {
     for (auto& pipe : runner.pipes) {
-      if (!pipe.initialized) continue;
+      if (pipe.lifecycle != PipeLifecycle::kInitialized) continue;
+      pipe.lifecycle = PipeLifecycle::kStarted;
 
       if (pipe.writable) {
         rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&pipe.pipe), AllocReadBuffer, OnPipeRead);
@@ -912,6 +1054,7 @@ napi_value SpawnSync(napi_env env, napi_callback_info info) {
       } else {
         runner.timer_initialized = true;
         runner.timer.data = &runner;
+        uv_unref(reinterpret_cast<uv_handle_t*>(&runner.timer));
         rc = uv_timer_start(&runner.timer, OnKillTimer, static_cast<uint64_t>(options.timeout_ms), 0);
         if (rc < 0) {
           SetErrorIfUnset(&runner, rc);
