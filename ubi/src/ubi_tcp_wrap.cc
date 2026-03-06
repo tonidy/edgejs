@@ -10,6 +10,7 @@
 #include <uv.h>
 
 #include "ubi_async_wrap.h"
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 #include "ubi_stream_base.h"
 #include "ubi_stream_listener.h"
@@ -200,7 +201,8 @@ napi_value TcpCtor(napi_env env, napi_callback_info info) {
   auto* wrap = new TcpWrap();
   wrap->env = env;
   wrap->socket_type = socket_type;
-  if (uv_tcp_init(uv_default_loop(), &wrap->handle) != 0) {
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  if (loop == nullptr || uv_tcp_init(loop, &wrap->handle) != 0) {
     delete wrap;
     return UbiStreamBaseUndefined(env);
   }

@@ -8,6 +8,7 @@
 
 // #include "ubi_async_wrap.h"
 #include "ubi_active_resource.h"
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 
 namespace {
@@ -184,7 +185,8 @@ napi_value SignalCtor(napi_env env, napi_callback_info info) {
   wrap->env = env;
   // wrap->async_id = UbiAsyncWrapNewAsyncId(env);
 
-  int rc = uv_signal_init(uv_default_loop(), &wrap->handle);
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  int rc = loop != nullptr ? uv_signal_init(loop, &wrap->handle) : UV_EINVAL;
   if (rc == 0) {
     wrap->initialized = true;
     wrap->handle.data = wrap;

@@ -18,6 +18,7 @@
 #include "internal_binding/helpers.h"
 #include "ubi_active_resource.h"
 #include "ubi_async_wrap.h"
+#include "ubi_env_loop.h"
 #include "ubi_module_loader.h"
 #include "ubi_pipe_wrap.h"
 #include "ubi_runtime.h"
@@ -648,7 +649,7 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   options.stdio_count = static_cast<int>(stdio.size());
   options.stdio = stdio.data();
 
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = UbiGetEnvLoop(env);
   if (loop == nullptr) return MakeInt32(env, UV_EINVAL);
 
   wrap->process = {};

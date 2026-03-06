@@ -20,6 +20,7 @@
 #include "cares/include/ares_dns.h"
 #include "cares/include/ares_dns_record.h"
 #include "cares/include/ares_nameser.h"
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 
 #ifndef AI_ALL
@@ -136,6 +137,7 @@ void OnCaresEnvCleanup(void* arg);
 
 void EnsureCaresCleanupHook(napi_env env) {
   if (env == nullptr) return;
+  (void)UbiEnsureEnvLoop(env, nullptr);
   auto [it, inserted] = g_cleanup_hook_registered.emplace(env);
   if (!inserted) return;
   if (napi_add_env_cleanup_hook(env, OnCaresEnvCleanup, env) != napi_ok) {
@@ -389,7 +391,8 @@ void StartChannelTimer(ChannelWrap* channel) {
   if (channel->timer_handle == nullptr) {
     auto* timer = new uv_timer_t();
     timer->data = channel;
-    if (uv_timer_init(uv_default_loop(), timer) != 0) {
+    uv_loop_t* loop = UbiGetEnvLoop(channel->env);
+    if (loop == nullptr || uv_timer_init(loop, timer) != 0) {
       delete timer;
       return;
     }
@@ -440,7 +443,8 @@ void ares_sockstate_cb(void* data, ares_socket_t sock, int read, int write) {
       task = new NodeAresTask();
       task->channel = channel;
       task->sock = sock;
-      if (uv_poll_init_socket(uv_default_loop(), &task->poll_watcher, sock) != 0) {
+      uv_loop_t* loop = UbiGetEnvLoop(channel->env);
+      if (loop == nullptr || uv_poll_init_socket(loop, &task->poll_watcher, sock) != 0) {
         delete task;
         return;
       }
@@ -1713,12 +1717,15 @@ napi_value CaresGetAddrInfo(napi_env env, napi_callback_info info) {
   hints.ai_family = (family == 4) ? AF_INET : ((family == 6) ? AF_INET6 : AF_UNSPEC);
   hints.ai_flags = hints_flags;
 
-  int rc = uv_getaddrinfo(uv_default_loop(),
-                          &req->ga,
-                          OnGetAddrInfo,
-                          req->hostname.c_str(),
-                          nullptr,
-                          &hints);
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  int rc = loop != nullptr
+               ? uv_getaddrinfo(loop,
+                                &req->ga,
+                                OnGetAddrInfo,
+                                req->hostname.c_str(),
+                                nullptr,
+                                &hints)
+               : UV_EINVAL;
   if (rc != 0) {
     UntrackPendingReq(req);
     MarkReqComplete(req);
@@ -1758,11 +1765,14 @@ napi_value CaresGetNameInfo(napi_env env, napi_callback_info info) {
   }
 
   if (rc == 0) {
-    rc = uv_getnameinfo(uv_default_loop(),
-                        &req->gn,
-                        OnGetNameInfo,
-                        reinterpret_cast<const sockaddr*>(&storage),
-                        NI_NAMEREQD);
+    uv_loop_t* loop = UbiGetEnvLoop(env);
+    rc = loop != nullptr
+             ? uv_getnameinfo(loop,
+                              &req->gn,
+                              OnGetNameInfo,
+                              reinterpret_cast<const sockaddr*>(&storage),
+                              NI_NAMEREQD)
+             : UV_EINVAL;
   }
 
   if (rc != 0) {

@@ -14,6 +14,7 @@
 #include <uv.h>
 
 #include "ubi_runtime.h"
+#include "ubi_env_loop.h"
 #include "ubi_timers_host.h"
 #include "unofficial_napi.h"
 
@@ -255,7 +256,7 @@ size_t DrainForegroundTasksFromState(PlatformTaskState* state,
 
 bool EnsureForegroundHandles(PlatformTaskState* state) {
   if (state == nullptr) return false;
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = UbiGetEnvLoop(state->env);
   if (loop == nullptr) return false;
 
   if (!state->foreground_async_initialized) {

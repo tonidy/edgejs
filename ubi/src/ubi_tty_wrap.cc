@@ -8,6 +8,7 @@
 #include <uv.h>
 
 #include "ubi_async_wrap.h"
+#include "ubi_env_loop.h"
 #include "ubi_stream_base.h"
 
 namespace {
@@ -137,7 +138,8 @@ napi_value TtyCtor(napi_env env, napi_callback_info info) {
   UbiStreamBaseInit(&wrap->base, env, &kTtyOps, kUbiProviderTtyWrap);
 
   if (fd >= 0) {
-    wrap->init_err = uv_tty_init(uv_default_loop(), &wrap->handle, fd, 0);
+    uv_loop_t* loop = UbiGetEnvLoop(env);
+    wrap->init_err = loop != nullptr ? uv_tty_init(loop, &wrap->handle, fd, 0) : UV_EINVAL;
   } else {
     wrap->init_err = UV_EINVAL;
   }

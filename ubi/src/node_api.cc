@@ -1,5 +1,6 @@
 #include "node_api.h"
 #include "node_api_types.h"
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 
 #include <atomic>
@@ -47,6 +48,8 @@ namespace {
 struct UbiEnvState {
   std::vector<napi_async_cleanup_hook_handle> async_cleanup_hooks;
   bool async_cleanup_hook_registered = false;
+  uv_loop_t* loop = nullptr;
+  bool loop_cleanup_hook_registered = false;
 };
 
 std::unordered_map<napi_env, UbiEnvState> g_ubi_env_state;
@@ -63,6 +66,62 @@ UbiEnvState* GetEnvState(napi_env env) {
   auto it = g_ubi_env_state.find(env);
   if (it == g_ubi_env_state.end()) return nullptr;
   return &it->second;
+}
+
+void MaybeEraseEnvState(napi_env env) {
+  auto it = g_ubi_env_state.find(env);
+  if (it == g_ubi_env_state.end()) return;
+  const UbiEnvState& state = it->second;
+  if (!state.async_cleanup_hook_registered &&
+      state.async_cleanup_hooks.empty() &&
+      !state.loop_cleanup_hook_registered &&
+      state.loop == nullptr) {
+    g_ubi_env_state.erase(it);
+  }
+}
+
+void CloseEnvLoopHandles(uv_loop_t* loop) {
+  if (loop == nullptr) return;
+  uv_walk(
+      loop,
+      [](uv_handle_t* handle, void*) {
+        if (handle == nullptr || uv_is_closing(handle) != 0) return;
+        uv_close(handle, nullptr);
+      },
+      nullptr);
+}
+
+void DrainAndCloseEnvLoop(uv_loop_t* loop) {
+  if (loop == nullptr) return;
+  CloseEnvLoopHandles(loop);
+  for (size_t guard = 0; guard < 1024; ++guard) {
+    if (uv_run(loop, UV_RUN_NOWAIT) == 0) {
+      if (uv_loop_close(loop) == 0) return;
+    }
+    CloseEnvLoopHandles(loop);
+  }
+
+  CloseEnvLoopHandles(loop);
+  while (uv_run(loop, UV_RUN_NOWAIT) != 0) {
+    CloseEnvLoopHandles(loop);
+  }
+  (void)uv_loop_close(loop);
+}
+
+void CleanupEnvLoopOnTeardown(void* arg) {
+  auto* env = static_cast<napi_env>(arg);
+  if (!CheckEnv(env)) return;
+  auto* state = GetEnvState(env);
+  if (state == nullptr) return;
+
+  uv_loop_t* loop = state->loop;
+  state->loop = nullptr;
+  state->loop_cleanup_hook_registered = false;
+  if (loop != nullptr) {
+    DrainAndCloseEnvLoop(loop);
+    delete loop;
+  }
+  MaybeEraseEnvState(env);
 }
 
 void RunAsyncCleanupHooksOnEnvTeardown(void* arg) {
@@ -108,8 +167,11 @@ void napi_v8_run_async_cleanup_hooks(napi_env env) {
 
   // Drive libuv callbacks queued by async cleanup hooks until hooks are removed.
   size_t guard = 0;
+  uv_loop_t* loop = UbiGetExistingEnvLoop(env);
   while (!state->async_cleanup_hooks.empty() && guard++ < 128) {
-    uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+    if (loop != nullptr) {
+      uv_run(loop, UV_RUN_DEFAULT);
+    }
     bool any_left = false;
     for (auto* handle : state->async_cleanup_hooks) {
       if (handle != nullptr && !handle->removed) {
@@ -123,7 +185,9 @@ void napi_v8_run_async_cleanup_hooks(napi_env env) {
   for (auto* handle : state->async_cleanup_hooks) {
     delete handle;
   }
-  g_ubi_env_state.erase(env);
+  state->async_cleanup_hooks.clear();
+  state->async_cleanup_hook_registered = false;
+  MaybeEraseEnvState(env);
 }
 
 extern "C" {
@@ -204,7 +268,9 @@ napi_status NAPI_CDECL napi_queue_async_work(node_api_basic_env env, napi_async_
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || work == nullptr) return napi_invalid_arg;
   if (work->queued) return napi_generic_failure;
-  int rc = uv_queue_work(uv_default_loop(), &work->req, UvExecute, UvAfterWork);
+  uv_loop_t* loop = UbiGetEnvLoop(napiEnv);
+  if (loop == nullptr) return napi_generic_failure;
+  int rc = uv_queue_work(loop, &work->req, UvExecute, UvAfterWork);
   if (rc != 0) return napi_generic_failure;
   work->queued = true;
   return napi_ok;
@@ -298,6 +364,7 @@ napi_status NAPI_CDECL napi_add_async_cleanup_hook(
     napi_async_cleanup_hook_handle* remove_handle) {
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || hook == nullptr) return napi_invalid_arg;
+  (void)UbiEnsureEnvLoop(napiEnv, nullptr);
   auto& state = GetOrCreateEnvState(napiEnv);
   if (!state.async_cleanup_hook_registered) {
     napi_status status =
@@ -336,16 +403,14 @@ napi_status NAPI_CDECL napi_remove_async_cleanup_hook(
   delete remove_handle;
   if (hooks.empty() && state->async_cleanup_hook_registered) {
     napi_remove_env_cleanup_hook(env, RunAsyncCleanupHooksOnEnvTeardown, env);
-    g_ubi_env_state.erase(env);
+    state->async_cleanup_hook_registered = false;
+    MaybeEraseEnvState(env);
   }
   return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_get_uv_event_loop(node_api_basic_env env, uv_loop_t** loop) {
-  auto* napiEnv = const_cast<napi_env>(env);
-  if (!CheckEnv(napiEnv) || loop == nullptr) return napi_invalid_arg;
-  *loop = uv_default_loop();
-  return napi_ok;
+  return UbiEnsureEnvLoop(const_cast<napi_env>(env), loop);
 }
 
 napi_status NAPI_CDECL napi_make_callback(napi_env env,
@@ -381,3 +446,36 @@ napi_status NAPI_CDECL napi_close_callback_scope(napi_env env, napi_callback_sco
 }
 
 }  // extern "C"
+
+napi_status UbiEnsureEnvLoop(napi_env env, uv_loop_t** loop_out) {
+  if (!CheckEnv(env)) return napi_invalid_arg;
+  auto& state = GetOrCreateEnvState(env);
+  if (!state.loop_cleanup_hook_registered) {
+    if (napi_add_env_cleanup_hook(env, CleanupEnvLoopOnTeardown, env) != napi_ok) {
+      return napi_generic_failure;
+    }
+    state.loop_cleanup_hook_registered = true;
+  }
+  if (state.loop == nullptr) {
+    auto* loop = new (std::nothrow) uv_loop_t();
+    if (loop == nullptr) return napi_generic_failure;
+    if (uv_loop_init(loop) != 0) {
+      delete loop;
+      return napi_generic_failure;
+    }
+    state.loop = loop;
+  }
+  if (loop_out != nullptr) *loop_out = state.loop;
+  return napi_ok;
+}
+
+uv_loop_t* UbiGetEnvLoop(napi_env env) {
+  uv_loop_t* loop = nullptr;
+  return UbiEnsureEnvLoop(env, &loop) == napi_ok ? loop : nullptr;
+}
+
+uv_loop_t* UbiGetExistingEnvLoop(napi_env env) {
+  if (!CheckEnv(env)) return nullptr;
+  auto* state = GetEnvState(env);
+  return state != nullptr ? state->loop : nullptr;
+}

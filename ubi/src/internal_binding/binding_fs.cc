@@ -10,6 +10,7 @@
 #include <uv.h>
 
 #include "internal_binding/helpers.h"
+#include "../ubi_env_loop.h"
 #include "../ubi_module_loader.h"
 #include "../ubi_path.h"
 #include "ubi_active_resource.h"
@@ -1102,7 +1103,9 @@ napi_value FileHandleClose(napi_env env, napi_callback_info info) {
   close_req->req.data = close_req;
   HoldFileHandleRef(wrap);
 
-  const int rc = uv_fs_close(uv_default_loop(), &close_req->req, wrap->fd, AfterFileHandleClose);
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  const int rc = loop != nullptr ? uv_fs_close(loop, &close_req->req, wrap->fd, AfterFileHandleClose)
+                                 : UV_EINVAL;
   if (rc < 0) {
     FinishFileHandleClose(close_req, rc);
   }
@@ -1357,7 +1360,8 @@ napi_value StatWatcherStart(napi_env env, napi_callback_info info) {
   uint32_t interval = 0;
   if (napi_get_value_uint32(env, argv[1], &interval) != napi_ok) return MakeInt32(env, UV_EINVAL);
 
-  int rc = uv_fs_poll_init(uv_default_loop(), &wrap->handle);
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  int rc = loop != nullptr ? uv_fs_poll_init(loop, &wrap->handle) : UV_EINVAL;
   if (rc != 0) return MakeInt32(env, rc);
 
   wrap->handle.data = wrap;
@@ -2088,13 +2092,16 @@ napi_value FsWriteBuffer(napi_env env, napi_callback_info info) {
       if (ExtractByteSpanForAsyncIo(env, argc >= 2 ? argv[1] : nullptr, offset, length, &hold_value, &async_req->bufs[0]) &&
           hold_value != nullptr &&
           napi_create_reference(env, hold_value, 1, &async_req->hold_refs[0]) == napi_ok) {
-        const int rc = uv_fs_write(uv_default_loop(),
-                                   &async_req->req,
-                                   fd,
-                                   async_req->bufs,
-                                   1,
-                                   position,
-                                   AfterAsyncFsReq);
+        uv_loop_t* loop = UbiGetEnvLoop(env);
+        const int rc = loop != nullptr
+                           ? uv_fs_write(loop,
+                                         &async_req->req,
+                                         fd,
+                                         async_req->bufs,
+                                         1,
+                                         position,
+                                         AfterAsyncFsReq)
+                           : UV_EINVAL;
         if (rc < 0) FinishAsyncFsReq(async_req, rc);
         return req_kind == ReqKind::kPromise ? promise : Undefined(env);
       }
@@ -2156,13 +2163,16 @@ napi_value FsWriteString(napi_env env, napi_callback_info info) {
       if (ExtractByteSpanForAsyncIo(env, buffer, 0, byte_length, &hold_value, &async_req->bufs[0]) &&
           hold_value != nullptr &&
           napi_create_reference(env, hold_value, 1, &async_req->hold_refs[0]) == napi_ok) {
-        const int rc = uv_fs_write(uv_default_loop(),
-                                   &async_req->req,
-                                   fd,
-                                   async_req->bufs,
-                                   1,
-                                   position,
-                                   AfterAsyncFsReq);
+        uv_loop_t* loop = UbiGetEnvLoop(env);
+        const int rc = loop != nullptr
+                           ? uv_fs_write(loop,
+                                         &async_req->req,
+                                         fd,
+                                         async_req->bufs,
+                                         1,
+                                         position,
+                                         AfterAsyncFsReq)
+                           : UV_EINVAL;
         if (rc < 0) FinishAsyncFsReq(async_req, rc);
         return req_kind == ReqKind::kPromise ? promise : Undefined(env);
       }
@@ -2256,13 +2266,16 @@ napi_value FsWriteBuffers(napi_env env, napi_callback_info info) {
       }
 
       if (ok) {
-        const int rc = uv_fs_write(uv_default_loop(),
-                                   &async_req->req,
-                                   fd,
-                                   async_req->bufs,
-                                   len,
-                                   position,
-                                   AfterAsyncFsReq);
+        uv_loop_t* loop = UbiGetEnvLoop(env);
+        const int rc = loop != nullptr
+                           ? uv_fs_write(loop,
+                                         &async_req->req,
+                                         fd,
+                                         async_req->bufs,
+                                         len,
+                                         position,
+                                         AfterAsyncFsReq)
+                           : UV_EINVAL;
         if (rc < 0) FinishAsyncFsReq(async_req, rc);
         return req_kind == ReqKind::kPromise ? promise : Undefined(env);
       }
@@ -2337,12 +2350,15 @@ napi_value FsOpenFileHandle(napi_env env, napi_callback_info info) {
       async_req->syscall = "open";
       async_req->result_kind = AsyncFsResultKind::kFileHandle;
       async_req->path_storage = std::move(path);
-      const int rc = uv_fs_open(uv_default_loop(),
-                                &async_req->req,
-                                async_req->path_storage.c_str(),
-                                flags,
-                                mode,
-                                AfterAsyncFsReq);
+      uv_loop_t* loop = UbiGetEnvLoop(env);
+      const int rc = loop != nullptr
+                         ? uv_fs_open(loop,
+                                      &async_req->req,
+                                      async_req->path_storage.c_str(),
+                                      flags,
+                                      mode,
+                                      AfterAsyncFsReq)
+                         : UV_EINVAL;
       if (rc < 0) FinishAsyncFsReq(async_req, rc);
       return req_kind == ReqKind::kPromise ? promise : Undefined(env);
     }

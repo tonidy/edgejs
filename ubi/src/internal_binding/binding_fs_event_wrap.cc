@@ -7,6 +7,7 @@
 #include <uv.h>
 
 #include "internal_binding/helpers.h"
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 
 namespace internal_binding {
@@ -237,7 +238,8 @@ napi_value FsEventStart(napi_env env, napi_callback_info info) {
   int flags = 0;
   if (recursive) flags |= UV_FS_EVENT_RECURSIVE;
 
-  int rc = uv_fs_event_init(uv_default_loop(), &wrap->handle);
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  int rc = loop != nullptr ? uv_fs_event_init(loop, &wrap->handle) : UV_EINVAL;
   if (rc != 0) return MakeInt32(env, rc);
 
   wrap->handle.data = wrap;

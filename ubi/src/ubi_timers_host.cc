@@ -10,6 +10,7 @@
 
 #include <uv.h>
 
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 #include "ubi_runtime_platform.h"
 
@@ -61,8 +62,13 @@ void DebugLog(const char* fmt, ...) {
   std::fprintf(stderr, "\n");
 }
 
-void StopLoopOnJsError() {
-  uv_loop_t* loop = uv_default_loop();
+uv_loop_t* GetLoop(TimersHostState* st) {
+  if (st == nullptr || st->env == nullptr) return nullptr;
+  return UbiGetEnvLoop(st->env);
+}
+
+void StopLoopOnJsError(TimersHostState* st) {
+  uv_loop_t* loop = GetLoop(st);
   if (loop != nullptr) uv_stop(loop);
 }
 
@@ -78,7 +84,7 @@ TimersHostState* GetState(napi_env env) {
 }
 
 double GetNowMs(TimersHostState* st) {
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = GetLoop(st);
   if (loop == nullptr || st == nullptr) return 0;
   uv_update_time(loop);
   const double now = static_cast<double>(uv_now(loop));
@@ -156,6 +162,7 @@ void OnTimersEnvCleanup(void* arg) {
 
 void EnsureTimersCleanupHook(napi_env env) {
   if (env == nullptr) return;
+  (void)UbiEnsureEnvLoop(env, nullptr);
   auto [it, inserted] = g_timers_cleanup_hook_registered.emplace(env);
   if (!inserted) return;
   if (napi_add_env_cleanup_hook(env, OnTimersEnvCleanup, env) != napi_ok) {
@@ -215,7 +222,7 @@ bool HasRefedNativeImmediateTasks(const TimersHostState* st) {
 
 void EnsureTimerHandle(TimersHostState* st) {
   if (st == nullptr || st->timer_initialized) return;
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = GetLoop(st);
   if (loop == nullptr) return;
   if (uv_timer_init(loop, &st->timer_handle) == 0) {
     st->timer_handle.data = st;
@@ -226,7 +233,7 @@ void EnsureTimerHandle(TimersHostState* st) {
 
 void EnsureCheckHandle(TimersHostState* st) {
   if (st == nullptr || st->check_initialized) return;
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = GetLoop(st);
   if (loop == nullptr) return;
   if (uv_check_init(loop, &st->check_handle) != 0) return;
   st->check_handle.data = st;
@@ -250,7 +257,7 @@ void EnsureCheckHandle(TimersHostState* st) {
                          }
                          bool pending = false;
                          if (napi_is_exception_pending(state->env, &pending) == napi_ok && pending) {
-                           StopLoopOnJsError();
+                           StopLoopOnJsError(state);
                            return;
                          }
                          if (ImmediateCount(state) == 0) {
@@ -275,7 +282,7 @@ void EnsureCheckHandle(TimersHostState* st) {
 
 void EnsureIdleHandle(TimersHostState* st) {
   if (st == nullptr || st->idle_initialized) return;
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = GetLoop(st);
   if (loop == nullptr) return;
   if (uv_idle_init(loop, &st->idle_handle) == 0) {
     st->idle_handle.data = st;
@@ -300,7 +307,7 @@ bool CallImmediateCallback(TimersHostState* st) {
   const napi_status status = UbiMakeCallback(st->env, global, cb, 0, nullptr, &ignored);
   if (status != napi_ok) {
     DebugLog("CallImmediateCallback JS error (status=%d), stopping loop turn", static_cast<int>(status));
-    StopLoopOnJsError();
+    StopLoopOnJsError(st);
     return false;
   }
   return true;
@@ -322,7 +329,7 @@ double CallTimersCallback(TimersHostState* st, double now) {
   const napi_status call_status = UbiMakeCallback(st->env, global, cb, 1, &now_value, &result);
   if (call_status != napi_ok || result == nullptr) {
     DebugLog("CallTimersCallback JS error (status=%d), stopping loop turn", static_cast<int>(call_status));
-    StopLoopOnJsError();
+    StopLoopOnJsError(st);
     return 0;
   }
 

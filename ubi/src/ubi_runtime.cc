@@ -33,6 +33,7 @@
 
 #include "ubi_fs.h"
 #include "ubi_buffer.h"
+#include "ubi_env_loop.h"
 #include "ubi_crypto.h"
 #include "ubi_encoding.h"
 #include "ubi_http_parser.h"
@@ -704,7 +705,7 @@ bool HasPendingEntryPointPromise(napi_env env) {
 int WaitForTopLevelPromiseToSettle(napi_env env, napi_value value, std::string* error_out) {
   if (!IsPromisePending(env, value)) return -1;
 
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = UbiGetEnvLoop(env);
   const auto start = std::chrono::steady_clock::now();
   while (IsPromisePending(env, value)) {
     if (loop != nullptr) {
@@ -747,10 +748,10 @@ int WaitForTopLevelPromiseToSettle(napi_env env, napi_value value, std::string* 
 }
 
 int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
-  uv_loop_t* loop = uv_default_loop();
+  uv_loop_t* loop = UbiGetEnvLoop(env);
   if (loop == nullptr) {
     if (error_out != nullptr) {
-      *error_out = "Missing default libuv loop";
+      *error_out = "Missing env libuv loop";
     }
     return 1;
   }

@@ -20,6 +20,7 @@
 #include "ubi_runtime.h"
 #include "ubi_active_resource.h"
 #include "ubi_async_wrap.h"
+#include "ubi_env_loop.h"
 #include "ubi_udp_listener.h"
 
 namespace {
@@ -360,8 +361,11 @@ void ThrowInvalidUdpReceiver(napi_env env) {
 
 class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
  public:
-  explicit UdpWrap(napi_env env_in) : env(env_in), async_id(UbiAsyncWrapNextId(env_in)) {
-    uv_udp_init(uv_default_loop(), &handle);
+ explicit UdpWrap(napi_env env_in) : env(env_in), async_id(UbiAsyncWrapNextId(env_in)) {
+    uv_loop_t* loop = UbiGetEnvLoop(env_in);
+    if (loop != nullptr) {
+      uv_udp_init(loop, &handle);
+    }
     handle.data = this;
     set_listener(this);
   }

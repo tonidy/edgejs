@@ -8,6 +8,7 @@
 #include <uv.h>
 
 #include "internal_binding/helpers.h"
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 
 namespace internal_binding {
@@ -396,7 +397,8 @@ napi_value DirHandleRead(napi_env env, napi_callback_info info) {
     }
     HoldDirHandleRef(wrap);
     req->req.data = req;
-    const int rc = uv_fs_readdir(uv_default_loop(), &req->req, wrap->dir, AfterReadDir);
+    uv_loop_t* loop = UbiGetEnvLoop(env);
+    const int rc = loop != nullptr ? uv_fs_readdir(loop, &req->req, wrap->dir, AfterReadDir) : UV_EINVAL;
     if (rc < 0) {
       req->req.result = rc;
       AfterReadDir(&req->req);
@@ -443,7 +445,8 @@ napi_value DirHandleClose(napi_env env, napi_callback_info info) {
     }
     HoldDirHandleRef(wrap);
     req->req.data = req;
-    const int rc = uv_fs_closedir(uv_default_loop(), &req->req, wrap->dir, AfterCloseDir);
+    uv_loop_t* loop = UbiGetEnvLoop(env);
+    const int rc = loop != nullptr ? uv_fs_closedir(loop, &req->req, wrap->dir, AfterCloseDir) : UV_EINVAL;
     wrap->dir = nullptr;
     if (rc < 0) {
       req->req.result = rc;
@@ -482,7 +485,8 @@ napi_value FsDirOpendir(napi_env env, napi_callback_info info) {
       return Undefined(env);
     }
     req->req.data = req;
-    const int rc = uv_fs_opendir(uv_default_loop(), &req->req, path.c_str(), AfterOpenDir);
+    uv_loop_t* loop = UbiGetEnvLoop(env);
+    const int rc = loop != nullptr ? uv_fs_opendir(loop, &req->req, path.c_str(), AfterOpenDir) : UV_EINVAL;
     if (rc < 0) {
       req->req.result = rc;
       AfterOpenDir(&req->req);

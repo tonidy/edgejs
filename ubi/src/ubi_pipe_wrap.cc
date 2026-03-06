@@ -8,6 +8,7 @@
 #include <uv.h>
 
 #include "ubi_async_wrap.h"
+#include "ubi_env_loop.h"
 #include "ubi_runtime.h"
 #include "ubi_stream_base.h"
 #include "ubi_stream_listener.h"
@@ -179,7 +180,8 @@ napi_value PipeCtor(napi_env env, napi_callback_info info) {
   wrap->env = env;
   wrap->socket_type = socket_type;
   wrap->ipc = socket_type == kPipeIPC;
-  if (uv_pipe_init(uv_default_loop(), &wrap->handle, wrap->ipc ? 1 : 0) != 0) {
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  if (loop == nullptr || uv_pipe_init(loop, &wrap->handle, wrap->ipc ? 1 : 0) != 0) {
     delete wrap;
     return UbiStreamBaseUndefined(env);
   }
