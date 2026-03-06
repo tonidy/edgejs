@@ -15,7 +15,6 @@
 #include <libplatform/libplatform.h>
 
 #include "internal/napi_v8_env.h"
-#include "internal/unofficial_napi_bridge.h"
 #include "ubi_v8_platform.h"
 
 namespace {
@@ -620,9 +619,18 @@ extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
     napi_env env,
-    unofficial_napi_enqueue_foreground_task_callback callback) {
+    unofficial_napi_enqueue_foreground_task_callback callback,
+    void* target) {
   if (env == nullptr) return napi_invalid_arg;
   env->enqueue_foreground_task_callback = callback;
+  env->enqueue_foreground_task_target = target;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    if (g_runtime.platform != nullptr &&
+        !g_runtime.platform->BindForegroundTaskTarget(env->isolate, env, callback, target)) {
+      return napi_generic_failure;
+    }
+  }
   return napi_ok;
 }
 
@@ -644,6 +652,9 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
+    if (g_runtime.platform != nullptr) {
+      g_runtime.platform->ClearForegroundTaskTarget(env->isolate, env);
+    }
     auto env_it = g_env_by_isolate.find(env->isolate);
     if (env_it != g_env_by_isolate.end() && env_it->second == env) {
       g_env_by_isolate.erase(env_it);
@@ -1100,18 +1111,3 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
 }
 
 }  // extern "C"
-
-bool NapiV8LookupForegroundTaskTarget(
-    v8::Isolate* isolate,
-    napi_env* env_out,
-    unofficial_napi_enqueue_foreground_task_callback* callback_out) {
-  if (env_out != nullptr) *env_out = nullptr;
-  if (callback_out != nullptr) *callback_out = nullptr;
-  if (isolate == nullptr) return false;
-  std::lock_guard<std::mutex> lock(g_runtime_mu);
-  const auto it = g_env_by_isolate.find(isolate);
-  if (it == g_env_by_isolate.end() || it->second == nullptr) return false;
-  if (env_out != nullptr) *env_out = it->second;
-  if (callback_out != nullptr) *callback_out = it->second->enqueue_foreground_task_callback;
-  return true;
-}

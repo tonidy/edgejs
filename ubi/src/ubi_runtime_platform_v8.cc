@@ -1,10 +1,13 @@
 #include "ubi_runtime_platform.h"
 
+#include <cassert>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -41,6 +44,7 @@ struct DelayedPlatformTaskCompare {
 struct PlatformTaskState {
   napi_env env_key = nullptr;
   napi_env env = nullptr;
+  std::thread::id owning_thread;
   std::mutex foreground_mutex;
 
   std::deque<PlatformTask> immediate_tasks;
@@ -53,22 +57,38 @@ struct PlatformTaskState {
                       DelayedPlatformTaskCompare> delayed_foreground_tasks;
   uint64_t next_foreground_seq = 0;
   bool draining_foreground = false;
+  bool foreground_async_pending = false;
 
   uv_async_t foreground_async{};
   uv_timer_t foreground_timer{};
   bool foreground_async_initialized = false;
   bool foreground_timer_initialized = false;
+  bool foreground_timer_armed = false;
+  Clock::time_point foreground_timer_due{};
 
-  bool cleanup_started = false;
+  std::atomic<bool> cleanup_started {false};
   uint32_t pending_handle_closes = 0;
 };
 
 std::unordered_map<napi_env, std::unique_ptr<PlatformTaskState>> g_platform_states;
 std::unordered_set<napi_env> g_platform_cleanup_hook_registered;
 
+size_t DrainForegroundTasksFromState(PlatformTaskState* state,
+                                     bool run_checkpoint,
+                                     bool clear_async_pending,
+                                     napi_status* status_out,
+                                     size_t* ran_out);
+
 PlatformTaskState* GetState(napi_env env) {
   auto it = g_platform_states.find(env);
   return it == g_platform_states.end() ? nullptr : it->second.get();
+}
+
+void AssertOwningThread(const PlatformTaskState* state, const char* where) {
+  if (state == nullptr) return;
+  assert(state->owning_thread == std::this_thread::get_id() &&
+         "immediate/platform task APIs must run on the owning JS thread");
+  (void)where;
 }
 
 void CleanupTask(napi_env env, PlatformTask* task) {
@@ -84,7 +104,10 @@ bool HasPendingException(napi_env env) {
 }
 
 void MaybeDestroyState(PlatformTaskState* state) {
-  if (state == nullptr || !state->cleanup_started || state->pending_handle_closes != 0) return;
+  if (state == nullptr || !state->cleanup_started.load(std::memory_order_acquire) ||
+      state->pending_handle_closes != 0) {
+    return;
+  }
   g_platform_states.erase(state->env_key);
 }
 
@@ -128,10 +151,16 @@ void RefreshForegroundTimerLocked(PlatformTaskState* state) {
 
   if (state->delayed_foreground_tasks.empty()) {
     uv_timer_stop(&state->foreground_timer);
+    state->foreground_timer_armed = false;
     return;
   }
 
-  Clock::duration remaining = state->delayed_foreground_tasks.top().due - Clock::now();
+  const Clock::time_point due = state->delayed_foreground_tasks.top().due;
+  if (state->foreground_timer_armed && due == state->foreground_timer_due) {
+    return;
+  }
+
+  Clock::duration remaining = due - Clock::now();
   if (remaining < Clock::duration::zero()) {
     remaining = Clock::duration::zero();
   }
@@ -140,34 +169,88 @@ void RefreshForegroundTimerLocked(PlatformTaskState* state) {
   uv_timer_start(&state->foreground_timer,
                  [](uv_timer_t* handle) {
                    auto* state = static_cast<PlatformTaskState*>(handle->data);
-                   if (state == nullptr || state->cleanup_started) return;
-                   std::deque<PlatformTask> batch;
-                   {
-                     std::lock_guard<std::mutex> lock(state->foreground_mutex);
-                     MoveDueForegroundTasksLocked(state);
-                     RefreshForegroundTimerLocked(state);
-                     batch.swap(state->foreground_tasks);
+                   if (state == nullptr ||
+                       state->cleanup_started.load(std::memory_order_acquire)) {
+                     return;
                    }
-                   while (!batch.empty()) {
-                     PlatformTask task = std::move(batch.front());
-                     batch.pop_front();
-                     if (task.callback == nullptr) {
-                       CleanupTask(state->env, &task);
-                       continue;
-                     }
-                     task.callback(state->env, task.data);
-                     CleanupTask(state->env, &task);
-                     if (HasPendingException(state->env)) {
-                       bool handled = false;
-                       (void)UbiHandlePendingExceptionNow(state->env, &handled);
-                       if (HasPendingException(state->env)) {
-                         break;
-                       }
-                     }
-                   }
+                   napi_status ignored = napi_ok;
+                   (void)DrainForegroundTasksFromState(state, false, false, &ignored, nullptr);
                  },
                  static_cast<uint64_t>(delay_ms),
                  0);
+  state->foreground_timer_due = due;
+  state->foreground_timer_armed = true;
+}
+
+size_t DrainForegroundTasksFromState(PlatformTaskState* state,
+                                     bool run_checkpoint,
+                                     bool clear_async_pending,
+                                     napi_status* status_out,
+                                     size_t* ran_out) {
+  if (status_out != nullptr) *status_out = napi_ok;
+  if (ran_out != nullptr) *ran_out = 0;
+  if (state == nullptr ||
+      state->cleanup_started.load(std::memory_order_acquire) ||
+      state->draining_foreground) {
+    return 0;
+  }
+  AssertOwningThread(state, "DrainForegroundTasksFromState");
+
+  size_t ran = 0;
+  state->draining_foreground = true;
+
+  if (clear_async_pending) {
+    std::lock_guard<std::mutex> lock(state->foreground_mutex);
+    state->foreground_async_pending = false;
+  }
+
+  for (;;) {
+    std::deque<PlatformTask> batch;
+    {
+      std::lock_guard<std::mutex> lock(state->foreground_mutex);
+      MoveDueForegroundTasksLocked(state);
+      RefreshForegroundTimerLocked(state);
+      batch.swap(state->foreground_tasks);
+    }
+    if (batch.empty()) break;
+
+    while (!batch.empty()) {
+      PlatformTask task = std::move(batch.front());
+      batch.pop_front();
+      if (task.callback == nullptr) {
+        CleanupTask(state->env, &task);
+        continue;
+      }
+      task.callback(state->env, task.data);
+      ++ran;
+      CleanupTask(state->env, &task);
+
+      if (HasPendingException(state->env)) {
+        bool handled = false;
+        (void)UbiHandlePendingExceptionNow(state->env, &handled);
+        if (HasPendingException(state->env)) {
+          state->draining_foreground = false;
+          if (status_out != nullptr) *status_out = napi_pending_exception;
+          if (ran_out != nullptr) *ran_out = ran;
+          return ran;
+        }
+      }
+    }
+
+    if (run_checkpoint) {
+      napi_status checkpoint_status = UbiRunCallbackScopeCheckpoint(state->env);
+      if (checkpoint_status != napi_ok) {
+        state->draining_foreground = false;
+        if (status_out != nullptr) *status_out = checkpoint_status;
+        if (ran_out != nullptr) *ran_out = ran;
+        return ran;
+      }
+    }
+  }
+
+  state->draining_foreground = false;
+  if (ran_out != nullptr) *ran_out = ran;
+  return ran;
 }
 
 bool EnsureForegroundHandles(PlatformTaskState* state) {
@@ -181,39 +264,13 @@ bool EnsureForegroundHandles(PlatformTaskState* state) {
                       &state->foreground_async,
                       [](uv_async_t* handle) {
                         auto* state = static_cast<PlatformTaskState*>(handle->data);
-                        if (state == nullptr || state->cleanup_started || state->draining_foreground) return;
-
-                        state->draining_foreground = true;
-                        for (;;) {
-                          std::deque<PlatformTask> batch;
-                          {
-                            std::lock_guard<std::mutex> lock(state->foreground_mutex);
-                            MoveDueForegroundTasksLocked(state);
-                            RefreshForegroundTimerLocked(state);
-                            batch.swap(state->foreground_tasks);
-                          }
-                          if (batch.empty()) break;
-
-                          while (!batch.empty()) {
-                            PlatformTask task = std::move(batch.front());
-                            batch.pop_front();
-                            if (task.callback == nullptr) {
-                              CleanupTask(state->env, &task);
-                              continue;
-                            }
-                            task.callback(state->env, task.data);
-                            CleanupTask(state->env, &task);
-                            if (HasPendingException(state->env)) {
-                              bool handled = false;
-                              (void)UbiHandlePendingExceptionNow(state->env, &handled);
-                              if (HasPendingException(state->env)) {
-                                state->draining_foreground = false;
-                                return;
-                              }
-                            }
-                          }
+                        if (state == nullptr ||
+                            state->cleanup_started.load(std::memory_order_acquire) ||
+                            state->draining_foreground) {
+                          return;
                         }
-                        state->draining_foreground = false;
+                        napi_status ignored = napi_ok;
+                        (void)DrainForegroundTasksFromState(state, false, true, &ignored, nullptr);
                       }) != 0) {
       return false;
     }
@@ -233,28 +290,29 @@ bool EnsureForegroundHandles(PlatformTaskState* state) {
   return true;
 }
 
-napi_status EnqueueForegroundTaskFromEngine(napi_env env,
+napi_status EnqueueForegroundTaskFromEngine(void* target,
                                            unofficial_napi_foreground_task_callback callback,
                                            void* data,
                                            unofficial_napi_foreground_task_cleanup cleanup,
                                            uint64_t delay_millis);
+void EnsurePlatformCleanupHook(napi_env env);
 
 napi_status InstallForegroundEnqueueHook(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
-  return unofficial_napi_set_enqueue_foreground_task_callback(
-      env, EnqueueForegroundTaskFromEngine);
-}
-
-PlatformTaskState* GetOrCreateState(napi_env env) {
-  if (env == nullptr) return nullptr;
+  PlatformTaskState* state = nullptr;
   auto [it, inserted] = g_platform_states.emplace(env, nullptr);
   if (inserted || it->second == nullptr) {
-    auto state = std::make_unique<PlatformTaskState>();
-    state->env_key = env;
-    state->env = env;
-    it->second = std::move(state);
+    auto created = std::make_unique<PlatformTaskState>();
+    created->env_key = env;
+    created->env = env;
+    created->owning_thread = std::this_thread::get_id();
+    it->second = std::move(created);
   }
-  return it->second.get();
+  state = it->second.get();
+  if (state == nullptr || !EnsureForegroundHandles(state)) return napi_generic_failure;
+  EnsurePlatformCleanupHook(env);
+  return unofficial_napi_set_enqueue_foreground_task_callback(
+      env, EnqueueForegroundTaskFromEngine, state);
 }
 
 void OnPlatformEnvCleanup(void* arg) {
@@ -263,8 +321,9 @@ void OnPlatformEnvCleanup(void* arg) {
 
   PlatformTaskState* state = GetState(env);
   if (state == nullptr) return;
+  AssertOwningThread(state, "OnPlatformEnvCleanup");
 
-  state->cleanup_started = true;
+  state->cleanup_started.store(true, std::memory_order_release);
   while (!state->immediate_tasks.empty()) {
     PlatformTask task = std::move(state->immediate_tasks.front());
     state->immediate_tasks.pop_front();
@@ -288,6 +347,7 @@ void OnPlatformEnvCleanup(void* arg) {
 
   if (state->foreground_timer_initialized) {
     uv_timer_stop(&state->foreground_timer);
+    state->foreground_timer_armed = false;
   }
 
   CloseHandleIfInitialized(state,
@@ -310,68 +370,18 @@ void EnsurePlatformCleanupHook(napi_env env) {
 }
 
 size_t DrainForegroundTasks(napi_env env, bool run_checkpoint, napi_status* status_out) {
-  if (status_out != nullptr) *status_out = napi_ok;
   PlatformTaskState* state = GetState(env);
-  if (state == nullptr || state->cleanup_started || state->draining_foreground) return 0;
-
-  size_t ran = 0;
-  state->draining_foreground = true;
-
-  for (;;) {
-    std::deque<PlatformTask> batch;
-    {
-      std::lock_guard<std::mutex> lock(state->foreground_mutex);
-      MoveDueForegroundTasksLocked(state);
-      RefreshForegroundTimerLocked(state);
-      batch.swap(state->foreground_tasks);
-    }
-    if (batch.empty()) break;
-
-    while (!batch.empty()) {
-      PlatformTask task = std::move(batch.front());
-      batch.pop_front();
-      if (task.callback == nullptr) {
-        CleanupTask(env, &task);
-        continue;
-      }
-      task.callback(env, task.data);
-      ++ran;
-      CleanupTask(env, &task);
-
-      if (HasPendingException(env)) {
-        bool handled = false;
-        (void)UbiHandlePendingExceptionNow(env, &handled);
-        if (HasPendingException(env)) {
-          state->draining_foreground = false;
-          if (status_out != nullptr) *status_out = napi_pending_exception;
-          return ran;
-        }
-      }
-    }
-
-    if (run_checkpoint) {
-      napi_status checkpoint_status = UbiRunCallbackScopeCheckpoint(env);
-      if (checkpoint_status != napi_ok) {
-        state->draining_foreground = false;
-        if (status_out != nullptr) *status_out = checkpoint_status;
-        return ran;
-      }
-    }
-  }
-
-  state->draining_foreground = false;
-  return ran;
+  return DrainForegroundTasksFromState(state, run_checkpoint, false, status_out, nullptr);
 }
 
-napi_status EnqueueForegroundTaskFromEngine(napi_env env,
+napi_status EnqueueForegroundTaskFromEngine(void* target,
                                            unofficial_napi_foreground_task_callback callback,
                                            void* data,
                                            unofficial_napi_foreground_task_cleanup cleanup,
                                            uint64_t delay_millis) {
-  if (env == nullptr || callback == nullptr) return napi_invalid_arg;
-  EnsurePlatformCleanupHook(env);
-  PlatformTaskState* state = GetOrCreateState(env);
-  if (state == nullptr || state->cleanup_started || !EnsureForegroundHandles(state)) {
+  auto* state = static_cast<PlatformTaskState*>(target);
+  if (state == nullptr || callback == nullptr) return napi_invalid_arg;
+  if (state->cleanup_started.load(std::memory_order_acquire)) {
     return napi_generic_failure;
   }
 
@@ -380,9 +390,14 @@ napi_status EnqueueForegroundTaskFromEngine(napi_env env,
   task.cleanup = cleanup;
   task.data = data;
 
+  bool should_signal = false;
   if (delay_millis == 0) {
     std::lock_guard<std::mutex> lock(state->foreground_mutex);
     state->foreground_tasks.push_back(std::move(task));
+    if (!state->foreground_async_pending) {
+      state->foreground_async_pending = true;
+      should_signal = true;
+    }
   } else {
     DelayedPlatformTask delayed;
     delayed.task = std::move(task);
@@ -390,9 +405,15 @@ napi_status EnqueueForegroundTaskFromEngine(napi_env env,
     delayed.seq = state->next_foreground_seq++;
     delayed.due = Clock::now() + std::chrono::milliseconds(delay_millis);
     state->delayed_foreground_tasks.push(std::move(delayed));
+    if (!state->foreground_async_pending) {
+      state->foreground_async_pending = true;
+      should_signal = true;
+    }
   }
 
-  uv_async_send(&state->foreground_async);
+  if (should_signal) {
+    uv_async_send(&state->foreground_async);
+  }
   return napi_ok;
 }
 
@@ -408,11 +429,16 @@ napi_status UbiRuntimePlatformEnqueueTask(napi_env env,
                                          UbiRuntimePlatformTaskCleanup cleanup,
                                          int flags) {
   if (env == nullptr || callback == nullptr) return napi_invalid_arg;
-  if (InstallForegroundEnqueueHook(env) != napi_ok) return napi_generic_failure;
+  PlatformTaskState* state = GetState(env);
+  if (state == nullptr || state->cleanup_started.load(std::memory_order_acquire)) {
+    if (InstallForegroundEnqueueHook(env) != napi_ok) return napi_generic_failure;
+    state = GetState(env);
+  }
 
-  EnsurePlatformCleanupHook(env);
-  PlatformTaskState* state = GetOrCreateState(env);
-  if (state == nullptr || state->cleanup_started) return napi_generic_failure;
+  if (state == nullptr || state->cleanup_started.load(std::memory_order_acquire)) {
+    return napi_generic_failure;
+  }
+  AssertOwningThread(state, "UbiRuntimePlatformEnqueueTask");
 
   const bool refed = (flags & kUbiRuntimePlatformTaskRefed) != 0;
   const bool need_ref = refed && state->refed_immediate_count == 0;
@@ -437,7 +463,12 @@ napi_status UbiRuntimePlatformEnqueueTask(napi_env env,
 
 size_t UbiRuntimePlatformDrainImmediateTasks(napi_env env, bool only_refed) {
   PlatformTaskState* state = GetState(env);
-  if (state == nullptr || state->cleanup_started || state->draining_immediates) return 0;
+  if (state == nullptr ||
+      state->cleanup_started.load(std::memory_order_acquire) ||
+      state->draining_immediates) {
+    return 0;
+  }
+  AssertOwningThread(state, "UbiRuntimePlatformDrainImmediateTasks");
 
   size_t ran = 0;
   state->draining_immediates = true;
@@ -492,17 +523,22 @@ size_t UbiRuntimePlatformDrainImmediateTasks(napi_env env, bool only_refed) {
 
 bool UbiRuntimePlatformHasImmediateTasks(napi_env env) {
   PlatformTaskState* state = GetState(env);
+  AssertOwningThread(state, "UbiRuntimePlatformHasImmediateTasks");
   return state != nullptr && !state->immediate_tasks.empty();
 }
 
 bool UbiRuntimePlatformHasRefedImmediateTasks(napi_env env) {
   PlatformTaskState* state = GetState(env);
+  AssertOwningThread(state, "UbiRuntimePlatformHasRefedImmediateTasks");
   return state != nullptr && state->refed_immediate_count != 0;
 }
 
 napi_status UbiRuntimePlatformDrainTasks(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
-  if (InstallForegroundEnqueueHook(env) != napi_ok) return napi_generic_failure;
+  PlatformTaskState* state = GetState(env);
+  if (state == nullptr || state->cleanup_started.load(std::memory_order_acquire)) {
+    if (InstallForegroundEnqueueHook(env) != napi_ok) return napi_generic_failure;
+  }
   napi_status status = napi_ok;
   (void)DrainForegroundTasks(env, true, &status);
   return status;

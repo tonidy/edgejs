@@ -13,6 +13,8 @@ enum UbiRuntimePlatformTaskFlags : int {
 
 // Queue a native immediate/platform task for the current env. Tasks run on the
 // owning thread before JS immediates, mirroring Node's native immediate queue.
+// Immediate-task APIs are owning-thread-only; cross-thread engine work must use
+// the foreground task enqueue hook instead.
 napi_status UbiRuntimePlatformEnqueueTask(napi_env env,
                                          UbiRuntimePlatformTaskCallback callback,
                                          void* data,

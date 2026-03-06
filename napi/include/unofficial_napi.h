@@ -23,7 +23,7 @@ NAPI_EXTERN napi_status unofficial_napi_process_microtasks(napi_env env);
 using unofficial_napi_foreground_task_callback = void (*)(napi_env env, void* data);
 using unofficial_napi_foreground_task_cleanup = void (*)(napi_env env, void* data);
 using unofficial_napi_enqueue_foreground_task_callback =
-    napi_status (*)(napi_env env,
+    napi_status (*)(void* target,
                     unofficial_napi_foreground_task_callback callback,
                     void* data,
                     unofficial_napi_foreground_task_cleanup cleanup,
@@ -35,7 +35,8 @@ using unofficial_napi_enqueue_foreground_task_callback =
 // outside the backend.
 NAPI_EXTERN napi_status unofficial_napi_set_enqueue_foreground_task_callback(
     napi_env env,
-    unofficial_napi_enqueue_foreground_task_callback callback);
+    unofficial_napi_enqueue_foreground_task_callback callback,
+    void* target);
 
 // Unofficial helper. Enqueues a JS function into V8 microtask queue.
 NAPI_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_value callback);

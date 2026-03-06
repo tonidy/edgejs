@@ -75,6 +75,7 @@ struct napi_env__ {
   bool async_cleanup_hook_registered = false;
   void (*node_api_cleanup_runner)(napi_env) = nullptr;
   unofficial_napi_enqueue_foreground_task_callback enqueue_foreground_task_callback = nullptr;
+  void* enqueue_foreground_task_target = nullptr;
 };
 
 napi_status napi_v8_set_last_error(napi_env env,

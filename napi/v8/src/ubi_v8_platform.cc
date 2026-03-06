@@ -1,18 +1,21 @@
 #include "ubi_v8_platform.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <utility>
+#include <vector>
 
 #include <libplatform/libplatform.h>
 #include <uv.h>
 
-#include "internal/unofficial_napi_bridge.h"
-
 namespace {
 
 struct ForegroundTaskRecord {
+  void* recycler = nullptr;
+  void (*recycle)(void* recycler, ForegroundTaskRecord* record) = nullptr;
   std::unique_ptr<v8::Task> task;
 };
 
@@ -24,7 +27,13 @@ void RunForegroundTaskRecord(napi_env /*env*/, void* data) {
 }
 
 void CleanupForegroundTaskRecord(napi_env /*env*/, void* data) {
-  delete static_cast<ForegroundTaskRecord*>(data);
+  auto* record = static_cast<ForegroundTaskRecord*>(data);
+  if (record == nullptr || record->recycle == nullptr) {
+    delete record;
+    return;
+  }
+  record->task.reset();
+  record->recycle(record->recycler, record);
 }
 
 }  // namespace
@@ -70,27 +79,41 @@ class UbiV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
                         const v8::SourceLocation& /*location*/) override {}
 
  private:
+  ForegroundTaskRecord* AcquireRecord() {
+    std::lock_guard<std::mutex> lock(record_mutex_);
+    if (!record_pool_.empty()) {
+      ForegroundTaskRecord* record = record_pool_.back();
+      record_pool_.pop_back();
+      return record;
+    }
+    return new (std::nothrow) ForegroundTaskRecord();
+  }
+
   void PostTaskCommon(std::unique_ptr<v8::Task> task,
                       uint64_t delay_ms,
                       const v8::SourceLocation& location) {
     if (!task) return;
 
-    napi_env env = nullptr;
-    unofficial_napi_enqueue_foreground_task_callback enqueue = nullptr;
-    if (NapiV8LookupForegroundTaskTarget(isolate_, &env, &enqueue) &&
-        enqueue != nullptr &&
-        env != nullptr) {
-      auto* record = new (std::nothrow) ForegroundTaskRecord();
+    unofficial_napi_enqueue_foreground_task_callback enqueue =
+        target_enqueue_.load(std::memory_order_acquire);
+    void* target = target_data_.load(std::memory_order_acquire);
+    if (enqueue != nullptr && target != nullptr) {
+      ForegroundTaskRecord* record = AcquireRecord();
       if (record != nullptr) {
+        record->recycler = this;
+        record->recycle = [](void* recycler, ForegroundTaskRecord* record) {
+          static_cast<ForegroundTaskRunner*>(recycler)->RecycleRecord(record);
+        };
         record->task = std::move(task);
-        if (enqueue(env,
+        if (enqueue(target,
                     RunForegroundTaskRecord,
                     record,
                     CleanupForegroundTaskRecord,
                     delay_ms) == napi_ok) {
           return;
         }
-        delete record;
+        task = std::move(record->task);
+        RecycleRecord(record);
       }
     }
 
@@ -106,6 +129,39 @@ class UbiV8Platform::ForegroundTaskRunner final : public v8::TaskRunner {
 
   v8::Isolate* isolate_ = nullptr;
   v8::Platform* fallback_ = nullptr;
+  std::atomic<napi_env> target_env_ {nullptr};
+  std::atomic<unofficial_napi_enqueue_foreground_task_callback> target_enqueue_ {nullptr};
+  std::atomic<void*> target_data_ {nullptr};
+  std::mutex record_mutex_;
+  std::vector<ForegroundTaskRecord*> record_pool_;
+
+ public:
+  ~ForegroundTaskRunner() override {
+    for (ForegroundTaskRecord* record : record_pool_) {
+      delete record;
+    }
+  }
+
+  void RecycleRecord(ForegroundTaskRecord* record) {
+    if (record == nullptr) return;
+    std::lock_guard<std::mutex> lock(record_mutex_);
+    record_pool_.push_back(record);
+  }
+
+  void BindTarget(napi_env env,
+                  unofficial_napi_enqueue_foreground_task_callback callback,
+                  void* target) {
+    target_data_.store(target, std::memory_order_release);
+    target_enqueue_.store(callback, std::memory_order_release);
+    target_env_.store(env, std::memory_order_release);
+  }
+
+  void ClearTarget(napi_env env) {
+    if (target_env_.load(std::memory_order_acquire) != env) return;
+    target_env_.store(nullptr, std::memory_order_release);
+    target_enqueue_.store(nullptr, std::memory_order_release);
+    target_data_.store(nullptr, std::memory_order_release);
+  }
 };
 
 std::unique_ptr<UbiV8Platform> UbiV8Platform::Create() {
@@ -130,6 +186,24 @@ std::shared_ptr<UbiV8Platform::ForegroundTaskRunner> UbiV8Platform::EnsureRunner
 }
 
 bool UbiV8Platform::RegisterIsolate(v8::Isolate* isolate) { return EnsureRunner(isolate) != nullptr; }
+
+bool UbiV8Platform::BindForegroundTaskTarget(
+    v8::Isolate* isolate,
+    napi_env env,
+    unofficial_napi_enqueue_foreground_task_callback callback,
+    void* target) {
+  std::shared_ptr<ForegroundTaskRunner> runner = EnsureRunner(isolate);
+  if (!runner) return false;
+  runner->BindTarget(env, callback, target);
+  return true;
+}
+
+void UbiV8Platform::ClearForegroundTaskTarget(v8::Isolate* isolate, napi_env env) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = runners_.find(isolate);
+  if (it == runners_.end() || !it->second) return;
+  it->second->ClearTarget(env);
+}
 
 int UbiV8Platform::NumberOfWorkerThreads() {
   return fallback_ != nullptr ? fallback_->NumberOfWorkerThreads() : 0;

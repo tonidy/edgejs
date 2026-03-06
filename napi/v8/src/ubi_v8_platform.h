@@ -7,6 +7,8 @@
 
 #include <v8-platform.h>
 
+#include "unofficial_napi.h"
+
 class UbiV8Platform final : public v8::Platform {
  public:
   static std::unique_ptr<UbiV8Platform> Create();
@@ -14,6 +16,11 @@ class UbiV8Platform final : public v8::Platform {
   ~UbiV8Platform() override;
 
   bool RegisterIsolate(v8::Isolate* isolate);
+  bool BindForegroundTaskTarget(v8::Isolate* isolate,
+                                napi_env env,
+                                unofficial_napi_enqueue_foreground_task_callback callback,
+                                void* target);
+  void ClearForegroundTaskTarget(v8::Isolate* isolate, napi_env env);
 
   int NumberOfWorkerThreads() override;
   std::shared_ptr<v8::TaskRunner> GetForegroundTaskRunner(
