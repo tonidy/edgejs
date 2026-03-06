@@ -82,6 +82,20 @@ std::string ShellSingleQuoted(const std::string& input) {
   return out;
 }
 
+std::string JsSingleQuoted(const std::string& input) {
+  std::string out;
+  out.reserve(input.size() + 2);
+  out.push_back('\'');
+  for (char c : input) {
+    if (c == '\\' || c == '\'') {
+      out.push_back('\\');
+    }
+    out.push_back(c);
+  }
+  out.push_back('\'');
+  return out;
+}
+
 struct CommandResult {
   int status = -1;
   std::string stdout_output;
@@ -506,6 +520,59 @@ TEST_F(Test1CliPhase01, PrintFlagEvaluatesExpression) {
   EXPECT_EQ(exit_code, 0) << "error=" << error;
   EXPECT_TRUE(error.empty()) << "error=" << error;
   EXPECT_NE(stdout_output.find("42"), std::string::npos);
+}
+
+TEST_F(Test1CliPhase01, FsPromisesReadFileInsideListenCallbackDoesNotHang) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "listen/readFile subprocess parity check is POSIX-only";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const fs::path file_path =
+      fs::temp_directory_path() / "ubi_phase01_listen_readfile_target.txt";
+  {
+    std::ofstream out(file_path);
+    out << "hello-from-readfile";
+    ASSERT_TRUE(out.good()) << "Failed to write readFile fixture";
+  }
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_listen_readfile",
+      "const http = require('http');\n"
+      "const fs = require('fs/promises');\n"
+      "const timer = setTimeout(() => {\n"
+      "  console.error('timeout');\n"
+      "  process.exit(9);\n"
+      "}, 2000);\n"
+      "const server = http.createServer((req, res) => res.end('ok'));\n"
+      "server.listen(0, async () => {\n"
+      "  try {\n"
+      "    const text = await fs.readFile(" + JsSingleQuoted(file_path.string()) + ", 'utf8');\n"
+      "    console.log('read:' + text);\n"
+      "  } catch (err) {\n"
+      "    console.error(err && err.stack || err);\n"
+      "    process.exitCode = 1;\n"
+      "  } finally {\n"
+      "    clearTimeout(timer);\n"
+      "    server.close();\n"
+      "  }\n"
+      "});\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_listen_readfile_run");
+
+  std::error_code ec;
+  fs::remove(file_path, ec);
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("read:hello-from-readfile"), std::string::npos) << result.stdout_output;
+  EXPECT_EQ(result.stderr_output.find("timeout"), std::string::npos) << result.stderr_output;
+#endif
 }
 
 TEST_F(Test1CliPhase01, BeforeExitCanScheduleMoreWork) {

@@ -47,6 +47,10 @@ napi_status UbiMakeCallback(napi_env env,
                               size_t argc,
                               napi_value* argv,
                               napi_value* result);
+// Mirrors the top-level task-queue checkpoint that Node runs when unwinding an
+// InternalCallbackScope. Use this after settling native promises from libuv
+// callbacks that did not enter JS through UbiMakeCallback().
+napi_status UbiRunCallbackScopeCheckpoint(napi_env env);
 bool UbiHandlePendingExceptionNow(napi_env env, bool* handled_out);
 
 #endif  // UBI_RUNTIME_H_

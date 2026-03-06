@@ -10,6 +10,7 @@
 #include <uv.h>
 
 #include "internal_binding/helpers.h"
+#include "ubi_runtime.h"
 
 namespace internal_binding {
 
@@ -626,6 +627,7 @@ void FinishFileHandleClose(FileHandleCloseReq* close_req, int result) {
       (void)napi_resolve_deferred(env, wrap->closing_deferred, Undefined(env));
     }
     wrap->closing_deferred = nullptr;
+    (void)UbiRunCallbackScopeCheckpoint(env);
   }
 
   if (env != nullptr && wrap != nullptr) {
