@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use napi_wasmer::{run_wasix_main_capture_stdout, run_wasm_main_i32, GuestMount};
+use napi_wasmer::{run_wasix_main_capture_stdio, run_wasm_main_i32, GuestMount};
 use std::path::{Path, PathBuf};
 
 fn init_tracing() {
@@ -116,8 +116,8 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("script has no file name: {}", host_script.display()))?;
             guest_args.push(format!("/app/{}", script_name.to_string_lossy()));
         }
-        let (exit, stdout) = run_wasix_main_capture_stdout(wasm_path, &guest_args, &extra_mounts)?;
-        print!("{stdout}");
+        let (exit, _stdout, _stderr) =
+            run_wasix_main_capture_stdio(wasm_path, &guest_args, &extra_mounts)?;
         println!("wasix_exit_code={exit}");
         return Ok(());
     }

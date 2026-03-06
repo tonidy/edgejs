@@ -8,6 +8,10 @@
 #include <unordered_map>
 #include <vector>
 #include <uv.h>
+#if !defined(_WIN32)
+#include <cerrno>
+#include <unistd.h>
+#endif
 
 #include "internal_binding/helpers.h"
 #include "../ubi_module_loader.h"

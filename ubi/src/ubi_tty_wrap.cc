@@ -12,6 +12,7 @@
 
 #include "ubi_async_wrap.h"
 #include "ubi_stream_base.h"
+#include "ubi_stream_wrap.h"
 
 namespace {
 
@@ -32,6 +33,12 @@ struct TtyBindingState {
 std::unordered_map<napi_env, TtyBindingState> g_tty_states;
 
 TtyBindingState& EnsureBindingState(napi_env env) { return g_tty_states[env]; }
+
+void SetStreamState(int idx, int32_t value) {
+  int32_t* state = UbiGetStreamBaseState();
+  if (state == nullptr) return;
+  state[idx] = value;
+}
 
 TtyWrap* FromBase(UbiStreamBase* base) {
   if (base == nullptr) return nullptr;
@@ -78,20 +85,6 @@ int SyncTtyWrite(TtyWrap* wrap, const char* data, size_t len) {
   if (rc < 0) return -errno;
   wrap->base.bytes_written += static_cast<uint64_t>(rc);
   return 0;
-}
-
-napi_value FinishSyncTtyWrite(TtyWrap* wrap, napi_value req_obj, int status) {
-  if (wrap == nullptr || wrap->env == nullptr) return nullptr;
-  if (req_obj != nullptr) {
-    napi_value stream_obj = UbiStreamBaseGetWrapper(&wrap->base);
-    napi_value argv[3] = {
-        UbiStreamBaseMakeInt32(wrap->env, status),
-        stream_obj != nullptr ? stream_obj : UbiStreamBaseUndefined(wrap->env),
-        status < 0 ? nullptr : UbiStreamBaseUndefined(wrap->env),
-    };
-    UbiStreamBaseInvokeReqOnComplete(wrap->env, req_obj, status, argv, 3);
-  }
-  return UbiStreamBaseMakeInt32(wrap->env, status);
 }
 
 napi_value GetThis(napi_env env,
@@ -303,7 +296,11 @@ napi_value TtyWriteBuffer(napi_env env, napi_callback_info info) {
   std::string temp_utf8;
   UbiStreamBaseExtractByteSpan(env, argv[1], &data, &len, &refable, &temp_utf8);
   if (data == nullptr && len > 0) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
-  return FinishSyncTtyWrite(wrap, argv[0], SyncTtyWrite(wrap, reinterpret_cast<const char*>(data), len));
+  const int rc = SyncTtyWrite(wrap, reinterpret_cast<const char*>(data), len);
+  SetStreamState(kUbiBytesWritten, rc == 0 ? static_cast<int32_t>(len) : 0);
+  SetStreamState(kUbiLastWriteWasAsync, 0);
+  UbiStreamBaseSetReqError(env, argv[0], rc);
+  return UbiStreamBaseMakeInt32(env, rc);
 #else
   return UbiLibuvStreamWriteBuffer(&wrap->base, argv[0], argv[1], nullptr, nullptr);
 #endif
@@ -335,7 +332,11 @@ napi_value TtyWriteString(napi_env env, napi_callback_info info) {
   std::string temp_utf8;
   UbiStreamBaseExtractByteSpan(env, buffer, &bytes, &len, &refable, &temp_utf8);
   if (bytes == nullptr && len > 0) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
-  return FinishSyncTtyWrite(wrap, argv[0], SyncTtyWrite(wrap, reinterpret_cast<const char*>(bytes), len));
+  const int rc = SyncTtyWrite(wrap, reinterpret_cast<const char*>(bytes), len);
+  SetStreamState(kUbiBytesWritten, rc == 0 ? static_cast<int32_t>(len) : 0);
+  SetStreamState(kUbiLastWriteWasAsync, 0);
+  UbiStreamBaseSetReqError(env, argv[0], rc);
+  return UbiStreamBaseMakeInt32(env, rc);
 #else
   return UbiLibuvStreamWriteString(&wrap->base,
                                    argv[0],

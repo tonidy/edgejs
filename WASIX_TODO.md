@@ -25,12 +25,13 @@ Items here should be replaced with real WASIX implementations, proper feature ga
 
 - Revisit the temporary zero-return behavior for process memory APIs in [ubi/src/ubi_process.cc](/home/theduke/dev/github.com/wasmerio/ubi/ubi/src/ubi_process.cc). These currently avoid unresolved imports for `uv_get_available_memory`, `uv_get_constrained_memory`, and `uv_resident_set_memory`, but should either report real values or be explicitly feature-gated.
 - Revisit the `getgroups()` guard in [ubi/src/internal_binding/binding_credentials.cc](/home/theduke/dev/github.com/wasmerio/ubi/ubi/src/internal_binding/binding_credentials.cc) once the WASIX libc story for group APIs is clearer.
-- Fix libuv stdio integration for WASIX instead of relying on compatibility write paths in `ubi`. Current evidence:
+- Fix libuv stdio integration for WASIX instead of relying on compatibility behavior in `ubi` or the harness. Current evidence:
   - guest-side direct WASIX writes work
-  - `process._rawDebug()` writes to `stderr` correctly
-  - `process.stdout.write()`, `console.log()`, and `fs.writeSync(1, ...)` do not reach `fd_write(1, ...)` through the current libuv-backed path
-  - `process.stdout` is currently classified as a TTY under the harness
-  The long-term fix should make `uv_tty_*`, `uv_fs_write`, and stdio handle classification behave correctly on WASIX so Node-style stdout/stderr flows work without `ubi`-specific fallbacks.
+  - the deeper guest/host memory issue was in the N-API/V8 buffer bridge rather than Wasix stdout capture alone
+  - stdio should continue to work through the normal Node/libuv path now that Buffer and typed-array sharing are correct
+  The remaining cleanup is to make sure `uv_tty_*`, stdio handle classification, and any TTY-specific behavior work correctly on WASIX without any special-case relabeling or forced handle types.
+
+- Revisit external `ArrayBuffer` / `Buffer` backing semantics in [napi/v8/src/js_native_api_v8.cc](/home/theduke/dev/github.com/wasmerio/ubi/napi/v8/src/js_native_api_v8.cc). WASIX now needs truly shared external backing stores so guest native code and host-side JS see the same bytes. The current fix moved the bridge onto real external backing stores, but this path should be reviewed carefully against upstream `napi-v8` expectations and GC/finalizer behavior.
 
 ## Build system
 

@@ -1,4 +1,10 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
+    println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=V8_DEFINES");
+    println!("cargo:rerun-if-env-changed=NAPI_V8_DEFINES");
+
     let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -11,10 +17,22 @@ fn main() {
     let napi_v8_src = napi_v8_dir.join("src");
 
     // V8 paths
-    let default_v8_include = "/opt/homebrew/Cellar/v8/14.5.201.9/include".to_string();
-    let default_v8_lib = "/opt/homebrew/Cellar/v8/14.5.201.9/lib".to_string();
-    let v8_include = std::env::var("V8_INCLUDE_DIR").unwrap_or(default_v8_include);
-    let v8_lib = std::env::var("V8_LIB_DIR").unwrap_or(default_v8_lib);
+    let v8_include = std::env::var("V8_INCLUDE_DIR")
+        .expect("V8_INCLUDE_DIR must be set; enter the repo via `nix develop`");
+    let v8_lib =
+        std::env::var("V8_LIB_DIR").expect("V8_LIB_DIR must be set; enter the repo via `nix develop`");
+    let v8_include_dir = std::path::Path::new(&v8_include);
+    let v8_lib_dir = std::path::Path::new(&v8_lib);
+    assert!(
+        v8_include_dir.join("v8.h").exists(),
+        "V8 headers not found in V8_INCLUDE_DIR={v8_include}"
+    );
+    assert!(
+        v8_lib_dir.join("libv8.a").exists()
+            || v8_lib_dir.join("libv8.so").exists()
+            || v8_lib_dir.join("libv8.dylib").exists(),
+        "V8 library not found in V8_LIB_DIR={v8_lib}"
+    );
 
     let v8_defines = std::env::var("V8_DEFINES")
         .or_else(|_| std::env::var("NAPI_V8_DEFINES"))
@@ -55,9 +73,7 @@ fn main() {
 
     build.compile("napi_bridge");
 
-    println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
     println!("cargo:rustc-link-search=native={v8_lib}");
-    let v8_lib_dir = std::path::Path::new(&v8_lib);
     let v8_link_kind = if v8_lib_dir.join("libv8.so").exists()
         || v8_lib_dir.join("libv8.dylib").exists()
     {

@@ -993,19 +993,22 @@ extern "C" int snapi_bridge_create_typedarray(int type, uint32_t length,
 
 extern "C" int snapi_bridge_get_typedarray_info(uint32_t id, int* type_out,
                                                 uint32_t* length_out,
+                                                uint64_t* data_out,
                                                 uint32_t* arraybuffer_out,
                                                 uint32_t* byte_offset_out) {
   napi_value val = LoadValue(id);
   if (!val) return napi_invalid_arg;
   napi_typedarray_type type;
   size_t length;
+  void* data = nullptr;
   napi_value arraybuffer;
   size_t byte_offset;
-  napi_status s = napi_get_typedarray_info(g_env, val, &type, &length, nullptr,
+  napi_status s = napi_get_typedarray_info(g_env, val, &type, &length, &data,
                                            &arraybuffer, &byte_offset);
   if (s != napi_ok) return s;
   if (type_out) *type_out = (int)type;
   if (length_out) *length_out = (uint32_t)length;
+  if (data_out) *data_out = (uint64_t)(uintptr_t)data;
   if (arraybuffer_out) *arraybuffer_out = StoreValue(arraybuffer);
   if (byte_offset_out) *byte_offset_out = (uint32_t)byte_offset;
   return napi_ok;
@@ -1031,17 +1034,20 @@ extern "C" int snapi_bridge_create_dataview(uint32_t byte_length,
 
 extern "C" int snapi_bridge_get_dataview_info(uint32_t id,
                                               uint32_t* byte_length_out,
+                                              uint64_t* data_out,
                                               uint32_t* arraybuffer_out,
                                               uint32_t* byte_offset_out) {
   napi_value val = LoadValue(id);
   if (!val) return napi_invalid_arg;
   size_t byte_length;
+  void* data = nullptr;
   napi_value arraybuffer;
   size_t byte_offset;
-  napi_status s = napi_get_dataview_info(g_env, val, &byte_length, nullptr,
+  napi_status s = napi_get_dataview_info(g_env, val, &byte_length, &data,
                                          &arraybuffer, &byte_offset);
   if (s != napi_ok) return s;
   if (byte_length_out) *byte_length_out = (uint32_t)byte_length;
+  if (data_out) *data_out = (uint64_t)(uintptr_t)data;
   if (arraybuffer_out) *arraybuffer_out = StoreValue(arraybuffer);
   if (byte_offset_out) *byte_offset_out = (uint32_t)byte_offset;
   return napi_ok;
@@ -1298,25 +1304,18 @@ extern "C" int snapi_bridge_adjust_external_memory(int64_t change,
 }
 
 // ============================================================
-// Node Buffers (implemented via Uint8Array + ArrayBuffer since
-// napi-v8 doesn't have node_api.h buffer functions)
+// Node Buffers
 // ============================================================
 
 extern "C" int snapi_bridge_create_buffer(uint32_t length,
                                           uint64_t* data_out,
                                           uint32_t* out_id) {
-  // Create an ArrayBuffer, then a Uint8Array view over it
-  napi_value arraybuffer;
-  void* ab_data = nullptr;
-  napi_status s = napi_create_arraybuffer(g_env, (size_t)length, &ab_data,
-                                          &arraybuffer);
+  napi_value buffer;
+  void* data = nullptr;
+  napi_status s = napi_create_buffer(g_env, (size_t)length, &data, &buffer);
   if (s != napi_ok) return s;
-  napi_value uint8array;
-  s = napi_create_typedarray(g_env, napi_uint8_array, (size_t)length,
-                             arraybuffer, 0, &uint8array);
-  if (s != napi_ok) return s;
-  *out_id = StoreValue(uint8array);
-  if (data_out) *data_out = (uint64_t)(uintptr_t)ab_data;
+  *out_id = StoreValue(buffer);
+  if (data_out) *data_out = (uint64_t)(uintptr_t)data;
   return napi_ok;
 }
 
@@ -1324,41 +1323,23 @@ extern "C" int snapi_bridge_create_buffer_copy(uint32_t length,
                                                const void* src_data,
                                                uint64_t* result_data_out,
                                                uint32_t* out_id) {
-  // Create an ArrayBuffer, copy data in, wrap with Uint8Array
-  napi_value arraybuffer;
-  void* ab_data = nullptr;
-  napi_status s = napi_create_arraybuffer(g_env, (size_t)length, &ab_data,
-                                          &arraybuffer);
+  napi_value buffer;
+  void* result_data = nullptr;
+  napi_status s = napi_create_buffer_copy(g_env, (size_t)length, src_data,
+                                          &result_data, &buffer);
   if (s != napi_ok) return s;
-  if (ab_data && src_data && length > 0) {
-    memcpy(ab_data, src_data, length);
-  }
-  napi_value uint8array;
-  s = napi_create_typedarray(g_env, napi_uint8_array, (size_t)length,
-                             arraybuffer, 0, &uint8array);
-  if (s != napi_ok) return s;
-  *out_id = StoreValue(uint8array);
-  if (result_data_out) *result_data_out = (uint64_t)(uintptr_t)ab_data;
+  *out_id = StoreValue(buffer);
+  if (result_data_out) *result_data_out = (uint64_t)(uintptr_t)result_data;
   return napi_ok;
 }
 
 extern "C" int snapi_bridge_is_buffer(uint32_t id, int* result) {
-  // A "buffer" in our implementation is a Uint8Array
   napi_value val = LoadValue(id);
   if (!val) return napi_invalid_arg;
-  bool is_ta;
-  napi_status s = napi_is_typedarray(g_env, val, &is_ta);
+  bool is_buffer = false;
+  napi_status s = napi_is_buffer(g_env, val, &is_buffer);
   if (s != napi_ok) return s;
-  if (!is_ta) {
-    *result = 0;
-    return napi_ok;
-  }
-  // Check if it's specifically a Uint8Array
-  napi_typedarray_type ta_type;
-  s = napi_get_typedarray_info(g_env, val, &ta_type, nullptr, nullptr,
-                               nullptr, nullptr);
-  if (s != napi_ok) return s;
-  *result = (ta_type == napi_uint8_array) ? 1 : 0;
+  *result = is_buffer ? 1 : 0;
   return napi_ok;
 }
 
@@ -1367,25 +1348,12 @@ extern "C" int snapi_bridge_get_buffer_info(uint32_t id,
                                             uint32_t* length_out) {
   napi_value val = LoadValue(id);
   if (!val) return napi_invalid_arg;
-  // Get typedarray info to find the backing arraybuffer and length
-  napi_typedarray_type ta_type;
-  size_t length;
-  napi_value arraybuffer;
-  size_t byte_offset;
-  napi_status s = napi_get_typedarray_info(g_env, val, &ta_type, &length,
-                                           nullptr, &arraybuffer, &byte_offset);
+  void* data = nullptr;
+  size_t length = 0;
+  napi_status s = napi_get_buffer_info(g_env, val, &data, &length);
   if (s != napi_ok) return s;
   if (length_out) *length_out = (uint32_t)length;
-  // Get the data pointer from the backing ArrayBuffer (not from the typedarray,
-  // which may return a V8 sandbox-mapped address for external arraybuffers)
-  if (data_out) {
-    void* ab_data = nullptr;
-    size_t ab_len = 0;
-    s = napi_get_arraybuffer_info(g_env, arraybuffer, &ab_data, &ab_len);
-    if (s != napi_ok) return s;
-    // Apply byte_offset to get the actual data start
-    *data_out = (uint64_t)(uintptr_t)((uint8_t*)ab_data + byte_offset);
-  }
+  if (data_out) *data_out = (uint64_t)(uintptr_t)data;
   return napi_ok;
 }
 
@@ -1483,6 +1451,7 @@ static napi_value generic_wasm_callback(napi_env env, napi_callback_info info);
 extern "C" int snapi_bridge_define_properties(uint32_t obj_id,
                                               uint32_t prop_count,
                                               const char** utf8names,
+                                              const uint32_t* name_ids,
                                               const uint32_t* prop_types,
                                               const uint32_t* value_ids,
                                               const uint32_t* method_reg_ids,
@@ -1494,7 +1463,8 @@ extern "C" int snapi_bridge_define_properties(uint32_t obj_id,
   std::vector<napi_property_descriptor> descs(prop_count);
   for (uint32_t i = 0; i < prop_count; i++) {
     memset(&descs[i], 0, sizeof(napi_property_descriptor));
-    descs[i].utf8name = utf8names[i];
+    descs[i].utf8name = utf8names != nullptr ? utf8names[i] : nullptr;
+    descs[i].name = (name_ids != nullptr && name_ids[i] != 0) ? LoadValue(name_ids[i]) : nullptr;
     descs[i].attributes = (napi_property_attributes)attributes[i];
 
     switch (prop_types[i]) {
@@ -1542,6 +1512,7 @@ extern "C" int snapi_bridge_define_class(
     uint32_t ctor_reg_id,
     uint32_t prop_count,
     const char** prop_names,
+    const uint32_t* prop_name_ids,
     const uint32_t* prop_types,
     const uint32_t* prop_value_ids,
     const uint32_t* prop_method_reg_ids,
@@ -1554,7 +1525,8 @@ extern "C" int snapi_bridge_define_class(
   std::vector<napi_property_descriptor> descs(prop_count);
   for (uint32_t i = 0; i < prop_count; i++) {
     memset(&descs[i], 0, sizeof(napi_property_descriptor));
-    descs[i].utf8name = prop_names[i];
+    descs[i].utf8name = prop_names != nullptr ? prop_names[i] : nullptr;
+    descs[i].name = (prop_name_ids != nullptr && prop_name_ids[i] != 0) ? LoadValue(prop_name_ids[i]) : nullptr;
     descs[i].attributes = (napi_property_attributes)prop_attributes[i];
 
     switch (prop_types[i]) {

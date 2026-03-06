@@ -2,10 +2,10 @@ use anyhow::{Context, Result};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::ffi::CString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use virtual_fs::{AsyncReadExt, FileSystem, RootFileSystemBuilder, TmpFileSystem};
-use virtual_mio::block_on;
 use wasmer::{
     imports,
     sys::{EngineBuilder, Features},
@@ -57,6 +57,33 @@ pub struct GuestMount {
     pub guest_path: PathBuf,
 }
 
+fn spawn_pipe_drain_thread(
+    mut pipe: Pipe,
+    mut sink: Box<dyn Write + Send>,
+) -> std::thread::JoinHandle<Result<String>> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create stdio drain runtime")?;
+        let mut captured = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = runtime
+                .block_on(pipe.read(&mut chunk))
+                .context("failed reading WASIX stdio pipe")?;
+            if n == 0 {
+                break;
+            }
+            sink.write_all(&chunk[..n])
+                .context("failed writing drained WASIX stdio")?;
+            sink.flush().context("failed flushing drained WASIX stdio")?;
+            captured.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8(captured).context("WASIX stdio was not valid UTF-8")
+    })
+}
+
 fn ensure_guest_dir(root_fs: &TmpFileSystem, dir: &Path) {
     let mut current = PathBuf::new();
     for component in dir.components() {
@@ -103,8 +130,8 @@ fn call_guest_callback(store: &mut impl wasmer::AsStoreMut, table: &Table, wasm_
             Some(Value::I64(v)) => *v as u32,
             _ => 0,
         },
-        Err(_) => {
-            eprintln!("[callback trampoline] error calling function");
+        Err(err) => {
+            eprintln!("[callback trampoline] error calling function: {err}");
             0
         }
     }
@@ -547,6 +574,7 @@ unsafe extern "C" {
         id: u32,
         type_out: *mut i32,
         length_out: *mut u32,
+        data_out: *mut u64,
         arraybuffer_out: *mut u32,
         byte_offset_out: *mut u32,
     ) -> i32;
@@ -560,6 +588,7 @@ unsafe extern "C" {
     fn snapi_bridge_get_dataview_info(
         id: u32,
         byte_length_out: *mut u32,
+        data_out: *mut u64,
         arraybuffer_out: *mut u32,
         byte_offset_out: *mut u32,
     ) -> i32;
@@ -681,6 +710,7 @@ unsafe extern "C" {
         ctor_reg_id: u32,
         prop_count: u32,
         prop_names: *const *const i8,
+        prop_name_ids: *const u32,
         prop_types: *const u32,
         prop_value_ids: *const u32,
         prop_method_reg_ids: *const u32,
@@ -693,6 +723,7 @@ unsafe extern "C" {
         obj_id: u32,
         prop_count: u32,
         prop_names: *const *const i8,
+        prop_name_ids: *const u32,
         prop_types: *const u32,
         prop_value_ids: *const u32,
         prop_method_reg_ids: *const u32,
@@ -803,6 +834,58 @@ fn read_guest_bytes(
     let mut out = vec![0u8; len];
     view.read(guest_ptr as u64, &mut out).ok()?;
     Some(out)
+}
+
+fn allocate_guest_bytes(env: &mut FunctionEnvMut<RuntimeEnv>, data: &[u8]) -> Option<u32> {
+    let malloc_fn = env.data().malloc_fn.clone()?;
+    let len = i32::try_from(data.len()).ok()?;
+    let guest_ptr: i32 = {
+        let (_, mut store_ref) = env.data_and_store_mut();
+        malloc_fn.call(&mut store_ref, len).ok()?
+    };
+    if guest_ptr <= 0 {
+        return None;
+    }
+    if !write_guest_bytes(env, guest_ptr as u32, data) {
+        return None;
+    }
+    Some(guest_ptr as u32)
+}
+
+fn host_ptr_to_guest_ptr(env: &mut FunctionEnvMut<RuntimeEnv>, host_addr: u64) -> Option<u32> {
+    let memory = env.data().memory.clone()?;
+    let (_, store_ref) = env.data_and_store_mut();
+    let view = memory.view(&store_ref);
+    let host_base = view.data_ptr() as u64;
+    let memory_len = view.data_size() as u64;
+    if host_addr < host_base || host_addr >= host_base + memory_len {
+        return None;
+    }
+    u32::try_from(host_addr - host_base).ok()
+}
+
+fn resolve_or_copy_host_data_to_guest(
+    env: &mut FunctionEnvMut<RuntimeEnv>,
+    handle_id: u32,
+    host_addr: u64,
+    byte_len: usize,
+) -> Option<u32> {
+    if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&handle_id) {
+        return Some(guest_data_ptr);
+    }
+    if host_addr == 0 {
+        return Some(0);
+    }
+    if let Some(guest_ptr) = host_ptr_to_guest_ptr(env, host_addr) {
+        return Some(guest_ptr);
+    }
+    if byte_len == 0 {
+        return Some(0);
+    }
+    let host_slice = unsafe { std::slice::from_raw_parts(host_addr as *const u8, byte_len) };
+    let guest_ptr = allocate_guest_bytes(env, host_slice)?;
+    env.data_mut().guest_data_ptrs.insert(handle_id, guest_ptr);
+    Some(guest_ptr)
 }
 
 fn read_guest_u32_array(
@@ -2959,22 +3042,11 @@ fn guest_napi_get_arraybuffer_info(
         write_guest_u32(&mut env, len_ptr as u32, bl);
     }
 
-    // Use stored guest data pointer mapping (V8 sandbox remaps external ArrayBuffer pointers)
     if data_ptr > 0 {
-        if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&(vh as u32)) {
+        if let Some(guest_data_ptr) =
+            resolve_or_copy_host_data_to_guest(&mut env, vh as u32, host_data_addr, bl as usize)
+        {
             write_guest_u32(&mut env, data_ptr as u32, guest_data_ptr);
-        } else if host_data_addr != 0 {
-            // Fallback for non-external arraybuffers: convert host pointer
-            let memory = env.data().memory.clone();
-            if let Some(memory) = memory {
-                let guest_data_ptr: u32 = {
-                    let (_, store_ref) = env.data_and_store_mut();
-                    let view = memory.view(&store_ref);
-                    let host_base = view.data_ptr() as u64;
-                    (host_data_addr - host_base) as u32
-                };
-                write_guest_u32(&mut env, data_ptr as u32, guest_data_ptr);
-            }
         }
     }
     0
@@ -3062,16 +3134,24 @@ fn guest_napi_get_typedarray_info(
     vh: i32,
     tp: i32,
     lp: i32,
-    _dp: i32,
+    dp: i32,
     abp: i32,
     bop: i32,
 ) -> i32 {
     let mut typ: i32 = 0;
     let mut len: u32 = 0;
+    let mut host_data_addr: u64 = 0;
     let mut ab: u32 = 0;
     let mut bo: u32 = 0;
     let s = unsafe {
-        snapi_bridge_get_typedarray_info(vh as u32, &mut typ, &mut len, &mut ab, &mut bo)
+        snapi_bridge_get_typedarray_info(
+            vh as u32,
+            &mut typ,
+            &mut len,
+            &mut host_data_addr,
+            &mut ab,
+            &mut bo,
+        )
     };
     if s == 0 {
         if tp > 0 {
@@ -3079,6 +3159,24 @@ fn guest_napi_get_typedarray_info(
         }
         if lp > 0 {
             write_guest_u32(&mut env, lp as u32, len);
+        }
+        if dp > 0 {
+            let elem_size = match typ {
+                0 | 1 | 2 => 1usize,
+                3 | 4 | 13 | 14 => 2usize,
+                5 | 6 | 15 | 16 => 4usize,
+                7 | 8 | 9 | 10 | 11 | 12 | 17 | 18 => 8usize,
+                _ => 1usize,
+            };
+            let byte_len = len as usize * elem_size;
+            if let Some(guest_data_ptr) = resolve_or_copy_host_data_to_guest(
+                &mut env,
+                vh as u32,
+                host_data_addr,
+                byte_len,
+            ) {
+                write_guest_u32(&mut env, dp as u32, guest_data_ptr);
+            }
         }
         if abp > 0 {
             write_guest_u32(&mut env, abp as u32, ab);
@@ -3113,17 +3211,30 @@ fn guest_napi_get_dataview_info(
     _e: i32,
     vh: i32,
     blp: i32,
-    _dp: i32,
+    dp: i32,
     abp: i32,
     bop: i32,
 ) -> i32 {
     let mut bl: u32 = 0;
+    let mut host_data_addr: u64 = 0;
     let mut ab: u32 = 0;
     let mut bo: u32 = 0;
-    let s = unsafe { snapi_bridge_get_dataview_info(vh as u32, &mut bl, &mut ab, &mut bo) };
+    let s = unsafe {
+        snapi_bridge_get_dataview_info(vh as u32, &mut bl, &mut host_data_addr, &mut ab, &mut bo)
+    };
     if s == 0 {
         if blp > 0 {
             write_guest_u32(&mut env, blp as u32, bl);
+        }
+        if dp > 0 {
+            if let Some(guest_data_ptr) = resolve_or_copy_host_data_to_guest(
+                &mut env,
+                vh as u32,
+                host_data_addr,
+                bl as usize,
+            ) {
+                write_guest_u32(&mut env, dp as u32, guest_data_ptr);
+            }
         }
         if abp > 0 {
             write_guest_u32(&mut env, abp as u32, ab);
@@ -3512,6 +3623,7 @@ fn guest_napi_define_class(
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
+                std::ptr::null(),
                 &mut out,
             )
         };
@@ -3530,6 +3642,7 @@ fn guest_napi_define_class(
 
     let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
     let mut prop_names_ptrs: Vec<*const i8> = Vec::with_capacity(pc as usize);
+    let mut prop_name_ids: Vec<u32> = Vec::with_capacity(pc as usize);
     let mut prop_types: Vec<u32> = Vec::with_capacity(pc as usize);
     let mut prop_value_ids: Vec<u32> = Vec::with_capacity(pc as usize);
     let mut prop_method_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
@@ -3541,7 +3654,7 @@ fn guest_napi_define_class(
         let base = i * PROP_DESC_SIZE;
         let utf8name_guest =
             u32::from_le_bytes([raw[base], raw[base + 1], raw[base + 2], raw[base + 3]]);
-        let _name_id =
+        let name_id =
             u32::from_le_bytes([raw[base + 4], raw[base + 5], raw[base + 6], raw[base + 7]]);
         let method_ptr =
             u32::from_le_bytes([raw[base + 8], raw[base + 9], raw[base + 10], raw[base + 11]]);
@@ -3583,6 +3696,7 @@ fn guest_napi_define_class(
             vec![]
         };
         let c_pname = CString::new(pname).unwrap_or_default();
+        prop_name_ids.push(name_id);
 
         // Determine property type and register callbacks as needed
         if method_ptr != 0 {
@@ -3649,6 +3763,7 @@ fn guest_napi_define_class(
             ctor_reg_id,
             pc,
             prop_names_ptrs.as_ptr(),
+            prop_name_ids.as_ptr(),
             prop_types.as_ptr(),
             prop_value_ids.as_ptr(),
             prop_method_reg_ids.as_ptr(),
@@ -3685,6 +3800,7 @@ fn guest_napi_define_properties(
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::null(),
+                std::ptr::null(),
             )
         };
     }
@@ -3696,6 +3812,7 @@ fn guest_napi_define_properties(
 
     let mut prop_names_c: Vec<CString> = Vec::with_capacity(pc as usize);
     let mut prop_names_ptrs: Vec<*const i8> = Vec::with_capacity(pc as usize);
+    let mut prop_name_ids: Vec<u32> = Vec::with_capacity(pc as usize);
     let mut prop_types: Vec<u32> = Vec::with_capacity(pc as usize);
     let mut prop_value_ids: Vec<u32> = Vec::with_capacity(pc as usize);
     let mut prop_method_reg_ids: Vec<u32> = Vec::with_capacity(pc as usize);
@@ -3707,7 +3824,7 @@ fn guest_napi_define_properties(
         let base = i * PROP_DESC_SIZE;
         let utf8name_guest =
             u32::from_le_bytes([raw[base], raw[base + 1], raw[base + 2], raw[base + 3]]);
-        let _name_id =
+        let name_id =
             u32::from_le_bytes([raw[base + 4], raw[base + 5], raw[base + 6], raw[base + 7]]);
         let method_ptr =
             u32::from_le_bytes([raw[base + 8], raw[base + 9], raw[base + 10], raw[base + 11]]);
@@ -3748,6 +3865,7 @@ fn guest_napi_define_properties(
             vec![]
         };
         let c_pname = CString::new(pname).unwrap_or_default();
+        prop_name_ids.push(name_id);
 
         if method_ptr != 0 {
             let reg_id = unsafe { snapi_bridge_alloc_cb_reg_id() };
@@ -3804,6 +3922,7 @@ fn guest_napi_define_properties(
             obj as u32,
             pc,
             prop_names_ptrs.as_ptr(),
+            prop_name_ids.as_ptr(),
             prop_types.as_ptr(),
             prop_value_ids.as_ptr(),
             prop_method_reg_ids.as_ptr(),
@@ -4074,27 +4193,9 @@ fn guest_napi_create_buffer(
             write_guest_bytes(&mut env, guest_ptr as u32, &zeros);
         }
 
-        // Create external ArrayBuffer backed by guest memory
-        let mut ab_id: u32 = 0;
-        let s = unsafe {
-            snapi_bridge_create_external_arraybuffer(host_addr, length as u32, &mut ab_id)
-        };
-        if s != 0 {
-            return s;
-        }
-
-        // Create Uint8Array on top of the ArrayBuffer (this is our "buffer")
-        // napi_uint8_array = 1 in napi_typedarray_type enum
         let mut buf_id: u32 = 0;
-        let s = unsafe {
-            snapi_bridge_create_typedarray(
-                1, /*napi_uint8_array*/
-                length as u32,
-                ab_id,
-                0,
-                &mut buf_id,
-            )
-        };
+        let s =
+            unsafe { snapi_bridge_create_external_buffer(host_addr, length as u32, &mut buf_id) };
         if s != 0 {
             return s;
         }
@@ -4159,27 +4260,9 @@ fn guest_napi_create_buffer_copy(
             host_base + guest_ptr as u64
         };
 
-        // Create external ArrayBuffer backed by guest memory
-        let mut ab_id: u32 = 0;
-        let s = unsafe {
-            snapi_bridge_create_external_arraybuffer(host_addr, length as u32, &mut ab_id)
-        };
-        if s != 0 {
-            return s;
-        }
-
-        // Create Uint8Array on top of the ArrayBuffer
-        // napi_uint8_array = 1 in napi_typedarray_type enum
         let mut buf_id: u32 = 0;
-        let s = unsafe {
-            snapi_bridge_create_typedarray(
-                1, /*napi_uint8_array*/
-                length as u32,
-                ab_id,
-                0,
-                &mut buf_id,
-            )
-        };
+        let s =
+            unsafe { snapi_bridge_create_external_buffer(host_addr, length as u32, &mut buf_id) };
         if s != 0 {
             return s;
         }
@@ -4231,9 +4314,10 @@ fn guest_napi_get_buffer_info(
     if len_ptr > 0 {
         write_guest_u32(&mut env, len_ptr as u32, bl);
     }
-    // Use stored guest data pointer mapping (V8 sandbox remaps external ArrayBuffer pointers)
     if data_ptr > 0 {
-        if let Some(&guest_data_ptr) = env.data().guest_data_ptrs.get(&(vh as u32)) {
+        if let Some(guest_data_ptr) =
+            resolve_or_copy_host_data_to_guest(&mut env, vh as u32, host_data, bl as usize)
+        {
             write_guest_u32(&mut env, data_ptr as u32, guest_data_ptr);
         }
     }
@@ -4890,18 +4974,21 @@ pub fn run_wasm_main_i32(wasm_path: &Path) -> Result<i32> {
     Ok(result)
 }
 
-pub fn run_wasix_main_capture_stdout(
+pub fn run_wasix_main_capture_stdio(
     wasm_path: &Path,
     args: &[String],
     extra_mounts: &[GuestMount],
-) -> Result<(i32, String)> {
+) -> Result<(i32, String, String)> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create tokio runtime for WASIX")?;
     let _guard = runtime.enter();
 
-    let (stdout_tx, mut stdout_rx) = Pipe::channel();
+    let (stdout_tx, stdout_rx) = Pipe::channel();
+    let (stderr_tx, stderr_rx) = Pipe::channel();
+    let stdout_thread = spawn_pipe_drain_thread(stdout_rx, Box::new(std::io::stdout()));
+    let stderr_thread = spawn_pipe_drain_thread(stderr_rx, Box::new(std::io::stderr()));
     let exit_code = {
         let wasm_bytes = std::fs::read(wasm_path)
             .with_context(|| format!("failed to read wasm file at {}", wasm_path.display()))?;
@@ -4909,7 +4996,8 @@ pub fn run_wasix_main_capture_stdout(
         let module = load_or_compile_module(&store, &wasm_bytes)?;
         let mut builder = WasiEnv::builder("guest-test")
             .engine(store.engine().clone())
-            .stdout(Box::new(stdout_tx));
+            .stdout(Box::new(stdout_tx))
+            .stderr(Box::new(stderr_tx));
         if !args.is_empty() {
             builder = builder.args(args.iter().map(|s| s.as_str()));
         }
@@ -5084,7 +5172,20 @@ pub fn run_wasix_main_capture_stdout(
         exit
     };
 
-    let mut out = String::new();
-    block_on(stdout_rx.read_to_string(&mut out)).context("failed reading WASIX stdout pipe")?;
-    Ok((exit_code, out))
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked"))??;
+    Ok((exit_code, stdout, stderr))
+}
+
+pub fn run_wasix_main_capture_stdout(
+    wasm_path: &Path,
+    args: &[String],
+    extra_mounts: &[GuestMount],
+) -> Result<(i32, String)> {
+    let (exit_code, stdout, _stderr) = run_wasix_main_capture_stdio(wasm_path, args, extra_mounts)?;
+    Ok((exit_code, stdout))
 }
