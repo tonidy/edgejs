@@ -83,6 +83,7 @@ napi_value UbiStreamBaseGetProviderType(UbiStreamBase* base);
 napi_value UbiStreamBaseAsyncReset(UbiStreamBase* base);
 napi_value UbiStreamBaseHasRefValue(UbiStreamBase* base);
 napi_value UbiStreamBaseGetWriteQueueSize(UbiStreamBase* base);
+uv_stream_t* UbiStreamBaseGetLibuvStream(napi_env env, napi_value value);
 
 napi_value UbiStreamBaseMakeInt32(napi_env env, int32_t value);
 napi_value UbiStreamBaseMakeInt64(napi_env env, int64_t value);

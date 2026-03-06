@@ -405,8 +405,9 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
   napi_value timeout_val = nullptr;
   if (GetNamedProperty(env, value, "timeout", &timeout_val)) {
     napi_valuetype timeout_t = napi_undefined;
-    if (napi_typeof(env, timeout_val, &timeout_t) == napi_ok &&
-        (timeout_t == napi_number || timeout_t == napi_bigint)) {
+    if (napi_typeof(env, timeout_val, &timeout_t) != napi_ok) return false;
+    if (timeout_t != napi_undefined && timeout_t != napi_null) {
+      if (timeout_t != napi_number) return false;
       int64_t timeout = 0;
       if (napi_get_value_int64(env, timeout_val, &timeout) == napi_ok && timeout > 0) {
         out->timeout_ms = timeout;
@@ -417,7 +418,9 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
   napi_value max_buffer_val = nullptr;
   if (GetNamedProperty(env, value, "maxBuffer", &max_buffer_val)) {
     napi_valuetype mb_t = napi_undefined;
-    if (napi_typeof(env, max_buffer_val, &mb_t) == napi_ok && mb_t == napi_number) {
+    if (napi_typeof(env, max_buffer_val, &mb_t) != napi_ok) return false;
+    if (mb_t != napi_undefined && mb_t != napi_null) {
+      if (mb_t != napi_number) return false;
       double mb = 0;
       if (napi_get_value_double(env, max_buffer_val, &mb) == napi_ok && mb >= 0) {
         if (mb > static_cast<double>(INT64_MAX)) out->max_buffer = INT64_MAX;
@@ -446,7 +449,9 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
   napi_value kill_signal_val = nullptr;
   if (GetNamedProperty(env, value, "killSignal", &kill_signal_val)) {
     napi_valuetype ks_t = napi_undefined;
-    if (napi_typeof(env, kill_signal_val, &ks_t) == napi_ok && ks_t == napi_number) {
+    if (napi_typeof(env, kill_signal_val, &ks_t) != napi_ok) return false;
+    if (ks_t != napi_undefined && ks_t != napi_null) {
+      if (ks_t != napi_number) return false;
       int32_t ks = SIGTERM;
       if (napi_get_value_int32(env, kill_signal_val, &ks) == napi_ok && ks > 0) {
         out->kill_signal = ks;
@@ -515,6 +520,8 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
         if (!ParseStdioObject(env, i, stdio_desc, &out->stdio[i])) return false;
       }
     }
+  } else if (has_stdio) {
+    return false;
   }
 
   napi_value input_val = nullptr;

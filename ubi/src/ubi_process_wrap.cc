@@ -20,10 +20,8 @@
 #include "ubi_async_wrap.h"
 #include "ubi_env_loop.h"
 #include "ubi_module_loader.h"
-#include "ubi_pipe_wrap.h"
 #include "ubi_runtime.h"
-#include "ubi_tcp_wrap.h"
-#include "ubi_tty_wrap.h"
+#include "ubi_stream_base.h"
 
 namespace {
 
@@ -330,14 +328,6 @@ const char* SignalNameFromNumber(int sig) {
   }
 }
 
-uv_stream_t* ExtractWrappedStream(napi_env env, napi_value value) {
-  if (value == nullptr) return nullptr;
-  if (uv_stream_t* stream = UbiPipeWrapGetStream(env, value)) return stream;
-  if (uv_stream_t* stream = UbiTcpWrapGetStream(env, value)) return stream;
-  if (uv_stream_t* stream = UbiTtyWrapGetStream(env, value)) return stream;
-  return nullptr;
-}
-
 bool ParseStringArray(napi_env env, napi_value value, std::vector<std::string>* storage, std::vector<char*>* out) {
   if (storage == nullptr || out == nullptr) return false;
   storage->clear();
@@ -410,7 +400,7 @@ bool ParseStdioOptions(napi_env env, napi_value js_options, std::vector<uv_stdio
     if (stdio_type == "pipe" || stdio_type == "overlapped") {
       napi_value handle_value = nullptr;
       if (!GetNamedValue(env, stdio, "handle", &handle_value) || handle_value == nullptr) return false;
-      uv_stream_t* stream = ExtractWrappedStream(env, handle_value);
+      uv_stream_t* stream = UbiStreamBaseGetLibuvStream(env, handle_value);
       if (stream == nullptr) return false;
       uv_stdio_flags flags = static_cast<uv_stdio_flags>(UV_CREATE_PIPE | UV_READABLE_PIPE | UV_WRITABLE_PIPE);
       if (stdio_type == "overlapped") {
@@ -424,7 +414,7 @@ bool ParseStdioOptions(napi_env env, napi_value js_options, std::vector<uv_stdio
     if (stdio_type == "wrap") {
       napi_value handle_value = nullptr;
       if (!GetNamedValue(env, stdio, "handle", &handle_value) || handle_value == nullptr) return false;
-      uv_stream_t* stream = ExtractWrappedStream(env, handle_value);
+      uv_stream_t* stream = UbiStreamBaseGetLibuvStream(env, handle_value);
       if (stream == nullptr) return false;
       entry.flags = UV_INHERIT_STREAM;
       entry.data.stream = stream;
@@ -673,7 +663,6 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   wrap->pid = static_cast<int32_t>(wrap->process.pid);
   wrap->alive = true;
   TrackLiveChildPid(wrap->pid);
-  uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->process));
   HoldWrapperRef(wrap);
   SetPidProperty(env, self, wrap->pid);
 

@@ -79,6 +79,15 @@ NAPI_EXTERN napi_status unofficial_napi_get_constructor_name(napi_env env,
                                                              napi_value value,
                                                              napi_value* name_out);
 
+// Unofficial helper for Node's internalBinding('util').getOwnNonIndexProperties.
+// Returns the target's own property names while skipping indexed elements at the
+// engine level, matching Node's use of IndexFilter::kSkipIndices.
+NAPI_EXTERN napi_status unofficial_napi_get_own_non_index_properties(
+    napi_env env,
+    napi_value value,
+    uint32_t filter_bits,
+    napi_value* result_out);
+
 // Unofficial helper for Node's internalBinding('util').privateSymbols.
 // Returns a JS-visible private symbol value backed by the engine's hidden
 // private property machinery.

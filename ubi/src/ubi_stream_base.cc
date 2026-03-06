@@ -9,8 +9,11 @@
 #include "ubi_active_resource.h"
 #include "ubi_async_wrap.h"
 #include "ubi_module_loader.h"
+#include "ubi_pipe_wrap.h"
 #include "ubi_runtime.h"
 #include "ubi_stream_wrap.h"
+#include "ubi_tcp_wrap.h"
+#include "ubi_tty_wrap.h"
 
 namespace {
 
@@ -807,6 +810,14 @@ napi_value UbiStreamBaseGetWriteQueueSize(UbiStreamBase* base) {
   napi_value out = nullptr;
   napi_create_uint32(base->env, size, &out);
   return out;
+}
+
+uv_stream_t* UbiStreamBaseGetLibuvStream(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+  if (uv_stream_t* stream = UbiPipeWrapGetStream(env, value)) return stream;
+  if (uv_stream_t* stream = UbiTcpWrapGetStream(env, value)) return stream;
+  if (uv_stream_t* stream = UbiTtyWrapGetStream(env, value)) return stream;
+  return nullptr;
 }
 
 napi_value UbiStreamBaseMakeInt32(napi_env env, int32_t value) {

@@ -43,6 +43,9 @@ target_compile_definitions(napi_v8
   PUBLIC
     NAPI_EXTERN=
 )
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(napi_v8 PRIVATE -fno-rtti)
+endif()
 if(NAPI_V8_DEFINES)
   target_compile_definitions(napi_v8 PRIVATE ${NAPI_V8_DEFINES})
 endif()

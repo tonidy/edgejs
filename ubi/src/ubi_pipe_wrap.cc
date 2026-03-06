@@ -326,9 +326,7 @@ napi_value PipeReadStop(napi_env env, napi_callback_info info) {
 }
 
 uv_stream_t* GetSendHandle(napi_env env, napi_value value) {
-  uv_stream_t* stream = UbiTcpWrapGetStream(env, value);
-  if (stream != nullptr) return stream;
-  stream = UbiPipeWrapGetStream(env, value);
+  uv_stream_t* stream = UbiStreamBaseGetLibuvStream(env, value);
   if (stream != nullptr) return stream;
   uv_handle_t* udp_handle = UbiUdpWrapGetHandle(env, value);
   return reinterpret_cast<uv_stream_t*>(udp_handle);

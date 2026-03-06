@@ -32,8 +32,6 @@ constexpr int32_t kExitInfoKExiting = 0;
 constexpr int32_t kExitInfoKExitCode = 1;
 constexpr int32_t kExitInfoKHasExitCode = 2;
 
-constexpr uint32_t kMaxArrayIndex = 4294967294u;
-
 struct LazyPropertyData {
   std::string module_id;
   std::string key;
@@ -163,18 +161,6 @@ bool MapSet(napi_env env, napi_value map, napi_value key, napi_value value) {
   if (!IsFunction(env, set_fn)) return false;
   napi_value argv[2] = {key, value};
   return CallFunction(env, map, set_fn, 2, argv) != nullptr;
-}
-
-bool IsArrayIndexString(std::string_view key) {
-  if (key.empty()) return false;
-  if (key.size() > 1 && key.front() == '0') return false;
-  uint64_t value = 0;
-  for (char ch : key) {
-    if (!std::isdigit(static_cast<unsigned char>(ch))) return false;
-    value = value * 10 + static_cast<unsigned>(ch - '0');
-    if (value > kMaxArrayIndex) return false;
-  }
-  return true;
 }
 
 bool ValueToTagEquals(napi_env env, napi_value value, const char* expected) {
@@ -500,12 +486,7 @@ napi_value GetOwnNonIndexPropertiesCallback(napi_env env, napi_callback_info inf
   }
 
   napi_value keys = nullptr;
-  if (napi_get_all_property_names(env,
-                                  source,
-                                  napi_key_own_only,
-                                  static_cast<napi_key_filter>(filter_bits),
-                                  napi_key_numbers_to_strings,
-                                  &keys) != napi_ok ||
+  if (unofficial_napi_get_own_non_index_properties(env, source, filter_bits, &keys) != napi_ok ||
       keys == nullptr) {
     return Undefined(env);
   }
@@ -529,7 +510,6 @@ napi_value GetOwnNonIndexPropertiesCallback(napi_env env, napi_callback_info inf
     }
 
     const std::string text = ToUtf8(env, key);
-    if (IsArrayIndexString(text)) continue;
     // internalBinding() is bootstrap-only in Node and should not leak into
     // REPL/global completion surfaces.
     if (source_is_global &&

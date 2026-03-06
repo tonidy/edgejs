@@ -239,15 +239,74 @@ bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
   return true;
 }
 
-class SerializerContext {
+class SerializerContext : public v8::ValueSerializer::Delegate {
  public:
   SerializerContext(napi_env env, v8::Local<v8::Object> wrap)
-      : env_(env), isolate_(env->isolate), serializer_(isolate_) {
+      : env_(env), isolate_(env->isolate), serializer_(isolate_, this) {
     wrap_.Reset(isolate_, wrap);
     wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
   }
 
   ~SerializerContext() { wrap_.Reset(); }
+
+  void ThrowDataCloneError(v8::Local<v8::String> message) override {
+    v8::Local<v8::Context> context = env_->context();
+    v8::Local<v8::Object> wrap = wrap_.Get(isolate_);
+
+    v8::Local<v8::Value> get_data_clone_error;
+    if (!wrap->Get(context, OneByteString(isolate_, "_getDataCloneError"))
+             .ToLocal(&get_data_clone_error) ||
+        !get_data_clone_error->IsFunction()) {
+      isolate_->ThrowException(v8::Exception::Error(message));
+      return;
+    }
+
+    v8::Local<v8::Value> argv[1] = {message};
+    v8::Local<v8::Value> error;
+    if (get_data_clone_error.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&error)) {
+      isolate_->ThrowException(error);
+    }
+  }
+
+  v8::Maybe<uint32_t> GetSharedArrayBufferId(
+      v8::Isolate* isolate,
+      v8::Local<v8::SharedArrayBuffer> shared_array_buffer) override {
+    v8::Local<v8::Context> context = env_->context();
+    v8::Local<v8::Object> wrap = wrap_.Get(isolate);
+
+    v8::Local<v8::Value> hook;
+    if (!wrap->Get(context, OneByteString(isolate, "_getSharedArrayBufferId")).ToLocal(&hook) ||
+        !hook->IsFunction()) {
+      return v8::ValueSerializer::Delegate::GetSharedArrayBufferId(isolate, shared_array_buffer);
+    }
+
+    v8::Local<v8::Value> argv[1] = {shared_array_buffer};
+    v8::Local<v8::Value> id;
+    if (!hook.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&id)) {
+      return v8::Nothing<uint32_t>();
+    }
+    return id->Uint32Value(context);
+  }
+
+  v8::Maybe<bool> WriteHostObject(v8::Isolate* isolate, v8::Local<v8::Object> input) override {
+    v8::Local<v8::Context> context = env_->context();
+    v8::Local<v8::Object> wrap = wrap_.Get(isolate);
+
+    v8::Local<v8::Value> hook;
+    if (!wrap->Get(context, OneByteString(isolate, "_writeHostObject")).ToLocal(&hook)) {
+      return v8::Nothing<bool>();
+    }
+    if (!hook->IsFunction()) {
+      return v8::ValueSerializer::Delegate::WriteHostObject(isolate, input);
+    }
+
+    v8::Local<v8::Value> argv[1] = {input};
+    v8::Local<v8::Value> ret;
+    if (!hook.As<v8::Function>()->Call(context, wrap, 1, argv).ToLocal(&ret)) {
+      return v8::Nothing<bool>();
+    }
+    return v8::Just(true);
+  }
 
   static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     v8::Isolate* isolate = args.GetIsolate();
@@ -293,8 +352,8 @@ class SerializerContext {
       const v8::FunctionCallbackInfo<v8::Value>& args) {
     SerializerContext* ctx = Unwrap(args);
     if (ctx == nullptr) return;
-    (void)args;
-    // Intentionally a no-op: keep V8 default ArrayBufferView serialization.
+    const bool value = args.Length() >= 1 && args[0]->BooleanValue(ctx->isolate_);
+    ctx->serializer_.SetTreatArrayBufferViewsAsHostObjects(value);
   }
 
   static void ReleaseBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -414,7 +473,7 @@ class SerializerContext {
   v8::ValueSerializer serializer_;
 };
 
-class DeserializerContext {
+class DeserializerContext : public v8::ValueDeserializer::Delegate {
  public:
   DeserializerContext(napi_env env,
                       v8::Local<v8::Object> wrap,
@@ -427,7 +486,7 @@ class DeserializerContext {
       data_.assign(data, data + size);
     }
     deserializer_ = std::make_unique<v8::ValueDeserializer>(
-        isolate_, data_.empty() ? nullptr : data_.data(), data_.size());
+        isolate_, data_.empty() ? nullptr : data_.data(), data_.size(), this);
 
     wrap_.Reset(isolate_, wrap);
     wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
@@ -440,6 +499,31 @@ class DeserializerContext {
   ~DeserializerContext() {
     wrap_.Reset();
     deserializer_.reset();
+  }
+
+  v8::MaybeLocal<v8::Object> ReadHostObject(v8::Isolate* isolate) override {
+    v8::Local<v8::Context> context = env_->context();
+    v8::Local<v8::Object> wrap = wrap_.Get(isolate);
+
+    v8::Local<v8::Value> hook;
+    if (!wrap->Get(context, OneByteString(isolate, "_readHostObject")).ToLocal(&hook)) {
+      return {};
+    }
+    if (!hook->IsFunction()) {
+      return v8::ValueDeserializer::Delegate::ReadHostObject(isolate);
+    }
+
+    v8::Isolate::AllowJavascriptExecutionScope allow_js(isolate);
+    v8::Local<v8::Value> ret;
+    if (!hook.As<v8::Function>()->Call(context, wrap, 0, nullptr).ToLocal(&ret)) {
+      return {};
+    }
+    if (!ret->IsObject()) {
+      isolate->ThrowException(v8::Exception::TypeError(
+          OneByteString(isolate, "readHostObject must return an object")));
+      return {};
+    }
+    return ret.As<v8::Object>();
   }
 
   static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -493,12 +577,16 @@ class DeserializerContext {
     if (ctx == nullptr || !ctx->deserializer_ || args.Length() < 2) return;
     uint32_t id = 0;
     if (!args[0]->Uint32Value(ctx->env_->context()).To(&id)) return;
-    if (!args[1]->IsArrayBuffer()) {
-      ctx->isolate_->ThrowException(v8::Exception::TypeError(
-          OneByteString(ctx->isolate_, "arrayBuffer must be an ArrayBuffer")));
+    if (args[1]->IsArrayBuffer()) {
+      ctx->deserializer_->TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
       return;
     }
-    ctx->deserializer_->TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
+    if (args[1]->IsSharedArrayBuffer()) {
+      ctx->deserializer_->TransferSharedArrayBuffer(id, args[1].As<v8::SharedArrayBuffer>());
+      return;
+    }
+    ctx->isolate_->ThrowException(v8::Exception::TypeError(
+        OneByteString(ctx->isolate_, "arrayBuffer must be an ArrayBuffer or SharedArrayBuffer")));
   }
 
   static void GetWireFormatVersion(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -955,6 +1043,29 @@ napi_status NAPI_CDECL unofficial_napi_get_constructor_name(napi_env env,
   v8::Local<v8::String> name = raw.As<v8::Object>()->GetConstructorName();
   *name_out = napi_v8_wrap_value(env, name);
   return *name_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_own_non_index_properties(
+    napi_env env,
+    napi_value value,
+    uint32_t filter_bits,
+    napi_value* result_out) {
+  if (env == nullptr || value == nullptr || result_out == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+  if (raw.IsEmpty() || !raw->IsObject()) return napi_invalid_arg;
+
+  v8::Local<v8::Array> properties;
+  if (!raw.As<v8::Object>()
+           ->GetPropertyNames(env->context(),
+                              v8::KeyCollectionMode::kOwnOnly,
+                              static_cast<v8::PropertyFilter>(filter_bits),
+                              v8::IndexFilter::kSkipIndices)
+           .ToLocal(&properties)) {
+    return napi_generic_failure;
+  }
+
+  *result_out = napi_v8_wrap_value(env, properties);
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_create_private_symbol(napi_env env,
