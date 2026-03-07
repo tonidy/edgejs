@@ -106,11 +106,23 @@ assert.strictEqual(zeroFillToggle.length, 1);
 
 const encodingBinding = internalBinding('encoding_binding');
 assert.ok(encodingBinding && typeof encodingBinding === 'object');
-assert.strictEqual(typeof encodingBinding.decodeLatin1, 'function');
-assert.strictEqual(
-  encodingBinding.decodeLatin1(Buffer.from([0x41, 0xe9]), 0, 2),
-  'A\xe9',
+assert.deepStrictEqual(
+  Object.keys(encodingBinding).sort(),
+  ['decodeUTF8', 'encodeInto', 'encodeIntoResults', 'encodeUtf8String', 'toASCII', 'toUnicode'],
 );
+assert.ok(encodingBinding.encodeIntoResults instanceof Uint32Array);
+assert.strictEqual(encodingBinding.encodeIntoResults.length, 2);
+for (const key of [
+  'decodeLatin1',
+  'decodeUtf8',
+  'encodeBase64',
+  'encodeUtf8',
+  'decodeBase64',
+  'utf8ByteLength',
+  'validateUtf8',
+]) {
+  assert.ok(!(key in encodingBinding), key);
+}
 
 const symbolsBinding = internalBinding('symbols');
 assert.ok(symbolsBinding && typeof symbolsBinding === 'object');

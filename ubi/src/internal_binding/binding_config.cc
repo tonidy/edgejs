@@ -45,14 +45,6 @@ bool IsTruthy(napi_env env, napi_value value) {
   return false;
 }
 
-bool HasIntl(napi_env env) {
-  napi_value global = GetGlobal(env);
-  napi_value intl = GetNamed(env, global, "Intl");
-  if (intl == nullptr) return false;
-  napi_valuetype t = napi_undefined;
-  return napi_typeof(env, intl, &t) == napi_ok && (t == napi_object || t == napi_function);
-}
-
 bool GetProcessConfigVariable(napi_env env, const char* key) {
   napi_value global = GetGlobal(env);
   napi_value process = GetNamed(env, global, "process");
@@ -89,7 +81,9 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return Undefined(env);
 
-  const bool has_intl = HasIntl(env);
+  // Match Node's compile-time config semantics: the ICU binding is built in,
+  // so `hasIntl` must stay true even when the JS global `Intl` is not exposed.
+  const bool has_intl = true;
   const bool has_inspector = false;
   const bool has_tracing = false;
 #ifdef OPENSSL_VERSION_NUMBER

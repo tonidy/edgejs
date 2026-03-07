@@ -12,41 +12,13 @@
 
 namespace {
 
-napi_ref g_encode_into_results_ref = nullptr;
+struct EncodingBindingState {
+  napi_ref encode_into_results_ref = nullptr;
+};
 
 const char* ZeroLengthByteSentinel() {
   static const char sentinel = 0;
   return &sentinel;
-}
-
-bool IsBase64Char(char c, bool url_mode) {
-  if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-    return true;
-  }
-  if (c == '=') return true;
-  if (c == '+' || c == '/') return true;
-  if (url_mode && (c == '-' || c == '_')) return true;
-  return false;
-}
-
-std::string NormalizeForgivingBase64(const std::string& input, bool url_mode) {
-  std::string compact;
-  compact.reserve(input.size());
-  for (char c : input) {
-    if (c == '=') break;
-    if (!IsBase64Char(c, url_mode)) continue;
-    if (url_mode) {
-      if (c == '-') c = '+';
-      else if (c == '_') c = '/';
-    }
-    compact.push_back(c);
-  }
-
-  const size_t rem = compact.size() % 4;
-  if (rem == 1) return "";
-  if (rem == 2) compact.append("==");
-  else if (rem == 3) compact.push_back('=');
-  return compact;
 }
 
 napi_value GetUndefined(napi_env env) {
@@ -103,6 +75,7 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, const char** data, si
     switch (type) {
       case napi_int16_array:
       case napi_uint16_array:
+      case napi_float16_array:
         bytes_per_element = 2;
         break;
       case napi_int32_array:
@@ -119,6 +92,7 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, const char** data, si
         bytes_per_element = 1;
         break;
     }
+
     *len = element_len * bytes_per_element;
     if (ptr == nullptr && *len != 0) return false;
     *data = ptr != nullptr ? static_cast<const char*>(ptr) : ZeroLengthByteSentinel();
@@ -159,9 +133,9 @@ napi_value MakeUint8Array(napi_env env, const char* data, size_t len) {
   return typed;
 }
 
-void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
+void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb, void* data) {
   napi_value fn = nullptr;
-  if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok && fn != nullptr) {
+  if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, data, &fn) == napi_ok && fn != nullptr) {
     napi_set_named_property(env, obj, name, fn);
   }
 }
@@ -184,16 +158,29 @@ void ThrowTypeErrorWithCode(napi_env env, std::string_view message, std::string_
   napi_throw(env, err);
 }
 
-napi_value GetEncodeIntoResultsArray(napi_env env) {
-  if (g_encode_into_results_ref == nullptr) return nullptr;
+void DeleteBindingState(napi_env env, void* data, void* /*hint*/) {
+  auto* state = static_cast<EncodingBindingState*>(data);
+  if (state == nullptr) return;
+  if (state->encode_into_results_ref != nullptr) {
+    napi_delete_reference(env, state->encode_into_results_ref);
+    state->encode_into_results_ref = nullptr;
+  }
+  delete state;
+}
+
+napi_value GetEncodeIntoResultsArray(napi_env env, EncodingBindingState* state) {
+  if (state == nullptr || state->encode_into_results_ref == nullptr) return nullptr;
   napi_value arr = nullptr;
-  if (napi_get_reference_value(env, g_encode_into_results_ref, &arr) != napi_ok || arr == nullptr) return nullptr;
+  if (napi_get_reference_value(env, state->encode_into_results_ref, &arr) != napi_ok || arr == nullptr) {
+    return nullptr;
+  }
   return arr;
 }
 
-void UpdateEncodeIntoResults(napi_env env, uint32_t read, uint32_t written) {
-  napi_value arr = GetEncodeIntoResultsArray(env);
+void UpdateEncodeIntoResults(napi_env env, EncodingBindingState* state, uint32_t read, uint32_t written) {
+  napi_value arr = GetEncodeIntoResultsArray(env, state);
   if (arr == nullptr) return;
+
   napi_value v_read = nullptr;
   napi_value v_written = nullptr;
   if (napi_create_uint32(env, read, &v_read) == napi_ok && v_read != nullptr) {
@@ -240,14 +227,14 @@ void DecodeUtf8Lossy(const uint8_t* data, size_t len, std::vector<char16_t>* out
   size_t i = 0;
   while (i < len) {
     uint32_t cp = 0xFFFD;
-    uint8_t b0 = data[i];
+    const uint8_t b0 = data[i];
 
     if (b0 < 0x80) {
       cp = b0;
       i += 1;
     } else if (b0 >= 0xC2 && b0 <= 0xDF) {
       if (i + 1 < len) {
-        uint8_t b1 = data[i + 1];
+        const uint8_t b1 = data[i + 1];
         if ((b1 & 0xC0) == 0x80) {
           cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
           i += 2;
@@ -259,8 +246,8 @@ void DecodeUtf8Lossy(const uint8_t* data, size_t len, std::vector<char16_t>* out
       }
     } else if (b0 >= 0xE0 && b0 <= 0xEF) {
       if (i + 2 < len) {
-        uint8_t b1 = data[i + 1];
-        uint8_t b2 = data[i + 2];
+        const uint8_t b1 = data[i + 1];
+        const uint8_t b2 = data[i + 2];
         bool ok = (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80;
         ok = ok && !((b0 == 0xE0) && (b1 < 0xA0));
         ok = ok && !((b0 == 0xED) && (b1 > 0x9F));
@@ -275,9 +262,9 @@ void DecodeUtf8Lossy(const uint8_t* data, size_t len, std::vector<char16_t>* out
       }
     } else if (b0 >= 0xF0 && b0 <= 0xF4) {
       if (i + 3 < len) {
-        uint8_t b1 = data[i + 1];
-        uint8_t b2 = data[i + 2];
-        uint8_t b3 = data[i + 3];
+        const uint8_t b1 = data[i + 1];
+        const uint8_t b2 = data[i + 2];
+        const uint8_t b3 = data[i + 3];
         bool ok = (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80;
         ok = ok && !((b0 == 0xF0) && (b1 < 0x90));
         ok = ok && !((b0 == 0xF4) && (b1 > 0x8F));
@@ -324,7 +311,8 @@ bool DecodeUTF8ToString(
   }
 
   if (fatal && !simdutf::validate_utf8(data, length)) {
-    ThrowTypeErrorWithCode(env, "The encoded data was not valid for encoding utf-8",
+    ThrowTypeErrorWithCode(env,
+                           "The encoded data was not valid for encoding utf-8",
                            "ERR_ENCODING_INVALID_ENCODED_DATA");
     return false;
   }
@@ -375,9 +363,13 @@ napi_value BindingEncodeUtf8String(napi_env env, napi_callback_info info) {
 napi_value BindingEncodeInto(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) {
+  void* data = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, &data) != napi_ok || argc < 2) {
     return GetUndefined(env);
   }
+
+  auto* state = static_cast<EncodingBindingState*>(data);
+  UpdateEncodeIntoResults(env, state, 0, 0);
 
   size_t utf16_len = 0;
   if (napi_get_value_string_utf16(env, argv[0], nullptr, 0, &utf16_len) != napi_ok) {
@@ -391,20 +383,28 @@ napi_value BindingEncodeInto(napi_env env, napi_callback_info info) {
 
   bool is_typed = false;
   if (napi_is_typedarray(env, argv[1], &is_typed) != napi_ok || !is_typed) {
+    ThrowTypeErrorWithCode(env, "The \"dest\" argument must be an instance of Uint8Array.", "ERR_INVALID_ARG_TYPE");
     return GetUndefined(env);
   }
+
   napi_typedarray_type type = napi_uint8_array;
   size_t element_len = 0;
   void* ptr = nullptr;
   napi_value arraybuffer = nullptr;
   size_t byte_offset = 0;
-  if (napi_get_typedarray_info(env, argv[1], &type, &element_len, &ptr, &arraybuffer, &byte_offset) != napi_ok ||
-      ptr == nullptr) {
+  if (napi_get_typedarray_info(env, argv[1], &type, &element_len, &ptr, &arraybuffer, &byte_offset) != napi_ok) {
+    return GetUndefined(env);
+  }
+  if (type != napi_uint8_array) {
+    ThrowTypeErrorWithCode(env, "The \"dest\" argument must be an instance of Uint8Array.", "ERR_INVALID_ARG_TYPE");
+    return GetUndefined(env);
+  }
+  if (ptr == nullptr && element_len != 0) {
     return GetUndefined(env);
   }
 
-  char* dest = static_cast<char*>(ptr);
-  size_t dest_len = element_len;
+  auto* dest = static_cast<char*>(ptr);
+  const size_t dest_len = element_len;
   uint32_t read = 0;
   uint32_t written = 0;
 
@@ -413,7 +413,7 @@ napi_value BindingEncodeInto(napi_env env, napi_callback_info info) {
     size_t consumed = 1;
     if (cp >= 0xD800 && cp <= 0xDBFF) {
       if (i + 1 < copied) {
-        uint32_t lo = input[i + 1];
+        const uint32_t lo = input[i + 1];
         if (lo >= 0xDC00 && lo <= 0xDFFF) {
           cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
           consumed = 2;
@@ -435,43 +435,8 @@ napi_value BindingEncodeInto(napi_env env, napi_callback_info info) {
     i += consumed;
   }
 
-  UpdateEncodeIntoResults(env, read, written);
+  UpdateEncodeIntoResults(env, state, read, written);
   return GetUndefined(env);
-}
-
-napi_value BindingUtf8ByteLength(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
-    return GetUndefined(env);
-  }
-  size_t utf16_len = 0;
-  if (napi_get_value_string_utf16(env, argv[0], nullptr, 0, &utf16_len) != napi_ok) {
-    return GetUndefined(env);
-  }
-  std::vector<char16_t> input(utf16_len + 1);
-  size_t copied = 0;
-  if (napi_get_value_string_utf16(env, argv[0], input.data(), input.size(), &copied) != napi_ok) {
-    return GetUndefined(env);
-  }
-  const size_t out_len = simdutf::utf8_length_from_utf16(input.data(), copied);
-  napi_value out = nullptr;
-  if (napi_create_uint32(env, static_cast<uint32_t>(out_len), &out) != napi_ok) return GetUndefined(env);
-  return out;
-}
-
-napi_value BindingValidateUtf8(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
-    return GetUndefined(env);
-  }
-  const char* data = nullptr;
-  size_t len = 0;
-  if (!ExtractBytesFromValue(env, argv[0], &data, &len)) return GetUndefined(env);
-  napi_value out = nullptr;
-  if (napi_get_boolean(env, simdutf::validate_utf8(data, len), &out) != napi_ok) return GetUndefined(env);
-  return out;
 }
 
 napi_value BindingDecodeUTF8(napi_env env, napi_callback_info info) {
@@ -501,98 +466,20 @@ napi_value BindingDecodeUTF8(napi_env env, napi_callback_info info) {
   return out;
 }
 
-napi_value BindingDecodeUtf8(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
-    return GetUndefined(env);
-  }
-
-  const char* data = nullptr;
-  size_t len = 0;
-  if (!ExtractBytesFromValue(env, argv[0], &data, &len)) return GetUndefined(env);
-  napi_value out = nullptr;
-  if (!DecodeUTF8ToString(env, data, len, true, false, &out)) return GetUndefined(env);
-  return out;
-}
-
-napi_value BindingEncodeBase64(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
-    return GetUndefined(env);
-  }
-  const char* data = nullptr;
-  size_t len = 0;
-  if (!ExtractBytesFromValue(env, argv[0], &data, &len)) return GetUndefined(env);
-  bool is_url = false;
-  if (argc >= 2 && argv[1] != nullptr) napi_get_value_bool(env, argv[1], &is_url);
-
-  const size_t out_len = is_url
-                             ? simdutf::base64_length_from_binary(len, simdutf::base64_url)
-                             : simdutf::base64_length_from_binary(len);
-  std::string out(out_len, '\0');
-  const size_t written = is_url
-                             ? simdutf::binary_to_base64(data, len, out.data(), simdutf::base64_url)
-                             : simdutf::binary_to_base64(data, len, out.data());
-  if (written != out_len) return GetUndefined(env);
-  napi_value str = nullptr;
-  if (napi_create_string_utf8(env, out.data(), written, &str) != napi_ok) return GetUndefined(env);
-  return str;
-}
-
-napi_value BindingDecodeBase64(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
-    return GetUndefined(env);
-  }
-
-  size_t in_len = 0;
-  if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &in_len) != napi_ok) return GetUndefined(env);
-  std::string input(in_len + 1, '\0');
-  size_t copied = 0;
-  if (napi_get_value_string_utf8(env, argv[0], input.data(), input.size(), &copied) != napi_ok) return GetUndefined(env);
-  input.resize(copied);
-
-  bool is_url = false;
-  if (argc >= 2 && argv[1] != nullptr) napi_get_value_bool(env, argv[1], &is_url);
-
-  const size_t max_len = simdutf::maximal_binary_length_from_base64(input.data(), input.size());
-  std::vector<char> out(max_len);
-  size_t out_len = max_len;
-  simdutf::result result = is_url
-                               ? simdutf::base64_to_binary_safe(
-                                     input.data(), input.size(), out.data(), out_len, simdutf::base64_url)
-                               : simdutf::base64_to_binary_safe(
-                                     input.data(), input.size(), out.data(), out_len);
-  if (result.error != simdutf::error_code::SUCCESS) {
-    const std::string forgiving = NormalizeForgivingBase64(input, is_url);
-    if (forgiving.empty()) return MakeUint8Array(env, nullptr, 0);
-    const size_t fallback_max = simdutf::maximal_binary_length_from_base64(forgiving.data(), forgiving.size());
-    std::vector<char> fallback_out(fallback_max);
-    size_t fallback_len = fallback_max;
-    simdutf::result fallback_result =
-        simdutf::base64_to_binary_safe(forgiving.data(), forgiving.size(), fallback_out.data(), fallback_len);
-    if (fallback_result.error != simdutf::error_code::SUCCESS) {
-      return MakeUint8Array(env, nullptr, 0);
-    }
-    return MakeUint8Array(env, fallback_out.data(), fallback_len);
-  }
-  return MakeUint8Array(env, out.data(), out_len);
-}
-
 napi_value BindingToASCII(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
     return GetUndefined(env);
   }
+
   size_t in_len = 0;
   if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &in_len) != napi_ok) return GetUndefined(env);
   std::string input(in_len + 1, '\0');
   size_t copied = 0;
-  if (napi_get_value_string_utf8(env, argv[0], input.data(), input.size(), &copied) != napi_ok) return GetUndefined(env);
+  if (napi_get_value_string_utf8(env, argv[0], input.data(), input.size(), &copied) != napi_ok) {
+    return GetUndefined(env);
+  }
   input.resize(copied);
 
   napi_value out = nullptr;
@@ -611,11 +498,14 @@ napi_value BindingToUnicode(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) {
     return GetUndefined(env);
   }
+
   size_t in_len = 0;
   if (napi_get_value_string_utf8(env, argv[0], nullptr, 0, &in_len) != napi_ok) return GetUndefined(env);
   std::string input(in_len + 1, '\0');
   size_t copied = 0;
-  if (napi_get_value_string_utf8(env, argv[0], input.data(), input.size(), &copied) != napi_ok) return GetUndefined(env);
+  if (napi_get_value_string_utf8(env, argv[0], input.data(), input.size(), &copied) != napi_ok) {
+    return GetUndefined(env);
+  }
   input.resize(copied);
 
   napi_value out = nullptr;
@@ -634,35 +524,39 @@ napi_value UbiInstallEncodingBinding(napi_env env) {
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
 
+  auto* state = new EncodingBindingState();
+  bool ok = true;
+
+  napi_value arraybuffer = nullptr;
   napi_value encode_into_results = nullptr;
-  if (napi_create_array_with_length(env, 2, &encode_into_results) == napi_ok && encode_into_results != nullptr) {
-    napi_value zero = nullptr;
-    napi_create_uint32(env, 0, &zero);
-    if (zero != nullptr) {
-      napi_set_element(env, encode_into_results, 0, zero);
-      napi_set_element(env, encode_into_results, 1, zero);
-    }
-    napi_set_named_property(env, binding, "encodeIntoResults", encode_into_results);
-    if (g_encode_into_results_ref != nullptr) {
-      napi_delete_reference(env, g_encode_into_results_ref);
-      g_encode_into_results_ref = nullptr;
-    }
-    napi_create_reference(env, encode_into_results, 1, &g_encode_into_results_ref);
+  void* raw_results = nullptr;
+  if (napi_create_arraybuffer(env, sizeof(uint32_t) * 2, &raw_results, &arraybuffer) != napi_ok ||
+      arraybuffer == nullptr || raw_results == nullptr ||
+      napi_create_typedarray(env, napi_uint32_array, 2, arraybuffer, 0, &encode_into_results) != napi_ok ||
+      encode_into_results == nullptr ||
+      napi_set_named_property(env, binding, "encodeIntoResults", encode_into_results) != napi_ok ||
+      napi_create_reference(env, encode_into_results, 1, &state->encode_into_results_ref) != napi_ok ||
+      state->encode_into_results_ref == nullptr) {
+    ok = false;
+  } else {
+    auto* results = static_cast<uint32_t*>(raw_results);
+    results[0] = 0;
+    results[1] = 0;
   }
 
-  SetMethod(env, binding, "encodeInto", BindingEncodeInto);
-  SetMethod(env, binding, "encodeUtf8String", BindingEncodeUtf8String);
-  SetMethod(env, binding, "decodeUTF8", BindingDecodeUTF8);
-  SetMethod(env, binding, "toASCII", BindingToASCII);
-  SetMethod(env, binding, "toUnicode", BindingToUnicode);
+  if (ok) {
+    SetMethod(env, binding, "encodeInto", BindingEncodeInto, state);
+    SetMethod(env, binding, "encodeUtf8String", BindingEncodeUtf8String, state);
+    SetMethod(env, binding, "decodeUTF8", BindingDecodeUTF8, state);
+    SetMethod(env, binding, "toASCII", BindingToASCII, state);
+    SetMethod(env, binding, "toUnicode", BindingToUnicode, state);
+    ok = napi_wrap(env, binding, state, DeleteBindingState, nullptr, nullptr) == napi_ok;
+  }
 
-  // Legacy helpers used by existing ubi builtins.
-  SetMethod(env, binding, "encodeUtf8", BindingEncodeUtf8String);
-  SetMethod(env, binding, "decodeUtf8", BindingDecodeUtf8);
-  SetMethod(env, binding, "utf8ByteLength", BindingUtf8ByteLength);
-  SetMethod(env, binding, "validateUtf8", BindingValidateUtf8);
-  SetMethod(env, binding, "encodeBase64", BindingEncodeBase64);
-  SetMethod(env, binding, "decodeBase64", BindingDecodeBase64);
+  if (!ok) {
+    DeleteBindingState(env, state, nullptr);
+    return nullptr;
+  }
 
   return binding;
 }

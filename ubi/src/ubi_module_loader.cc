@@ -220,6 +220,10 @@ std::string LoadBuiltinsConfigJson() {
     // Ubi does not yet implement Amaro/type-stripping, so process.config
     // must not advertise it or Node's own tests will take unsupported paths.
     ReplaceJsonBooleanOrNumber(&body, "node_use_amaro", false);
+    // Ubi ships its own ICU-backed encoding support and should advertise that
+    // in the serialized config consumed by bootstrap/node.
+    ReplaceJsonBooleanOrNumber(&body, "v8_enable_i18n_support", true);
+    ReplaceJsonBooleanOrNumber(&body, "icu_small", false);
     cached = body;
     if (!cached.empty()) return cached;
   }
@@ -229,6 +233,8 @@ std::string LoadBuiltinsConfigJson() {
   cached =
       "{"
       "\"variables\":{"
+      "\"v8_enable_i18n_support\":1,"
+      "\"icu_small\":false,"
       "\"node_use_amaro\":false,"
       "\"node_builtin_shareable_builtins\":["
       "\"deps/cjs-module-lexer/lexer.js\","
@@ -1054,6 +1060,10 @@ static void ResetStateRef(napi_env env, napi_ref* slot, napi_value value) {
 
 static bool IsPerContextBuiltinId(const std::string& id) {
   return id.rfind("internal/per_context/", 0) == 0;
+}
+
+static bool ShouldCacheInternalBinding(const std::string& name) {
+  return name != "encoding_binding";
 }
 
 static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state) {
@@ -3269,7 +3279,7 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
   }
   auto* state = static_cast<ModuleLoaderState*>(data);
   const std::string name = ValueToUtf8(env, argv[0]);
-  if (!name.empty()) {
+  if (!name.empty() && ShouldCacheInternalBinding(name)) {
     napi_value cached = GetCachedInternalBinding(state, env, name.c_str());
     if (cached != nullptr) {
       return cached;
@@ -3290,7 +3300,7 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
 
   napi_value resolved = internal_binding::Resolve(env, name, options);
   if (resolved != nullptr) {
-    if (!name.empty() && !IsUndefinedValue(env, resolved)) {
+    if (!name.empty() && ShouldCacheInternalBinding(name) && !IsUndefinedValue(env, resolved)) {
       napi_value cached = CacheInternalBinding(state, env, name.c_str(), resolved);
       if (cached != nullptr) {
         return cached;

@@ -316,6 +316,19 @@ bool SetProcessConfigVariableInt(napi_env env, napi_value variables_obj, const c
   return napi_set_named_property(env, variables_obj, key, js_value) == napi_ok;
 }
 
+bool EnsureProcessConfigVariablesForUbi(napi_env env, napi_value config_obj) {
+  if (config_obj == nullptr) return false;
+
+  napi_value variables_obj = nullptr;
+  if (napi_get_named_property(env, config_obj, "variables", &variables_obj) != napi_ok || variables_obj == nullptr) {
+    if (napi_create_object(env, &variables_obj) != napi_ok || variables_obj == nullptr) return false;
+    if (napi_set_named_property(env, config_obj, "variables", variables_obj) != napi_ok) return false;
+  }
+
+  return SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", 1) &&
+         SetProcessConfigVariableInt(env, variables_obj, "icu_small", 0);
+}
+
 napi_value BuildMinimalProcessConfigObject(napi_env env) {
   napi_value config_obj = nullptr;
   if (napi_create_object(env, &config_obj) != napi_ok || config_obj == nullptr) return nullptr;
@@ -431,9 +444,13 @@ napi_value BuildProcessConfigObject(napi_env env) {
   const std::string config_text = FindNodeConfigGypiText();
   napi_value parsed = ParseProcessConfigObjectFromText(env, config_text);
   if (parsed != nullptr) {
+    if (!EnsureProcessConfigVariablesForUbi(env, parsed)) return nullptr;
     return parsed;
   }
-  return BuildMinimalProcessConfigObject(env);
+  napi_value minimal = BuildMinimalProcessConfigObject(env);
+  if (minimal == nullptr) return nullptr;
+  if (!EnsureProcessConfigVariablesForUbi(env, minimal)) return nullptr;
+  return minimal;
 }
 
 uint64_t GetHrtimeNanoseconds() {
