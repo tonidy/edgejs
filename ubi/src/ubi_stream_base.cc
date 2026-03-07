@@ -204,6 +204,25 @@ bool IsFunction(napi_env env, napi_value value) {
   return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
 }
 
+void DefineValueProperty(napi_env env,
+                         napi_value object,
+                         const char* name,
+                         napi_value value,
+                         napi_property_attributes attrs) {
+  if (env == nullptr || object == nullptr || name == nullptr || value == nullptr) return;
+  napi_property_descriptor desc = {
+      name,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      value,
+      attrs,
+      nullptr,
+  };
+  napi_define_properties(env, object, 1, &desc);
+}
+
 std::string ValueToUtf8(napi_env env, napi_value value) {
   if (env == nullptr || value == nullptr) return {};
   napi_value string_value = nullptr;
@@ -540,11 +559,23 @@ void UbiStreamBaseSetInitialStreamProperties(UbiStreamBase* base,
   napi_value self = UbiStreamBaseGetWrapper(base);
   if (self == nullptr) return;
 
-  napi_set_named_property(base->env, self, "isStreamBase", UbiStreamBaseMakeBool(base->env, true));
-  napi_set_named_property(base->env, self, "reading", UbiStreamBaseMakeBool(base->env, false));
+  DefineValueProperty(base->env,
+                      self,
+                      "isStreamBase",
+                      UbiStreamBaseMakeBool(base->env, true),
+                      static_cast<napi_property_attributes>(0));
+  DefineValueProperty(base->env,
+                      self,
+                      "reading",
+                      UbiStreamBaseMakeBool(base->env, false),
+                      napi_writable);
 
   if (set_onconnection) {
-    napi_set_named_property(base->env, self, "onconnection", UbiStreamBaseUndefined(base->env));
+    DefineValueProperty(base->env,
+                        self,
+                        "onconnection",
+                        UbiStreamBaseUndefined(base->env),
+                        napi_writable);
   }
 
   if (set_owner_symbol) {

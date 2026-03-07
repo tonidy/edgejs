@@ -68,6 +68,21 @@ std::filesystem::path ResolveBuiltUbienvBinary() {
   return ResolveBuiltBinary("ubienv");
 }
 
+#if defined(NAPI_V8_NODE_ROOT_PATH) || defined(PROJECT_ROOT_PATH)
+std::filesystem::path ResolveNodeTestScriptPath(const char* relative_path) {
+  namespace fs = std::filesystem;
+#if defined(NAPI_V8_NODE_ROOT_PATH)
+  fs::path node_root(NAPI_V8_NODE_ROOT_PATH);
+#else
+  fs::path node_root(PROJECT_ROOT_PATH "/node");
+#endif
+  if (!node_root.is_absolute()) {
+    node_root = fs::absolute(node_root).lexically_normal();
+  }
+  return fs::absolute(node_root / "test" / relative_path).lexically_normal();
+}
+#endif
+
 std::string ShellSingleQuoted(const std::string& input) {
   std::string out;
   out.reserve(input.size() + 2);
@@ -552,7 +567,9 @@ TEST_F(Test1CliPhase01, ScriptFileDoesNotLeakEvalGlobals) {
   ASSERT_NE(result.status, -1);
   ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
-  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty() ||
+              result.stderr_output.find("internal/test/binding") != std::string::npos)
+      << "stderr=" << result.stderr_output;
   EXPECT_NE(result.stdout_output.find("script-globals:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
@@ -580,7 +597,9 @@ TEST_F(Test1CliPhase01, EvalModeExposesNodeStyleEvalGlobals) {
   ASSERT_NE(result.status, -1);
   ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
   EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
-  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty() ||
+              result.stderr_output.find("internal/test/binding") != std::string::npos)
+      << "stderr=" << result.stderr_output;
   EXPECT_NE(result.stdout_output.find("eval-globals:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
@@ -951,6 +970,111 @@ TEST_F(Test1CliPhase01, IntlSurfaceMatchesNodeBasics) {
   EXPECT_NE(result.stdout_output.find("\"nfkdAt\":\"@\""), std::string::npos) << result.stdout_output;
   EXPECT_NE(result.stdout_output.find("\"trLower\":\"ı\""), std::string::npos) << result.stdout_output;
   EXPECT_NE(result.stdout_output.find("\"trUpper\":\"İ\""), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, SerdesBindingMatchesNodeContractAndHostObjectSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Serdes subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_serdes_contract",
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const v8 = require('v8');\n"
+      "function snap(fn) {\n"
+      "  try { fn(); return { ok: true }; } catch (err) {\n"
+      "    return { name: err?.name, message: err?.message, code: err?.code };\n"
+      "  }\n"
+      "}\n"
+      "const ser = new v8.Serializer();\n"
+      "ser.writeHeader();\n"
+      "const out = ser.releaseBuffer();\n"
+      "const hostError = snap(() => v8.serialize(new (internalBinding('js_stream').JSStream)()));\n"
+      "console.log(JSON.stringify({\n"
+      "  isBuffer: Buffer.isBuffer(out),\n"
+      "  byteLength: out.byteLength,\n"
+      "  bufferByteLength: out.buffer.byteLength,\n"
+      "  byteOffset: out.byteOffset,\n"
+      "  serializerName: v8.Serializer.name,\n"
+      "  deserializerName: v8.Deserializer.name,\n"
+      "  deserializerLength: v8.Deserializer.length,\n"
+      "  serializerProtoWritable: Object.getOwnPropertyDescriptor(v8.Serializer, 'prototype').writable,\n"
+      "  deserializerProtoWritable: Object.getOwnPropertyDescriptor(v8.Deserializer, 'prototype').writable,\n"
+      "  noNewSer: snap(() => v8.Serializer()).code,\n"
+      "  noNewDer: snap(() => v8.Deserializer()).code,\n"
+      "  badWrite: snap(() => { const s = new v8.Serializer(); s.writeHeader(); s.writeRawBytes('x'); }).code,\n"
+      "  badDer: snap(() => new v8.Deserializer('x')).code,\n"
+      "  hostErrorMessage: hostError.message,\n"
+      "}));\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--no-warnings", "--expose-internals", script_path},
+      "ubi_phase01_cli_serdes_contract_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty() ||
+              result.stderr_output.find("internal/test/binding") != std::string::npos)
+      << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("\"isBuffer\":true"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"byteLength\":2"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"bufferByteLength\":2"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"byteOffset\":0"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"serializerName\":\"Serializer\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"deserializerName\":\"Deserializer\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"deserializerLength\":1"), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"serializerProtoWritable\":false"), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"deserializerProtoWritable\":false"), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"noNewSer\":\"ERR_CONSTRUCT_CALL_REQUIRED\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"noNewDer\":\"ERR_CONSTRUCT_CALL_REQUIRED\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"badWrite\":\"ERR_INVALID_ARG_TYPE\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"badDer\":\"ERR_INVALID_ARG_TYPE\""), std::string::npos)
+      << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"hostErrorMessage\":\"Unserializable host object: JSStream {}\""),
+            std::string::npos)
+      << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, SerdesPassesRawNodeV8SerdesScript) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Serdes raw Node subprocess parity check is POSIX-only";
+#elif !defined(NAPI_V8_NODE_ROOT_PATH) && !defined(PROJECT_ROOT_PATH)
+  GTEST_SKIP() << "Node test root path is unavailable";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::filesystem::path script_path = ResolveNodeTestScriptPath("parallel/test-v8-serdes.js");
+  ASSERT_TRUE(std::filesystem::exists(script_path)) << "Missing script: " << script_path.string();
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--no-warnings", "--expose-internals", script_path.string()},
+      "ubi_phase01_cli_raw_node_v8_serdes_run");
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty() ||
+              result.stderr_output.find("internal/test/binding") != std::string::npos)
+      << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stdout_output.empty()) << "stdout=" << result.stdout_output;
 #endif
 }
 

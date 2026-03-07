@@ -1440,7 +1440,12 @@ napi_status NAPI_CDECL napi_get_dataview_info(napi_env env,
   v8::Local<v8::DataView> view = view_val.As<v8::DataView>();
   if (byte_length != nullptr) *byte_length = view->ByteLength();
   if (byte_offset != nullptr) *byte_offset = view->ByteOffset();
-  if (data != nullptr) *data = view->Buffer()->Data();
+  if (data != nullptr) {
+    const size_t offset = view->ByteOffset();
+    void* buffer_data = view->Buffer()->Data();
+    *data = (buffer_data == nullptr) ? nullptr
+                                     : static_cast<void*>(static_cast<uint8_t*>(buffer_data) + offset);
+  }
   if (arraybuffer != nullptr) {
     *arraybuffer = napi_v8_wrap_value(env, view->Buffer());
     if (*arraybuffer == nullptr) return napi_generic_failure;
@@ -1676,19 +1681,44 @@ napi_status NAPI_CDECL napi_define_class(napi_env env,
     return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
   }
 
-  napi_value ctorValue = nullptr;
-  napi_status status =
-      napi_create_function(env, utf8name, length, constructor, data, &ctorValue);
-  if (status != napi_ok) return status;
-
   v8::Local<v8::Context> context = env->context();
-  v8::Local<v8::Function> ctor = napi_v8_unwrap_value(ctorValue).As<v8::Function>();
+  auto* payload = new (std::nothrow) CallbackPayload{env, constructor, data};
+  if (payload == nullptr) return napi_generic_failure;
+
+  const int v8_length = (length == NAPI_AUTO_LENGTH) ? -1 : static_cast<int>(length);
+  v8::Local<v8::String> name;
+  if (!v8::String::NewFromUtf8(env->isolate,
+                               utf8name,
+                               v8::NewStringType::kNormal,
+                               v8_length)
+           .ToLocal(&name)) {
+    return napi_generic_failure;
+  }
+
+  // Use a FunctionTemplate so instances created through napi_define_class()
+  // are V8 API objects, matching Node's host-object behavior for wrapped
+  // internal classes such as JSStream.
+  v8::Local<v8::FunctionTemplate> ctor_template =
+      v8::FunctionTemplate::New(env->isolate,
+                                FunctionTrampoline,
+                                v8::External::New(env->isolate, payload));
+  ctor_template->SetClassName(name);
+  ctor_template->InstanceTemplate()->SetInternalFieldCount(1);
+
+  v8::Local<v8::Function> ctor;
+  if (!ctor_template->GetFunction(context).ToLocal(&ctor)) {
+    return napi_generic_failure;
+  }
+
+  napi_value ctorValue = napi_v8_wrap_value(env, ctor);
+  if (ctorValue == nullptr) return napi_generic_failure;
   v8::Local<v8::Object> proto = ctor->Get(context, v8::String::NewFromUtf8Literal(env->isolate, "prototype"))
                                      .ToLocalChecked()
                                      .As<v8::Object>();
 
   for (size_t i = 0; i < property_count; ++i) {
     const napi_property_descriptor& desc = properties[i];
+    napi_status status = napi_ok;
     v8::Local<v8::Name> key;
     if (desc.utf8name != nullptr) {
       v8::Local<v8::String> key_str;

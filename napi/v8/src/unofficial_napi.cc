@@ -200,6 +200,48 @@ v8::Local<v8::String> OneByteString(v8::Isolate* isolate, const char* value) {
       .ToLocalChecked();
 }
 
+void ThrowTypeErrorWithCode(v8::Local<v8::Context> context,
+                            v8::Isolate* isolate,
+                            const char* code,
+                            const char* message) {
+  v8::Local<v8::Value> exception = v8::Exception::TypeError(OneByteString(isolate, message));
+  if (exception->IsObject()) {
+    (void)exception.As<v8::Object>()->Set(
+        context, OneByteString(isolate, "code"), OneByteString(isolate, code));
+  }
+  isolate->ThrowException(exception);
+}
+
+v8::Local<v8::Object> CreateBufferObject(v8::Local<v8::Context> context,
+                                         v8::Local<v8::ArrayBuffer> array_buffer,
+                                         size_t offset,
+                                         size_t length) {
+  v8::Isolate* isolate = context->GetIsolate();
+  v8::Local<v8::Object> global = context->Global();
+
+  v8::Local<v8::Value> buffer_ctor_value;
+  if (global->Get(context, OneByteString(isolate, "Buffer")).ToLocal(&buffer_ctor_value) &&
+      buffer_ctor_value->IsObject()) {
+    v8::Local<v8::Object> buffer_ctor = buffer_ctor_value.As<v8::Object>();
+    v8::Local<v8::Value> from_value;
+    if (buffer_ctor->Get(context, OneByteString(isolate, "from")).ToLocal(&from_value) &&
+        from_value->IsFunction()) {
+      v8::Local<v8::Value> argv[3] = {
+          array_buffer,
+          v8::Number::New(isolate, static_cast<double>(offset)),
+          v8::Number::New(isolate, static_cast<double>(length)),
+      };
+      v8::Local<v8::Value> maybe_buffer;
+      if (from_value.As<v8::Function>()->Call(context, buffer_ctor, 3, argv).ToLocal(&maybe_buffer) &&
+          maybe_buffer->IsObject()) {
+        return maybe_buffer.As<v8::Object>();
+      }
+    }
+  }
+
+  return v8::Uint8Array::New(array_buffer, offset, length);
+}
+
 bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
                               const uint8_t** data_out,
                               size_t* size_out) {
@@ -290,8 +332,10 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
   static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     v8::Isolate* isolate = args.GetIsolate();
     if (!args.IsConstructCall()) {
-      isolate->ThrowException(v8::Exception::TypeError(
-          OneByteString(isolate, "Class constructor Serializer cannot be invoked without 'new'")));
+      ThrowTypeErrorWithCode(args.GetIsolate()->GetCurrentContext(),
+                             isolate,
+                             "ERR_CONSTRUCT_CALL_REQUIRED",
+                             "Class constructor Serializer cannot be invoked without 'new'");
       return;
     }
     if (!args.Data()->IsExternal()) {
@@ -354,27 +398,8 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
       std::free(serialized.first);
       return;
     }
-    v8::Local<v8::ArrayBuffer> ab =
-        v8::ArrayBuffer::New(isolate, std::move(backing_store));
-    v8::Local<v8::Uint8Array> view =
-        v8::Uint8Array::New(ab, 0, serialized.second);
-
-    v8::Local<v8::Value> buffer_ctor;
-    if (context->Global()->Get(context, OneByteString(isolate, "Buffer")).ToLocal(&buffer_ctor) &&
-        buffer_ctor->IsFunction()) {
-      v8::Local<v8::Value> from_val;
-      if (buffer_ctor.As<v8::Object>()->Get(context, OneByteString(isolate, "from")).ToLocal(&from_val) &&
-          from_val->IsFunction()) {
-        v8::Local<v8::Value> argv[1] = {view};
-        v8::Local<v8::Value> out;
-        if (from_val.As<v8::Function>()->Call(context, buffer_ctor, 1, argv).ToLocal(&out)) {
-          args.GetReturnValue().Set(out);
-          return;
-        }
-      }
-    }
-
-    args.GetReturnValue().Set(view);
+    v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(isolate, std::move(backing_store));
+    args.GetReturnValue().Set(CreateBufferObject(context, ab, 0, serialized.second));
   }
 
   static void TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -386,8 +411,10 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
     if (!args[0]->Uint32Value(ctx->env_->context()).To(&id)) return;
 
     if (!args[1]->IsArrayBuffer()) {
-      ctx->isolate_->ThrowException(v8::Exception::TypeError(
-          OneByteString(ctx->isolate_, "arrayBuffer must be an ArrayBuffer")));
+      ThrowTypeErrorWithCode(ctx->env_->context(),
+                             ctx->isolate_,
+                             "ERR_INVALID_ARG_TYPE",
+                             "arrayBuffer must be an ArrayBuffer");
       return;
     }
     ctx->serializer_.TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
@@ -429,8 +456,10 @@ class SerializerContext : public v8::ValueSerializer::Delegate {
     const uint8_t* data = nullptr;
     size_t size = 0;
     if (!ReadArrayBufferViewBytes(args[0], &data, &size)) {
-      ctx->isolate_->ThrowException(v8::Exception::TypeError(
-          OneByteString(ctx->isolate_, "source must be a TypedArray or a DataView")));
+      ThrowTypeErrorWithCode(ctx->env_->context(),
+                             ctx->isolate_,
+                             "ERR_INVALID_ARG_TYPE",
+                             "source must be a TypedArray or a DataView");
       return;
     }
     ctx->serializer_.WriteRawBytes(data, size);
@@ -508,8 +537,10 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
   static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
     v8::Isolate* isolate = args.GetIsolate();
     if (!args.IsConstructCall()) {
-      isolate->ThrowException(v8::Exception::TypeError(
-          OneByteString(isolate, "Class constructor Deserializer cannot be invoked without 'new'")));
+      ThrowTypeErrorWithCode(args.GetIsolate()->GetCurrentContext(),
+                             isolate,
+                             "ERR_CONSTRUCT_CALL_REQUIRED",
+                             "Class constructor Deserializer cannot be invoked without 'new'");
       return;
     }
     if (!args.Data()->IsExternal()) {
@@ -518,8 +549,10 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
       return;
     }
     if (args.Length() < 1 || !args[0]->IsArrayBufferView()) {
-      isolate->ThrowException(v8::Exception::TypeError(
-          OneByteString(isolate, "buffer must be a TypedArray or a DataView")));
+      ThrowTypeErrorWithCode(args.GetIsolate()->GetCurrentContext(),
+                             isolate,
+                             "ERR_INVALID_ARG_TYPE",
+                             "buffer must be a TypedArray or a DataView");
       return;
     }
 
@@ -564,8 +597,10 @@ class DeserializerContext : public v8::ValueDeserializer::Delegate {
       ctx->deserializer_->TransferSharedArrayBuffer(id, args[1].As<v8::SharedArrayBuffer>());
       return;
     }
-    ctx->isolate_->ThrowException(v8::Exception::TypeError(
-        OneByteString(ctx->isolate_, "arrayBuffer must be an ArrayBuffer or SharedArrayBuffer")));
+    ThrowTypeErrorWithCode(ctx->env_->context(),
+                           ctx->isolate_,
+                           "ERR_INVALID_ARG_TYPE",
+                           "arrayBuffer must be an ArrayBuffer or SharedArrayBuffer");
   }
 
   static void GetWireFormatVersion(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -1408,6 +1443,7 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
   v8::Local<v8::FunctionTemplate> serializer_tmpl =
       v8::FunctionTemplate::New(isolate, SerializerContext::New, env_data);
   serializer_tmpl->InstanceTemplate()->SetInternalFieldCount(1);
+  serializer_tmpl->SetClassName(OneByteString(isolate, "Serializer"));
   SetProtoMethod(isolate, serializer_tmpl, "writeHeader", SerializerContext::WriteHeader);
   SetProtoMethod(isolate, serializer_tmpl, "writeValue", SerializerContext::WriteValue);
   SetProtoMethod(isolate, serializer_tmpl, "releaseBuffer", SerializerContext::ReleaseBuffer);
@@ -1420,6 +1456,7 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
                  serializer_tmpl,
                  "_setTreatArrayBufferViewsAsHostObjects",
                  SerializerContext::SetTreatArrayBufferViewsAsHostObjects);
+  serializer_tmpl->ReadOnlyPrototype();
   if (!SetConstructorFunction(context, target, "Serializer", serializer_tmpl)) {
     return napi_generic_failure;
   }
@@ -1427,6 +1464,7 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
   v8::Local<v8::FunctionTemplate> deserializer_tmpl =
       v8::FunctionTemplate::New(isolate, DeserializerContext::New, env_data);
   deserializer_tmpl->InstanceTemplate()->SetInternalFieldCount(1);
+  deserializer_tmpl->SetClassName(OneByteString(isolate, "Deserializer"));
   SetProtoMethod(isolate, deserializer_tmpl, "readHeader", DeserializerContext::ReadHeader);
   SetProtoMethod(isolate, deserializer_tmpl, "readValue", DeserializerContext::ReadValue);
   SetProtoMethod(
@@ -1437,6 +1475,8 @@ napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
   SetProtoMethod(isolate, deserializer_tmpl, "readUint64", DeserializerContext::ReadUint64);
   SetProtoMethod(isolate, deserializer_tmpl, "readDouble", DeserializerContext::ReadDouble);
   SetProtoMethod(isolate, deserializer_tmpl, "_readRawBytes", DeserializerContext::ReadRawBytes);
+  deserializer_tmpl->SetLength(1);
+  deserializer_tmpl->ReadOnlyPrototype();
   if (!SetConstructorFunction(context, target, "Deserializer", deserializer_tmpl)) {
     return napi_generic_failure;
   }
