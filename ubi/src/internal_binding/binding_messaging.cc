@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -95,6 +96,12 @@ bool IsFunction(napi_env env, napi_value value) {
   if (value == nullptr) return false;
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+bool IsObjectLike(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && (type == napi_object || type == napi_function);
 }
 
 bool IsUndefinedValue(napi_env env, napi_value value) {
@@ -197,6 +204,39 @@ napi_value GetRefValue(napi_env env, napi_ref ref) {
   return value;
 }
 
+napi_value GetInternalBindingValue(napi_env env, const char* name) {
+  if (name == nullptr) return nullptr;
+  napi_value global = GetGlobal(env);
+  napi_value internal_binding = UbiGetInternalBinding(env);
+  if (!IsFunction(env, internal_binding)) {
+    internal_binding = GetNamed(env, global, "internalBinding");
+  }
+  if (!IsFunction(env, internal_binding)) return nullptr;
+
+  napi_value name_value = nullptr;
+  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &name_value) != napi_ok || name_value == nullptr) {
+    return nullptr;
+  }
+
+  napi_value argv[1] = {name_value};
+  napi_value out = nullptr;
+  if (napi_call_function(env, global, internal_binding, 1, argv, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
+  return out;
+}
+
+napi_value GetUtilPrivateSymbol(napi_env env, const char* key) {
+  napi_value util_binding = GetInternalBindingValue(env, "util");
+  napi_value private_symbols = GetNamed(env, util_binding, "privateSymbols");
+  return GetNamed(env, private_symbols, key);
+}
+
+napi_value GetMessagingSymbol(napi_env env, const char* key) {
+  napi_value symbols = GetInternalBindingValue(env, "symbols");
+  return GetNamed(env, symbols, key);
+}
+
 napi_value TakePendingException(napi_env env) {
   bool pending = false;
   if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) return nullptr;
@@ -227,6 +267,285 @@ void SetRefToValue(napi_env env, napi_ref* slot, napi_value value) {
   DeleteRefIfPresent(env, slot);
   if (value == nullptr) return;
   napi_create_reference(env, value, 1, slot);
+}
+
+bool IsCloneableTransferableValue(napi_env env, napi_value value) {
+  if (!IsObjectLike(env, value)) return false;
+
+  napi_value transfer_mode_symbol = GetUtilPrivateSymbol(env, "transfer_mode_private_symbol");
+  napi_value clone_symbol = GetMessagingSymbol(env, "messaging_clone_symbol");
+  if (transfer_mode_symbol == nullptr || clone_symbol == nullptr) return false;
+
+  bool has_mode = false;
+  if (napi_has_property(env, value, transfer_mode_symbol, &has_mode) != napi_ok || !has_mode) return false;
+
+  napi_value transfer_mode = nullptr;
+  if (napi_get_property(env, value, transfer_mode_symbol, &transfer_mode) != napi_ok || transfer_mode == nullptr) {
+    return false;
+  }
+
+  uint32_t mode = 0;
+  if (napi_get_value_uint32(env, transfer_mode, &mode) != napi_ok || (mode & 2u) == 0) return false;
+
+  napi_value clone_method = nullptr;
+  return napi_get_property(env, value, clone_symbol, &clone_method) == napi_ok && IsFunction(env, clone_method);
+}
+
+bool IsBlobHandleValue(napi_env env, napi_value value) {
+  if (!IsObjectLike(env, value)) return false;
+  bool has_blob_data = false;
+  return napi_has_named_property(env, value, "__ubi_blob_data", &has_blob_data) == napi_ok && has_blob_data;
+}
+
+napi_value CreateBlobHandleCloneMarker(napi_env env, napi_value handle) {
+  napi_value blob_data = GetNamed(env, handle, "__ubi_blob_data");
+  if (blob_data == nullptr) return nullptr;
+
+  napi_value marker = nullptr;
+  if (napi_create_object(env, &marker) != napi_ok || marker == nullptr) return nullptr;
+  napi_value true_value = nullptr;
+  if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr ||
+      napi_set_named_property(env, marker, "__ubiBlobHandleCloneMarker", true_value) != napi_ok ||
+      napi_set_named_property(env, marker, "data", blob_data) != napi_ok) {
+    return nullptr;
+  }
+  return marker;
+}
+
+bool IsBlobHandleCloneMarker(napi_env env, napi_value value, napi_value* data_out) {
+  if (data_out != nullptr) *data_out = nullptr;
+  if (!IsObjectLike(env, value)) return false;
+
+  bool has_marker = false;
+  if (napi_has_named_property(env, value, "__ubiBlobHandleCloneMarker", &has_marker) != napi_ok || !has_marker) {
+    return false;
+  }
+
+  napi_value marker_value = GetNamed(env, value, "__ubiBlobHandleCloneMarker");
+  bool is_marker = false;
+  if (marker_value == nullptr || napi_get_value_bool(env, marker_value, &is_marker) != napi_ok || !is_marker) {
+    return false;
+  }
+
+  napi_value blob_data = GetNamed(env, value, "data");
+  if (blob_data == nullptr) return false;
+  if (data_out != nullptr) *data_out = blob_data;
+  return true;
+}
+
+bool IsStructuredClonePassThroughValue(napi_env env, napi_value value) {
+  if (!IsObjectLike(env, value)) return true;
+
+  bool is_arraybuffer = false;
+  if (napi_is_arraybuffer(env, value, &is_arraybuffer) == napi_ok && is_arraybuffer) return true;
+
+  bool is_typedarray = false;
+  if (napi_is_typedarray(env, value, &is_typedarray) == napi_ok && is_typedarray) return true;
+
+  bool is_dataview = false;
+  if (napi_is_dataview(env, value, &is_dataview) == napi_ok && is_dataview) return true;
+
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) return true;
+
+  return false;
+}
+
+napi_value PrepareTransferableDataForStructuredClone(napi_env env, napi_value value);
+napi_value RestoreTransferableDataAfterStructuredClone(napi_env env, napi_value value);
+
+napi_value CloneArrayEntriesForStructuredClone(napi_env env, napi_value array) {
+  uint32_t length = 0;
+  if (napi_get_array_length(env, array, &length) != napi_ok) return nullptr;
+
+  napi_value out = nullptr;
+  if (napi_create_array_with_length(env, length, &out) != napi_ok || out == nullptr) return nullptr;
+
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value item = nullptr;
+    if (napi_get_element(env, array, i, &item) != napi_ok) return nullptr;
+    napi_value cloned = PrepareTransferableDataForStructuredClone(env, item);
+    if (cloned == nullptr) return nullptr;
+    if (napi_set_element(env, out, i, cloned) != napi_ok) return nullptr;
+  }
+  return out;
+}
+
+napi_value CloneObjectPropertiesForStructuredClone(napi_env env, napi_value object) {
+  napi_value keys = nullptr;
+  if (napi_get_property_names(env, object, &keys) != napi_ok || keys == nullptr) return nullptr;
+
+  uint32_t length = 0;
+  if (napi_get_array_length(env, keys, &length) != napi_ok) return nullptr;
+
+  napi_value out = nullptr;
+  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return nullptr;
+
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value key = nullptr;
+    if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) return nullptr;
+    napi_value item = nullptr;
+    if (napi_get_property(env, object, key, &item) != napi_ok) return nullptr;
+    napi_value cloned = PrepareTransferableDataForStructuredClone(env, item);
+    if (cloned == nullptr) return nullptr;
+    if (napi_set_property(env, out, key, cloned) != napi_ok) return nullptr;
+  }
+
+  return out;
+}
+
+napi_value PrepareTransferableDataForStructuredClone(napi_env env, napi_value value) {
+  if (value == nullptr || IsNullOrUndefinedValue(env, value) || IsStructuredClonePassThroughValue(env, value)) {
+    return value;
+  }
+  if (IsBlobHandleValue(env, value)) {
+    return CreateBlobHandleCloneMarker(env, value);
+  }
+  if (!IsObjectLike(env, value)) return value;
+
+  bool is_array = false;
+  if (napi_is_array(env, value, &is_array) == napi_ok && is_array) {
+    return CloneArrayEntriesForStructuredClone(env, value);
+  }
+  return CloneObjectPropertiesForStructuredClone(env, value);
+}
+
+napi_value CreateBlobHandleFromCloneData(napi_env env, napi_value blob_data) {
+  if (blob_data == nullptr) return nullptr;
+
+  napi_value blob_binding = GetInternalBindingValue(env, "blob");
+  napi_value create_blob = GetNamed(env, blob_binding, "createBlob");
+  if (!IsFunction(env, create_blob)) return nullptr;
+
+  size_t byte_length = 0;
+  void* raw = nullptr;
+  bool is_arraybuffer = false;
+  if (napi_is_arraybuffer(env, blob_data, &is_arraybuffer) != napi_ok || !is_arraybuffer ||
+      napi_get_arraybuffer_info(env, blob_data, &raw, &byte_length) != napi_ok) {
+    return nullptr;
+  }
+
+  napi_value sources = nullptr;
+  if (napi_create_array_with_length(env, 1, &sources) != napi_ok || sources == nullptr) return nullptr;
+  if (napi_set_element(env, sources, 0, blob_data) != napi_ok) return nullptr;
+
+  napi_value length_value = nullptr;
+  if (napi_create_uint32(
+          env,
+          static_cast<uint32_t>(std::min<size_t>(byte_length, std::numeric_limits<uint32_t>::max())),
+          &length_value) != napi_ok ||
+      length_value == nullptr) {
+    return nullptr;
+  }
+
+  napi_value argv[2] = {sources, length_value};
+  napi_value handle = nullptr;
+  if (napi_call_function(env, blob_binding, create_blob, 2, argv, &handle) != napi_ok || handle == nullptr) {
+    return nullptr;
+  }
+  return handle;
+}
+
+napi_value RestoreTransferableDataAfterStructuredClone(napi_env env, napi_value value) {
+  if (value == nullptr || IsNullOrUndefinedValue(env, value) || IsStructuredClonePassThroughValue(env, value)) {
+    return value;
+  }
+
+  napi_value blob_data = nullptr;
+  if (IsBlobHandleCloneMarker(env, value, &blob_data)) {
+    return CreateBlobHandleFromCloneData(env, blob_data);
+  }
+
+  if (!IsObjectLike(env, value)) return value;
+
+  bool is_array = false;
+  if (napi_is_array(env, value, &is_array) == napi_ok && is_array) {
+    uint32_t length = 0;
+    if (napi_get_array_length(env, value, &length) != napi_ok) return nullptr;
+    for (uint32_t i = 0; i < length; ++i) {
+      napi_value item = nullptr;
+      if (napi_get_element(env, value, i, &item) != napi_ok) return nullptr;
+      napi_value restored = RestoreTransferableDataAfterStructuredClone(env, item);
+      if (restored == nullptr || napi_set_element(env, value, i, restored) != napi_ok) return nullptr;
+    }
+    return value;
+  }
+
+  napi_value keys = nullptr;
+  if (napi_get_property_names(env, value, &keys) != napi_ok || keys == nullptr) return nullptr;
+
+  uint32_t length = 0;
+  if (napi_get_array_length(env, keys, &length) != napi_ok) return nullptr;
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value key = nullptr;
+    if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) return nullptr;
+    napi_value item = nullptr;
+    if (napi_get_property(env, value, key, &item) != napi_ok) return nullptr;
+    napi_value restored = RestoreTransferableDataAfterStructuredClone(env, item);
+    if (restored == nullptr || napi_set_property(env, value, key, restored) != napi_ok) return nullptr;
+  }
+  return value;
+}
+
+napi_value StructuredCloneJSTransferableValue(napi_env env, napi_value value) {
+  if (!IsCloneableTransferableValue(env, value)) return nullptr;
+
+  napi_value clone_symbol = GetMessagingSymbol(env, "messaging_clone_symbol");
+  napi_value clone_method = nullptr;
+  if (clone_symbol == nullptr ||
+      napi_get_property(env, value, clone_symbol, &clone_method) != napi_ok ||
+      !IsFunction(env, clone_method)) {
+    return nullptr;
+  }
+
+  napi_value clone_result = nullptr;
+  if (napi_call_function(env, value, clone_method, 0, nullptr, &clone_result) != napi_ok || clone_result == nullptr) {
+    return nullptr;
+  }
+
+  napi_value clone_data = GetNamed(env, clone_result, "data");
+  napi_value deserialize_info = GetNamed(env, clone_result, "deserializeInfo");
+  if (clone_data == nullptr || deserialize_info == nullptr) return nullptr;
+
+  napi_value prepared_data = PrepareTransferableDataForStructuredClone(env, clone_data);
+  if (prepared_data == nullptr) return nullptr;
+
+  napi_value cloned_data = nullptr;
+  if (unofficial_napi_structured_clone(env, prepared_data, &cloned_data) != napi_ok || cloned_data == nullptr) {
+    return nullptr;
+  }
+
+  cloned_data = RestoreTransferableDataAfterStructuredClone(env, cloned_data);
+  if (cloned_data == nullptr) return nullptr;
+
+  auto it = g_messaging_states.find(env);
+  if (it == g_messaging_states.end() || it->second.deserializer_create_object_ref == nullptr) return nullptr;
+
+  napi_value deserializer_factory = GetRefValue(env, it->second.deserializer_create_object_ref);
+  if (!IsFunction(env, deserializer_factory)) return nullptr;
+
+  napi_value receiver = Undefined(env);
+  napi_value argv[1] = {deserialize_info};
+  napi_value out = nullptr;
+  if (napi_call_function(env, receiver, deserializer_factory, 1, argv, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
+
+  napi_value deserialize_symbol = GetMessagingSymbol(env, "messaging_deserialize_symbol");
+  napi_value deserialize_method = nullptr;
+  if (deserialize_symbol == nullptr ||
+      napi_get_property(env, out, deserialize_symbol, &deserialize_method) != napi_ok ||
+      !IsFunction(env, deserialize_method)) {
+    return nullptr;
+  }
+
+  napi_value deserialize_argv[1] = {cloned_data};
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, out, deserialize_method, 1, deserialize_argv, &ignored) != napi_ok) {
+    return nullptr;
+  }
+
+  return out;
 }
 
 napi_value TryRequireModule(napi_env env, const char* module_name) {
@@ -2018,8 +2337,9 @@ napi_value StructuredCloneCallback(napi_env env, napi_callback_info info) {
     return nullptr;
   }
 
-  napi_value out = nullptr;
-  const napi_status clone_status = unofficial_napi_structured_clone(env, argv[0], &out);
+  napi_value out = StructuredCloneJSTransferableValue(env, argv[0]);
+  const napi_status clone_status =
+      out != nullptr ? napi_ok : unofficial_napi_structured_clone(env, argv[0], &out);
   if (clone_status != napi_ok || out == nullptr) {
     bool has_pending = false;
     if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) return nullptr;

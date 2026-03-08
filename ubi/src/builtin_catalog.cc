@@ -1,4 +1,5 @@
 #include "builtin_catalog.h"
+#include "ubi_process.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -83,16 +84,50 @@ bool IsAllowedNodeDepsRelativePath(const fs::path& rel) {
   return false;
 }
 
-std::vector<fs::path> NodeDepsRootCandidates() {
+void AppendPathCandidate(std::vector<fs::path>* out, const fs::path& candidate) {
+  if (out == nullptr || candidate.empty()) return;
+  out->push_back(candidate);
+}
+
+std::vector<fs::path> NodeLibRootCandidates() {
   const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
   std::vector<fs::path> candidates;
-  candidates.push_back(source_root / "node" / "deps");
+
+  const fs::path exec_path = fs::path(UbiGetProcessExecPath()).lexically_normal();
+  if (!exec_path.empty()) {
+    const fs::path install_root = exec_path.parent_path().parent_path();
+    AppendPathCandidate(&candidates, install_root / "node-lib");
+  }
+
+  AppendPathCandidate(&candidates, source_root / "node-lib");
 
   std::error_code ec;
   const fs::path cwd = fs::current_path(ec);
   if (!ec && !cwd.empty()) {
-    candidates.push_back(cwd / "node" / "deps");
-    candidates.push_back(cwd.parent_path() / "node" / "deps");
+    AppendPathCandidate(&candidates, cwd / "node-lib");
+    AppendPathCandidate(&candidates, cwd.parent_path() / "node-lib");
+  }
+
+  return candidates;
+}
+
+std::vector<fs::path> NodeDepsRootCandidates() {
+  const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+  std::vector<fs::path> candidates;
+
+  const fs::path exec_path = fs::path(UbiGetProcessExecPath()).lexically_normal();
+  if (!exec_path.empty()) {
+    const fs::path install_root = exec_path.parent_path().parent_path();
+    AppendPathCandidate(&candidates, install_root / "node" / "deps");
+  }
+
+  AppendPathCandidate(&candidates, source_root / "node" / "deps");
+
+  std::error_code ec;
+  const fs::path cwd = fs::current_path(ec);
+  if (!ec && !cwd.empty()) {
+    AppendPathCandidate(&candidates, cwd / "node" / "deps");
+    AppendPathCandidate(&candidates, cwd.parent_path() / "node" / "deps");
   }
   return candidates;
 }
@@ -139,8 +174,14 @@ void AppendNodeDepsIds(const fs::path& node_deps_root, std::vector<std::string>*
 }  // namespace
 
 const fs::path& NodeLibRoot() {
-  static const fs::path root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / ".." / "node-lib")
-                                   .lexically_normal();
+  static const fs::path root = []() {
+    const std::vector<fs::path> candidates = NodeLibRootCandidates();
+    for (const fs::path& candidate : candidates) {
+      if (PathExistsDirectory(candidate)) return fs::absolute(candidate).lexically_normal();
+    }
+    if (!candidates.empty()) return fs::absolute(candidates.front()).lexically_normal();
+    return fs::path();
+  }();
   return root;
 }
 

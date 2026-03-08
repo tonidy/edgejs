@@ -348,19 +348,65 @@ napi_value TranscodeCallback(napi_env env, napi_callback_info info) {
     return empty != nullptr ? empty : Undefined(env);
   }
 
-  size_t capacity = std::max<size_t>(source_length * 4, 32);
-  std::vector<char> output(capacity);
   UErrorCode status = U_ZERO_ERROR;
+  UConverter* to_converter = ucnv_open(to_name, &status);
+  if (U_FAILURE(status) || to_converter == nullptr) {
+    napi_value status_value = nullptr;
+    napi_create_int32(env, static_cast<int32_t>(status), &status_value);
+    return status_value != nullptr ? status_value : Undefined(env);
+  }
+
+  status = U_ZERO_ERROR;
+  UConverter* from_converter = ucnv_open(from_name, &status);
+  if (U_FAILURE(status) || from_converter == nullptr) {
+    if (to_converter != nullptr) ucnv_close(to_converter);
+    napi_value status_value = nullptr;
+    napi_create_int32(env, static_cast<int32_t>(status), &status_value);
+    return status_value != nullptr ? status_value : Undefined(env);
+  }
+
+  const int32_t substitute_length = std::max<int32_t>(ucnv_getMinCharSize(to_converter), 1);
+  std::string substitute(static_cast<size_t>(substitute_length), '?');
+  status = U_ZERO_ERROR;
+  ucnv_setSubstChars(to_converter, substitute.data(), substitute_length, &status);
+  if (U_FAILURE(status)) {
+    ucnv_close(from_converter);
+    ucnv_close(to_converter);
+    napi_value status_value = nullptr;
+    napi_create_int32(env, static_cast<int32_t>(status), &status_value);
+    return status_value != nullptr ? status_value : Undefined(env);
+  }
+
+  const int max_char_size = std::max<int>(static_cast<int>(ucnv_getMaxCharSize(to_converter)), 1);
+  size_t capacity = std::max<size_t>(source_length * static_cast<size_t>(max_char_size), 32);
+  std::vector<char> output(capacity);
   int32_t written = 0;
 
   for (;;) {
     status = U_ZERO_ERROR;
-    written = ucnv_convert(
-        to_name, from_name, output.data(), static_cast<int32_t>(output.size()), source, static_cast<int32_t>(source_length), &status);
+    const char* source_cursor = source;
+    char* target = output.data();
+    ucnv_convertEx(to_converter,
+                   from_converter,
+                   &target,
+                   target + output.size(),
+                   &source_cursor,
+                   source + source_length,
+                   nullptr,
+                   nullptr,
+                   nullptr,
+                   nullptr,
+                   true,
+                   true,
+                   &status);
+    written = static_cast<int32_t>(target - output.data());
     if (status != U_BUFFER_OVERFLOW_ERROR) break;
     capacity = std::max<size_t>(output.size() * 2, static_cast<size_t>(written) + 16);
     output.resize(capacity);
   }
+
+  ucnv_close(from_converter);
+  ucnv_close(to_converter);
 
   if (U_FAILURE(status)) {
     napi_value status_value = nullptr;
