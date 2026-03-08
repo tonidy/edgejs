@@ -264,22 +264,19 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
   record->holder.Reset();
 }
 
-bool IsOurBufferObject(napi_env env, v8::Local<v8::Object> object) {
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
-  return object->HasPrivate(env->context(), key).FromMaybe(false);
-}
+bool GetArrayBufferViewInfo(v8::Local<v8::Value> value, void** data, size_t* length) {
+  if (!value->IsArrayBufferView()) return false;
 
-napi_status GetBufferRecord(napi_env env, napi_value value, napi_buffer_record** out) {
-  if (!CheckEnv(env) || value == nullptr || out == nullptr) return napi_invalid_arg;
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (!raw->IsObject()) return napi_invalid_arg;
-  v8::Local<v8::Object> object = raw.As<v8::Object>();
-  v8::Local<v8::Private> key = env->buffer_private_key.Get(env->isolate);
-  v8::MaybeLocal<v8::Value> maybe = object->GetPrivate(env->context(), key);
-  v8::Local<v8::Value> external;
-  if (!maybe.ToLocal(&external) || !external->IsExternal()) return napi_invalid_arg;
-  *out = static_cast<napi_buffer_record*>(external.As<v8::External>()->Value());
-  return (*out == nullptr) ? napi_invalid_arg : napi_ok;
+  v8::Local<v8::ArrayBufferView> view = value.As<v8::ArrayBufferView>();
+  std::shared_ptr<v8::BackingStore> backing_store = view->Buffer()->GetBackingStore();
+  size_t byte_length = view->ByteLength();
+
+  if (length != nullptr) *length = byte_length;
+  if (data != nullptr) {
+    uint8_t* base = static_cast<uint8_t*>(backing_store ? backing_store->Data() : nullptr);
+    *data = (base == nullptr) ? nullptr : static_cast<void*>(base + view->ByteOffset());
+  }
+  return true;
 }
 
 v8::Local<v8::Object> CreateBufferObject(napi_env env,
@@ -3011,11 +3008,7 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
 napi_status NAPI_CDECL napi_is_buffer(napi_env env, napi_value value, bool* result) {
   if (!CheckEnv(env) || value == nullptr || result == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
-  if (!raw->IsObject()) {
-    *result = false;
-    return napi_ok;
-  }
-  *result = IsOurBufferObject(env, raw.As<v8::Object>());
+  *result = raw->IsArrayBufferView();
   return napi_ok;
 }
 
@@ -3024,11 +3017,9 @@ napi_status NAPI_CDECL napi_get_buffer_info(napi_env env,
                                             void** data,
                                             size_t* length) {
   if (!CheckEnv(env) || value == nullptr) return napi_invalid_arg;
-  napi_buffer_record* record = nullptr;
-  napi_status status = GetBufferRecord(env, value, &record);
-  if (status != napi_ok) return napi_invalid_arg;
-  if (data != nullptr) *data = record->backing_store->Data();
-  if (length != nullptr) *length = record->backing_store->ByteLength();
+  if (!GetArrayBufferViewInfo(napi_v8_unwrap_value(value), data, length)) {
+    return napi_invalid_arg;
+  }
   return napi_ok;
 }
 
