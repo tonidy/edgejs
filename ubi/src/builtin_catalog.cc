@@ -118,6 +118,7 @@ std::vector<fs::path> NodeDepsRootCandidates() {
   const fs::path exec_path = fs::path(UbiGetProcessExecPath()).lexically_normal();
   if (!exec_path.empty()) {
     const fs::path install_root = exec_path.parent_path().parent_path();
+    AppendPathCandidate(&candidates, install_root / "node-lib" / "internal" / "deps");
     AppendPathCandidate(&candidates, install_root / "node" / "deps");
   }
 
