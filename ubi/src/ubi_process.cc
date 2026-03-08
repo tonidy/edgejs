@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -74,10 +75,21 @@ std::string g_ubi_argv0;
 std::string g_process_title = "ubi";
 uint32_t g_process_debug_port = 9229;
 std::mutex g_process_umask_mutex;
+std::mutex g_process_dlopen_mutex;
+std::map<std::string, std::unique_ptr<uv_lib_t>> g_process_dlopen_handles;
 
 #ifndef UBI_EMBEDDED_V8_VERSION
 #define UBI_EMBEDDED_V8_VERSION "0.0.0-node.0"
 #endif
+
+napi_addon_register_func GetNapiInitializerCallback(uv_lib_t* lib) {
+  if (lib == nullptr) return nullptr;
+  void* symbol = nullptr;
+  if (uv_dlsym(lib, "napi_register_module_v1", &symbol) != 0 || symbol == nullptr) {
+    return nullptr;
+  }
+  return reinterpret_cast<napi_addon_register_func>(symbol);
+}
 
 #define UBI_STRINGIFY_HELPER(x) #x
 #define UBI_STRINGIFY(x) UBI_STRINGIFY_HELPER(x)
@@ -2539,19 +2551,72 @@ napi_value ProcessMethodsGetActiveResourcesInfoCallback(napi_env env, napi_callb
 }
 
 napi_value ProcessMethodsDlopenCallback(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr, nullptr};
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
     return nullptr;
   }
-  std::string filename = "(unknown)";
-  if (argc >= 2 && argv[1] != nullptr) {
-    const std::string maybe_name = NapiValueToUtf8(env, argv[1]);
-    if (!maybe_name.empty()) filename = maybe_name;
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) {
+    ThrowErrorWithCode(env, "ERR_MISSING_ARGS", "process.dlopen needs at least 2 arguments");
+    return nullptr;
   }
-  const std::string message = "Module did not self-register: '" + filename + "'.";
-  ThrowErrorWithCode(env, "ERR_DLOPEN_FAILED", message.c_str());
-  return nullptr;
+
+  std::string filename = "(unknown)";
+  const std::string maybe_name = NapiValueToUtf8(env, argv[1]);
+  if (!maybe_name.empty()) filename = maybe_name;
+
+  napi_value module = argv[0];
+  napi_value exports = nullptr;
+  if (napi_get_named_property(env, module, "exports", &exports) != napi_ok || exports == nullptr) {
+    return nullptr;
+  }
+
+  napi_addon_register_func init = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_process_dlopen_mutex);
+    uv_lib_t* lib = nullptr;
+    auto it = g_process_dlopen_handles.find(filename);
+    if (it == g_process_dlopen_handles.end()) {
+      auto loaded = std::make_unique<uv_lib_t>();
+      if (uv_dlopen(filename.c_str(), loaded.get()) != 0) {
+        const char* dlerror = uv_dlerror(loaded.get());
+        const std::string message =
+            dlerror != nullptr && dlerror[0] != '\0'
+                ? dlerror
+                : ("Cannot open shared object file: '" + filename + "'");
+        ThrowErrorWithCode(env, "ERR_DLOPEN_FAILED", message.c_str());
+        return nullptr;
+      }
+      lib = loaded.get();
+      g_process_dlopen_handles.emplace(filename, std::move(loaded));
+    } else {
+      lib = it->second.get();
+    }
+    init = GetNapiInitializerCallback(lib);
+  }
+
+  if (init == nullptr) {
+    const std::string message = "Module did not self-register: '" + filename + "'.";
+    ThrowErrorWithCode(env, "ERR_DLOPEN_FAILED", message.c_str());
+    return nullptr;
+  }
+
+  napi_value addon_exports = init(env, exports);
+
+  bool has_pending = false;
+  if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+    return nullptr;
+  }
+
+  bool same_exports = false;
+  if (addon_exports != nullptr &&
+      (napi_strict_equals(env, addon_exports, exports, &same_exports) != napi_ok || !same_exports)) {
+    napi_set_named_property(env, module, "exports", addon_exports);
+  }
+
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
 }
 
 napi_value ProcessMethodsEmptyArrayCallback(napi_env env, napi_callback_info info) {
