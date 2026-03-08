@@ -22,7 +22,7 @@
 - `../include/`: shared public C headers (engine-agnostic surface)
 - `../tests/`: shared canonical Node-API fixtures
 - `src/`: V8-backed implementation and environment glue
-- `tests/`: V8-specific gtest runners and harness glue
+- `tests/`: V8-specific test assets and compatibility test docs
 
  ## Current Phase
 

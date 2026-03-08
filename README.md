@@ -93,3 +93,38 @@ Canonical configuration variables:
 - `NAPI_V8_DEFINES`
 
 Compatibility aliases (`NAPI_V8_V8_*`) are still accepted during migration.
+
+## Testing
+
+The supported JavaScript test workflow uses the vendored `node-test` harness at
+the repository root.
+
+Run a category against the local `ubi` build:
+
+```bash
+NODE_TEST_RUNNER="$(pwd)/build-ubi-rename/ubi" \
+./node-test/nodejs_test_harness --category=node:assert
+```
+
+Useful variants:
+
+```bash
+# Run multiple generated categories.
+NODE_TEST_RUNNER="$(pwd)/build-ubi-rename/ubi" \
+./node-test/nodejs_test_harness --categories=node:assert,node:buffer
+
+# Run one explicit test file.
+NODE_TEST_RUNNER="$(pwd)/build-ubi-rename/ubi" \
+./node-test/nodejs_test_harness parallel/test-assert.js
+
+# Print only the pass/fail counts for a category run.
+NODE_TEST_RUNNER="$(pwd)/build-ubi-rename/ubi" \
+./node-test/nodejs_test_harness --counts-only --category=node:assert
+```
+
+Notes:
+
+- `NODE_TEST_RUNNER` can point to `ubi`, `node`, `deno`, or any compatible
+  runtime binary.
+- Category filters expand from `node-test/module-categories/*.txt`.
+- The harness forwards additional arguments to `node-test/tools/test.py`.
