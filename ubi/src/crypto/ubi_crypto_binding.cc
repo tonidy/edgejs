@@ -1,4 +1,5 @@
 #include "crypto/ubi_crypto_binding.h"
+#include "crypto/ubi_secure_context_bridge.h"
 
 #include <algorithm>
 #include <cctype>
@@ -445,14 +446,6 @@ std::string CanonicalizeDigestName(const std::string& in) {
   return out;
 }
 
-struct SecureContextHolder {
-  explicit SecureContextHolder(SSL_CTX* in_ctx) : ctx(in_ctx) {}
-  ~SecureContextHolder() {
-    if (ctx != nullptr) SSL_CTX_free(ctx);
-  }
-  SSL_CTX* ctx = nullptr;
-};
-
 void SecureContextFinalizer(napi_env env, void* data, void* hint) {
   (void)env;
   (void)hint;
@@ -460,13 +453,40 @@ void SecureContextFinalizer(napi_env env, void* data, void* hint) {
   delete holder;
 }
 
-bool GetSecureContextHolder(napi_env env, napi_value value, SecureContextHolder** out) {
-  if (out == nullptr) return false;
-  *out = nullptr;
-  void* raw = nullptr;
-  if (napi_get_value_external(env, value, &raw) != napi_ok || raw == nullptr) return false;
-  *out = reinterpret_cast<SecureContextHolder*>(raw);
-  return true;
+void ResetStoredCertificate(X509** slot, X509* cert) {
+  if (slot == nullptr) return;
+  if (*slot != nullptr) {
+    X509_free(*slot);
+    *slot = nullptr;
+  }
+  if (cert != nullptr) {
+    *slot = X509_dup(cert);
+  }
+}
+
+void UpdateIssuerFromStore(SecureContextHolder* holder) {
+  if (holder == nullptr || holder->ctx == nullptr || holder->cert == nullptr) return;
+
+  ResetStoredCertificate(&holder->issuer, nullptr);
+
+  X509_STORE* store = SSL_CTX_get_cert_store(holder->ctx);
+  if (store == nullptr) return;
+
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+  X509_STORE_CTX* store_ctx = X509_STORE_CTX_new();
+  if (store_ctx == nullptr) return;
+  if (X509_STORE_CTX_init(store_ctx, store, holder->cert, nullptr) != 1) {
+    X509_STORE_CTX_free(store_ctx);
+    return;
+  }
+
+  X509* issuer = nullptr;
+  if (X509_STORE_CTX_get1_issuer(&issuer, store_ctx, holder->cert) == 1 && issuer != nullptr) {
+    ResetStoredCertificate(&holder->issuer, issuer);
+    X509_free(issuer);
+  }
+  X509_STORE_CTX_free(store_ctx);
+#endif
 }
 
 X509* ParseX509(const uint8_t* data, size_t len);
@@ -483,6 +503,16 @@ napi_value CreateBufferCopy(napi_env env, const uint8_t* data, size_t len) {
 
 napi_value CreateBufferCopy(napi_env env, const ncrypto::DataPointer& dp) {
   return CreateBufferCopy(env, dp.get<uint8_t>(), dp.size());
+}
+
+napi_value CreateX509DerBuffer(napi_env env, X509* cert) {
+  if (cert == nullptr) return nullptr;
+  const int size = i2d_X509(cert, nullptr);
+  if (size <= 0) return nullptr;
+  std::vector<uint8_t> out(static_cast<size_t>(size));
+  unsigned char* write_ptr = out.data();
+  if (i2d_X509(cert, &write_ptr) != size) return nullptr;
+  return CreateBufferCopy(env, out.data(), out.size());
 }
 
 napi_value CryptoHashOneShot(napi_env env, napi_callback_info info) {
@@ -1178,6 +1208,52 @@ napi_value CryptoSecureContextInit(napi_env env, napi_callback_info info) {
   return true_v;
 }
 
+napi_value CryptoSecureContextSetMinProto(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  int32_t min_version = 0;
+  if (napi_get_value_int32(env, argv[1], &min_version) != napi_ok) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "min protocol version must be an integer");
+    return nullptr;
+  }
+  if (SSL_CTX_set_min_proto_version(holder->ctx, min_version) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_PROTOCOL_VERSION", "Failed to set min protocol version");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetMaxProto(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  int32_t max_version = 0;
+  if (napi_get_value_int32(env, argv[1], &max_version) != napi_ok) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "max protocol version must be an integer");
+    return nullptr;
+  }
+  if (SSL_CTX_set_max_proto_version(holder->ctx, max_version) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_PROTOCOL_VERSION", "Failed to set max protocol version");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
 napi_value CryptoSecureContextSetOptions(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr, nullptr};
@@ -1209,7 +1285,13 @@ napi_value CryptoSecureContextSetCiphers(napi_env env, napi_callback_info info) 
   }
   const std::string ciphers = ValueToUtf8(env, argv[1]);
   if (SSL_CTX_set_cipher_list(holder->ctx, ciphers.c_str()) != 1) {
-    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CIPHER", "Failed to set ciphers");
+    const unsigned long err = ERR_get_error();
+    if (ciphers.empty() && ERR_GET_REASON(err) == SSL_R_NO_CIPHER_MATCH) {
+      napi_value true_v = nullptr;
+      napi_get_boolean(env, true, &true_v);
+      return true_v;
+    }
+    ThrowOpenSslError(env, "ERR_TLS_INVALID_CIPHER", err, "Failed to set ciphers");
     return nullptr;
   }
   napi_value true_v = nullptr;
@@ -1262,6 +1344,10 @@ napi_value CryptoSecureContextSetCert(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   const int ok = SSL_CTX_use_certificate(holder->ctx, cert);
+  if (ok == 1) {
+    ResetStoredCertificate(&holder->cert, cert);
+    UpdateIssuerFromStore(holder);
+  }
   X509_free(cert);
   if (ok != 1) {
     ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to use certificate");
@@ -1348,6 +1434,8 @@ napi_value CryptoSecureContextAddCACert(napi_env env, napi_callback_info info) {
     ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to add CA certificate");
     return nullptr;
   }
+  (void)SSL_CTX_add_client_CA(holder->ctx, cert);
+  UpdateIssuerFromStore(holder);
   X509_free(cert);
   napi_value true_v = nullptr;
   napi_get_boolean(env, true, &true_v);
@@ -1386,6 +1474,180 @@ napi_value CryptoSecureContextAddCrl(napi_env env, napi_callback_info info) {
   napi_value true_v = nullptr;
   napi_get_boolean(env, true, &true_v);
   return true_v;
+}
+
+napi_value CryptoSecureContextAddRootCerts(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  if (SSL_CTX_set_default_verify_paths(holder->ctx) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to load default CA certificates");
+    return nullptr;
+  }
+  UpdateIssuerFromStore(holder);
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetAllowPartialTrustChain(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  X509_STORE* store = SSL_CTX_get_cert_store(holder->ctx);
+  if (store == nullptr || X509_STORE_set_flags(store, X509_V_FLAG_PARTIAL_CHAIN) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_CERT", "Failed to update certificate store flags");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetSessionIdContext(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  const std::string session_id_context = ValueToUtf8(env, argv[1]);
+  const auto* data = reinterpret_cast<const unsigned char*>(session_id_context.data());
+  if (SSL_CTX_set_session_id_context(holder->ctx, data, session_id_context.size()) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CONTEXT", "Failed to set session id context");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetSessionTimeout(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  int32_t timeout = 0;
+  if (napi_get_value_int32(env, argv[1], &timeout) != napi_ok || timeout < 0) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "session timeout must be a non-negative integer");
+    return nullptr;
+  }
+  SSL_CTX_set_timeout(holder->ctx, static_cast<long>(timeout));
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetTicketKeys(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  uint8_t* data = nullptr;
+  size_t len = 0;
+  if (!GetBufferBytes(env, argv[1], &data, &len) || len != 48) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "ticket keys must be a 48-byte Buffer");
+    return nullptr;
+  }
+  holder->ticket_keys.assign(data, data + len);
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetSigalgs(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  const std::string sigalgs = ValueToUtf8(env, argv[1]);
+  if (sigalgs.empty() || SSL_CTX_set1_sigalgs_list(holder->ctx, sigalgs.c_str()) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CONTEXT", "Failed to set signature algorithms");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextSetECDHCurve(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  const std::string curve = ValueToUtf8(env, argv[1]);
+  if (curve.empty() || curve == "auto") {
+    napi_value true_v = nullptr;
+    napi_get_boolean(env, true, &true_v);
+    return true_v;
+  }
+  if (SSL_CTX_set1_curves_list(holder->ctx, curve.c_str()) != 1) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CONTEXT", "Failed to set ECDH curve");
+    return nullptr;
+  }
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
+napi_value CryptoSecureContextGetCertificate(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  napi_value out = CreateX509DerBuffer(env, holder->cert);
+  if (out == nullptr) {
+    napi_get_null(env, &out);
+  }
+  return out;
+}
+
+napi_value CryptoSecureContextGetIssuer(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  napi_value out = CreateX509DerBuffer(env, holder->issuer);
+  if (out == nullptr) {
+    napi_get_null(env, &out);
+  }
+  return out;
 }
 
 EVP_PKEY* ParsePrivateKeyWithPassphrase(const uint8_t* data,
@@ -2746,6 +3008,8 @@ napi_value InstallCryptoBinding(napi_env env) {
   SetMethod(env, binding, "parseCrl", CryptoParseCrl);
   SetMethod(env, binding, "secureContextCreate", CryptoSecureContextCreate);
   SetMethod(env, binding, "secureContextInit", CryptoSecureContextInit);
+  SetMethod(env, binding, "secureContextSetMinProto", CryptoSecureContextSetMinProto);
+  SetMethod(env, binding, "secureContextSetMaxProto", CryptoSecureContextSetMaxProto);
   SetMethod(env, binding, "secureContextSetOptions", CryptoSecureContextSetOptions);
   SetMethod(env, binding, "secureContextSetCiphers", CryptoSecureContextSetCiphers);
   SetMethod(env, binding, "secureContextSetCipherSuites", CryptoSecureContextSetCipherSuites);
@@ -2753,6 +3017,15 @@ napi_value InstallCryptoBinding(napi_env env) {
   SetMethod(env, binding, "secureContextSetKey", CryptoSecureContextSetKey);
   SetMethod(env, binding, "secureContextAddCACert", CryptoSecureContextAddCACert);
   SetMethod(env, binding, "secureContextAddCrl", CryptoSecureContextAddCrl);
+  SetMethod(env, binding, "secureContextAddRootCerts", CryptoSecureContextAddRootCerts);
+  SetMethod(env, binding, "secureContextSetAllowPartialTrustChain", CryptoSecureContextSetAllowPartialTrustChain);
+  SetMethod(env, binding, "secureContextSetSessionIdContext", CryptoSecureContextSetSessionIdContext);
+  SetMethod(env, binding, "secureContextSetSessionTimeout", CryptoSecureContextSetSessionTimeout);
+  SetMethod(env, binding, "secureContextSetTicketKeys", CryptoSecureContextSetTicketKeys);
+  SetMethod(env, binding, "secureContextSetSigalgs", CryptoSecureContextSetSigalgs);
+  SetMethod(env, binding, "secureContextSetECDHCurve", CryptoSecureContextSetECDHCurve);
+  SetMethod(env, binding, "secureContextGetCertificate", CryptoSecureContextGetCertificate);
+  SetMethod(env, binding, "secureContextGetIssuer", CryptoSecureContextGetIssuer);
   SetMethod(env, binding, "signOneShot", CryptoSignOneShot);
   SetMethod(env, binding, "verifyOneShot", CryptoVerifyOneShot);
   SetMethod(env, binding, "getAsymmetricKeyDetails", CryptoGetAsymmetricKeyDetails);

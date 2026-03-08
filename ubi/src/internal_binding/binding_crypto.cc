@@ -31,6 +31,7 @@
 
 #include "ncrypto.h"
 #include "internal_binding/helpers.h"
+#include "crypto/ubi_secure_context_bridge.h"
 #include "ubi_async_wrap.h"
 #include "ubi_runtime.h"
 #include "ubi_runtime_platform.h"
@@ -3873,6 +3874,35 @@ void SecureContextCallBindingMethod(napi_env env,
   CallBindingMethod(env, binding, method, call_argv.size(), call_argv.data(), &ignored);
 }
 
+ubi::crypto::SecureContextHolder* GetSecureContextHolderFromWrap(napi_env env, SecureContextWrap* wrap) {
+  if (wrap == nullptr || wrap->handle_ref == nullptr) return nullptr;
+  napi_value handle = GetRefValue(env, wrap->handle_ref);
+  if (handle == nullptr) return nullptr;
+  ubi::crypto::SecureContextHolder* holder = nullptr;
+  if (!ubi::crypto::GetSecureContextHolder(env, handle, &holder)) return nullptr;
+  return holder;
+}
+
+napi_value CallSecureContextBindingMethodReturningValue(napi_env env,
+                                                        SecureContextWrap* wrap,
+                                                        const char* method,
+                                                        size_t extra_argc,
+                                                        napi_value* extra_argv) {
+  if (wrap == nullptr || method == nullptr) return nullptr;
+  napi_value binding = GetBinding(env);
+  napi_value handle = GetRefValue(env, wrap->handle_ref);
+  if (binding == nullptr || handle == nullptr) return nullptr;
+  std::vector<napi_value> call_argv;
+  call_argv.reserve(1 + extra_argc);
+  call_argv.push_back(handle);
+  for (size_t i = 0; i < extra_argc; ++i) {
+    call_argv.push_back(extra_argv != nullptr ? extra_argv[i] : Undefined(env));
+  }
+  napi_value out = nullptr;
+  if (!CallBindingMethod(env, binding, method, call_argv.size(), call_argv.data(), &out)) return nullptr;
+  return out;
+}
+
 napi_value SecureContextCtor(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
@@ -3899,10 +3929,9 @@ napi_value SecureContextInit(napi_env env, napi_callback_info info) {
     if (CallBindingMethod(env, binding, "secureContextCreate", 0, nullptr, &handle)) {
       ResetRef(env, &wrap->handle_ref);
       napi_create_reference(env, handle, 1, &wrap->handle_ref);
-      napi_value init_argv[4] = {handle, argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env),
-                                 argc >= 3 ? argv[2] : Undefined(env)};
+      napi_value init_argv[3] = {handle, argc >= 2 ? argv[1] : Undefined(env), argc >= 3 ? argv[2] : Undefined(env)};
       napi_value ignored = nullptr;
-      CallBindingMethod(env, binding, "secureContextInit", 4, init_argv, &ignored);
+      CallBindingMethod(env, binding, "secureContextInit", 3, init_argv, &ignored);
     }
   }
   return Undefined(env);
@@ -3992,6 +4021,112 @@ napi_value SecureContextAddCrl(napi_env env, napi_callback_info info) {
   return Undefined(env);
 }
 
+napi_value SecureContextAddRootCerts(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  SecureContextCallBindingMethod(env, wrap, "secureContextAddRootCerts", 0, nullptr);
+  return Undefined(env);
+}
+
+napi_value SecureContextSetECDHCurve(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  SecureContextCallBindingMethod(env, wrap, "secureContextSetECDHCurve", 1, call_argv);
+  return Undefined(env);
+}
+
+napi_value SecureContextSetSigalgs(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  SecureContextCallBindingMethod(env, wrap, "secureContextSetSigalgs", 1, call_argv);
+  return Undefined(env);
+}
+
+napi_value SecureContextSetSessionIdContext(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  SecureContextCallBindingMethod(env, wrap, "secureContextSetSessionIdContext", 1, call_argv);
+  return Undefined(env);
+}
+
+napi_value SecureContextSetSessionTimeout(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  SecureContextCallBindingMethod(env, wrap, "secureContextSetSessionTimeout", 1, call_argv);
+  return Undefined(env);
+}
+
+napi_value SecureContextSetTicketKeys(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  SecureContextCallBindingMethod(env, wrap, "secureContextSetTicketKeys", 1, call_argv);
+  return Undefined(env);
+}
+
+napi_value SecureContextSetAllowPartialTrustChain(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  SecureContextCallBindingMethod(env, wrap, "secureContextSetAllowPartialTrustChain", 0, nullptr);
+  return Undefined(env);
+}
+
+napi_value SecureContextGetCertificate(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  napi_value out = CallSecureContextBindingMethodReturningValue(env, wrap, "secureContextGetCertificate", 0, nullptr);
+  if (out != nullptr) return out;
+  napi_value null_value = nullptr;
+  napi_get_null(env, &null_value);
+  return null_value;
+}
+
+napi_value SecureContextGetIssuer(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  napi_value out = CallSecureContextBindingMethodReturningValue(env, wrap, "secureContextGetIssuer", 0, nullptr);
+  if (out != nullptr) return out;
+  napi_value null_value = nullptr;
+  napi_get_null(env, &null_value);
+  return null_value;
+}
+
 napi_value SecureContextNoop(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
@@ -4011,6 +4146,8 @@ napi_value SecureContextSetMinProto(napi_env env, napi_callback_info info) {
   int32_t value = 0;
   if (argc >= 1 && argv[0] != nullptr) napi_get_value_int32(env, argv[0], &value);
   wrap->min_proto = value;
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  SecureContextCallBindingMethod(env, wrap, "secureContextSetMinProto", 1, call_argv);
   return Undefined(env);
 }
 
@@ -4024,6 +4161,8 @@ napi_value SecureContextSetMaxProto(napi_env env, napi_callback_info info) {
   int32_t value = 0;
   if (argc >= 1 && argv[0] != nullptr) napi_get_value_int32(env, argv[0], &value);
   wrap->max_proto = value;
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  SecureContextCallBindingMethod(env, wrap, "secureContextSetMaxProto", 1, call_argv);
   return Undefined(env);
 }
 
@@ -6467,14 +6606,20 @@ void EnsureClass(napi_env env,
                  const std::vector<napi_property_descriptor>& methods) {
   bool has = false;
   if (napi_has_named_property(env, binding, name, &has) == napi_ok && has) return;
+  std::vector<napi_property_descriptor> descriptors = methods;
+  for (auto& desc : descriptors) {
+    if (desc.method != nullptr) {
+      desc.attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+    }
+  }
   napi_value cls = nullptr;
   if (napi_define_class(env,
                         name,
                         NAPI_AUTO_LENGTH,
                         ctor,
                         nullptr,
-                        methods.size(),
-                        methods.data(),
+                        descriptors.size(),
+                        descriptors.data(),
                         &cls) == napi_ok &&
       cls != nullptr) {
     napi_set_named_property(env, binding, name, cls);
@@ -6681,21 +6826,26 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
                   {"setKey", nullptr, SecureContextSetKey, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"addCACert", nullptr, SecureContextAddCACert, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"addCRL", nullptr, SecureContextAddCrl, nullptr, nullptr, nullptr, napi_default, nullptr},
-                  {"addRootCerts", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
-                  {"setECDHCurve", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"addRootCerts", nullptr, SecureContextAddRootCerts, nullptr, nullptr, nullptr, napi_default,
+                   nullptr},
+                  {"setECDHCurve", nullptr, SecureContextSetECDHCurve, nullptr, nullptr, nullptr, napi_default,
+                   nullptr},
                   {"setDHParam", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
-                  {"setSigalgs", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"setSigalgs", nullptr, SecureContextSetSigalgs, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"setEngineKey", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"setClientCertEngine", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default,
                    nullptr},
-                  {"setSessionIdContext", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default,
+                  {"setSessionIdContext", nullptr, SecureContextSetSessionIdContext, nullptr, nullptr, nullptr,
+                   napi_default, nullptr},
+                  {"setSessionTimeout", nullptr, SecureContextSetSessionTimeout, nullptr, nullptr, nullptr,
+                   napi_default, nullptr},
+                  {"setTicketKeys", nullptr, SecureContextSetTicketKeys, nullptr, nullptr, nullptr, napi_default,
                    nullptr},
-                  {"setSessionTimeout", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
-                  {"setTicketKeys", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
-                  {"setAllowPartialTrustChain", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default,
+                  {"setAllowPartialTrustChain", nullptr, SecureContextSetAllowPartialTrustChain, nullptr, nullptr,
+                   nullptr, napi_default, nullptr},
+                  {"getCertificate", nullptr, SecureContextGetCertificate, nullptr, nullptr, nullptr, napi_default,
                    nullptr},
-                  {"getCertificate", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
-                  {"getIssuer", nullptr, SecureContextNoop, nullptr, nullptr, nullptr, napi_default, nullptr},
+                  {"getIssuer", nullptr, SecureContextGetIssuer, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"setMinProto", nullptr, SecureContextSetMinProto, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"setMaxProto", nullptr, SecureContextSetMaxProto, nullptr, nullptr, nullptr, napi_default, nullptr},
                   {"loadPKCS12", nullptr, SecureContextLoadPKCS12, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -6909,6 +7059,17 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
   for (const char* cls : stub_classes) EnsureStubClass(env, out, cls);
 
   return out;
+}
+
+bool UbiCryptoGetSecureContextHolderFromObject(napi_env env,
+                                               napi_value value,
+                                               ubi::crypto::SecureContextHolder** out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  SecureContextWrap* wrap = UnwrapSecureContext(env, value);
+  if (wrap == nullptr) return false;
+  *out = GetSecureContextHolderFromWrap(env, wrap);
+  return *out != nullptr;
 }
 
 }  // namespace internal_binding

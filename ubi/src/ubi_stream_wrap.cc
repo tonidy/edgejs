@@ -1,12 +1,19 @@
 #include "ubi_stream_wrap.h"
 
 #include <cstdint>
+#include <unordered_map>
 
 #include "ubi_async_wrap.h"
 
 namespace {
 
 int32_t* g_stream_state = nullptr;
+
+struct StreamWrapBindingState {
+  napi_ref binding_ref = nullptr;
+};
+
+std::unordered_map<napi_env, StreamWrapBindingState> g_stream_wrap_bindings;
 
 struct StreamReqWrap {
   napi_env env = nullptr;
@@ -23,6 +30,9 @@ void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   napi_delete_reference(env, *ref);
   *ref = nullptr;
 }
+
+napi_value StreamReqGetAsyncId(napi_env env, napi_callback_info info);
+napi_value StreamReqGetProviderTypeValue(napi_env env, napi_callback_info info);
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
   if (env == nullptr || ref == nullptr) return nullptr;
@@ -63,6 +73,31 @@ napi_value StreamReqCtor(napi_env env, napi_callback_info info) {
   return self;
 }
 
+bool DefineReqMethods(napi_env env, napi_value target) {
+  if (env == nullptr || target == nullptr) return false;
+  napi_property_descriptor req_props[] = {
+      {"getAsyncId", nullptr, StreamReqGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getProviderType",
+       nullptr,
+       StreamReqGetProviderTypeValue,
+       nullptr,
+       nullptr,
+       nullptr,
+       napi_default_method,
+       nullptr},
+  };
+  return napi_define_properties(env, target, sizeof(req_props) / sizeof(req_props[0]), req_props) == napi_ok;
+}
+
+bool DefineReqPrototypeMethods(napi_env env, napi_value ctor) {
+  if (env == nullptr || ctor == nullptr) return false;
+  napi_value prototype = nullptr;
+  if (napi_get_named_property(env, ctor, "prototype", &prototype) != napi_ok || prototype == nullptr) {
+    return false;
+  }
+  return DefineReqMethods(env, prototype);
+}
+
 napi_value StreamReqGetAsyncId(napi_env env, napi_callback_info info) {
   napi_value self = nullptr;
   size_t argc = 0;
@@ -94,6 +129,20 @@ void SetNamedU32(napi_env env, napi_value obj, const char* key, uint32_t value) 
 
 int32_t* UbiGetStreamBaseState() {
   return g_stream_state;
+}
+
+napi_value UbiCreateStreamReqObject(napi_env env) {
+  if (env == nullptr) return nullptr;
+  napi_value req = nullptr;
+  if (napi_create_object(env, &req) != napi_ok || req == nullptr) return nullptr;
+  if (!DefineReqMethods(env, req)) return nullptr;
+  auto* wrap = new StreamReqWrap();
+  wrap->env = env;
+  if (napi_wrap(env, req, wrap, StreamReqWrapFinalize, nullptr, &wrap->wrapper_ref) != napi_ok) {
+    delete wrap;
+    return nullptr;
+  }
+  return req;
 }
 
 int64_t UbiStreamReqGetAsyncId(napi_env env, napi_value req_obj) {
@@ -136,20 +185,14 @@ void UbiStreamReqMarkDone(napi_env env, napi_value req_obj) {
 }
 
 napi_value UbiInstallStreamWrapBinding(napi_env env) {
+  auto it = g_stream_wrap_bindings.find(env);
+  if (it != g_stream_wrap_bindings.end() && it->second.binding_ref != nullptr) {
+    napi_value cached = GetRefValue(env, it->second.binding_ref);
+    if (cached != nullptr) return cached;
+  }
+
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
-
-  napi_property_descriptor req_props[] = {
-      {"getAsyncId", nullptr, StreamReqGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
-      {"getProviderType",
-       nullptr,
-       StreamReqGetProviderTypeValue,
-       nullptr,
-       nullptr,
-       nullptr,
-       napi_default_method,
-       nullptr},
-  };
 
   napi_value write_wrap_ctor = nullptr;
   if (napi_define_class(env,
@@ -157,12 +200,13 @@ napi_value UbiInstallStreamWrapBinding(napi_env env) {
                         NAPI_AUTO_LENGTH,
                         StreamReqCtor,
                         nullptr,
-                        sizeof(req_props) / sizeof(req_props[0]),
-                        req_props,
+                        0,
+                        nullptr,
                         &write_wrap_ctor) != napi_ok ||
       write_wrap_ctor == nullptr) {
     return nullptr;
   }
+  if (!DefineReqPrototypeMethods(env, write_wrap_ctor)) return nullptr;
 
   napi_value shutdown_wrap_ctor = nullptr;
   if (napi_define_class(env,
@@ -170,12 +214,13 @@ napi_value UbiInstallStreamWrapBinding(napi_env env) {
                         NAPI_AUTO_LENGTH,
                         StreamReqCtor,
                         nullptr,
-                        sizeof(req_props) / sizeof(req_props[0]),
-                        req_props,
+                        0,
+                        nullptr,
                         &shutdown_wrap_ctor) != napi_ok ||
       shutdown_wrap_ctor == nullptr) {
     return nullptr;
   }
+  if (!DefineReqPrototypeMethods(env, shutdown_wrap_ctor)) return nullptr;
 
   void* state_data = nullptr;
   napi_value state_ab = nullptr;
@@ -205,6 +250,10 @@ napi_value UbiInstallStreamWrapBinding(napi_env env) {
   SetNamedU32(env, binding, "kArrayBufferOffset", kUbiArrayBufferOffset);
   SetNamedU32(env, binding, "kBytesWritten", kUbiBytesWritten);
   SetNamedU32(env, binding, "kLastWriteWasAsync", kUbiLastWriteWasAsync);
+
+  StreamWrapBindingState& state = g_stream_wrap_bindings[env];
+  DeleteRefIfPresent(env, &state.binding_ref);
+  napi_create_reference(env, binding, 1, &state.binding_ref);
 
   return binding;
 }

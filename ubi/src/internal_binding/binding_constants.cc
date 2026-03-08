@@ -4,6 +4,7 @@
 
 #include <openssl/ec.h>
 #include <openssl/rsa.h>
+#include <openssl/ssl.h>
 
 #include "internal_binding/helpers.h"
 
@@ -92,6 +93,16 @@ void EnsureInt32Default(napi_env env, napi_value target, const char* key, int32_
   bool has_key = false;
   if (napi_has_named_property(env, target, key, &has_key) != napi_ok || has_key) return;
   SetInt32(env, target, key, value);
+}
+
+void EnsureInt64Default(napi_env env, napi_value target, const char* key, int64_t value) {
+  if (!IsObjectLike(env, target)) return;
+  bool has_key = false;
+  if (napi_has_named_property(env, target, key, &has_key) != napi_ok || has_key) return;
+  napi_value out = nullptr;
+  if (napi_create_int64(env, value, &out) == napi_ok && out != nullptr) {
+    napi_set_named_property(env, target, key, out);
+  }
 }
 
 void CopyOwnProperties(napi_env env, napi_value src, napi_value dst) {
@@ -290,6 +301,24 @@ void NormalizeConstantsShape(napi_env env, napi_value constants) {
 #endif
 #ifdef RSA_PSS_SALTLEN_AUTO
   EnsureInt32Default(env, crypto_obj, "RSA_PSS_SALTLEN_AUTO", RSA_PSS_SALTLEN_AUTO);
+#endif
+#ifdef TLS1_VERSION
+  EnsureInt32Default(env, crypto_obj, "TLS1_VERSION", TLS1_VERSION);
+#endif
+#ifdef TLS1_1_VERSION
+  EnsureInt32Default(env, crypto_obj, "TLS1_1_VERSION", TLS1_1_VERSION);
+#endif
+#ifdef TLS1_2_VERSION
+  EnsureInt32Default(env, crypto_obj, "TLS1_2_VERSION", TLS1_2_VERSION);
+#endif
+#ifdef TLS1_3_VERSION
+  EnsureInt32Default(env, crypto_obj, "TLS1_3_VERSION", TLS1_3_VERSION);
+#endif
+#ifdef SSL_OP_CIPHER_SERVER_PREFERENCE
+  EnsureInt64Default(env,
+                     crypto_obj,
+                     "SSL_OP_CIPHER_SERVER_PREFERENCE",
+                     static_cast<int64_t>(SSL_OP_CIPHER_SERVER_PREFERENCE));
 #endif
   EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_COMPRESSED", POINT_CONVERSION_COMPRESSED);
   EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_UNCOMPRESSED", POINT_CONVERSION_UNCOMPRESSED);
