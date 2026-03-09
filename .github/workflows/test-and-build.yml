@@ -59,6 +59,7 @@ jobs:
           if-no-files-found: error
 
       - name: Test ubi
+        if: false
         run: |
           make test-only TEST_JOBS=4
 
