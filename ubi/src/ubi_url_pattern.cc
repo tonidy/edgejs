@@ -1,5 +1,6 @@
 #include "ubi_url_pattern.h"
 
+#include <cstring>
 #include <optional>
 #include <string>
 #include <string_view>

@@ -2,6 +2,7 @@
 #include "internal_binding/dispatch.h"
 
 #include <algorithm>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <mutex>
