@@ -56,6 +56,7 @@ std::mutex g_runtime_mu;
 SharedRuntime g_runtime;
 std::unordered_map<v8::Isolate*, napi_env> g_env_by_isolate;
 std::unordered_map<v8::Isolate*, v8::Global<v8::Function>> g_promise_reject_callbacks;
+std::unordered_map<v8::Isolate*, std::array<v8::Global<v8::Function>, 4>> g_promise_hooks;
 std::unordered_map<v8::ArrayBuffer::Allocator*, void*> g_tracking_allocators;
 
 struct FatalErrorCallbacks {
@@ -274,6 +275,90 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
     } else {
       std::fprintf(stderr, "<exception>\n");
     }
+  }
+}
+
+bool IsNullishValue(v8::Local<v8::Value> value) {
+  return value.IsEmpty() || value->IsUndefined() || value->IsNull();
+}
+
+bool GetPromiseHookFunction(napi_env env,
+                            napi_value value,
+                            v8::Local<v8::Function>* function_out) {
+  if (env == nullptr || function_out == nullptr) return false;
+  *function_out = v8::Local<v8::Function>();
+  if (value == nullptr) return true;
+
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(value);
+  if (IsNullishValue(raw)) return true;
+  if (!raw->IsFunction()) return false;
+
+  *function_out = raw.As<v8::Function>();
+  return true;
+}
+
+size_t PromiseHookIndex(v8::PromiseHookType type) {
+  switch (type) {
+    case v8::PromiseHookType::kInit:
+      return 0;
+    case v8::PromiseHookType::kBefore:
+      return 1;
+    case v8::PromiseHookType::kAfter:
+      return 2;
+    case v8::PromiseHookType::kResolve:
+      return 3;
+    default:
+      return 4;
+  }
+}
+
+bool HasPromiseHooks(const std::array<v8::Global<v8::Function>, 4>& hooks) {
+  for (const auto& hook : hooks) {
+    if (!hook.IsEmpty()) return true;
+  }
+  return false;
+}
+
+void PromiseHookCallback(v8::PromiseHookType type,
+                         v8::Local<v8::Promise> promise,
+                         v8::Local<v8::Value> parent) {
+  v8::Isolate* isolate = promise->GetIsolate();
+  napi_env env = nullptr;
+  v8::Local<v8::Function> callback;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    const auto env_it = g_env_by_isolate.find(isolate);
+    if (env_it == g_env_by_isolate.end() || env_it->second == nullptr) return;
+    env = env_it->second;
+
+    const auto hooks_it = g_promise_hooks.find(isolate);
+    if (hooks_it == g_promise_hooks.end()) return;
+
+    const size_t index = PromiseHookIndex(type);
+    if (index >= hooks_it->second.size() || hooks_it->second[index].IsEmpty()) return;
+    callback = hooks_it->second[index].Get(isolate);
+  }
+  if (env == nullptr || callback.IsEmpty()) return;
+
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context =
+      isolate->InContext() ? isolate->GetCurrentContext() : env->context();
+  if (context.IsEmpty()) return;
+  std::optional<v8::Context::Scope> context_scope;
+  if (!isolate->InContext()) {
+    context_scope.emplace(context);
+  }
+
+  v8::TryCatch tc(isolate);
+  tc.SetVerbose(false);
+  v8::Local<v8::Value> args[] = {
+      promise,
+      parent.IsEmpty() ? v8::Undefined(isolate) : parent,
+  };
+  const int argc = type == v8::PromiseHookType::kInit ? 2 : 1;
+  (void)callback->Call(context, v8::Undefined(isolate), argc, args);
+  if (tc.HasCaught() && !tc.HasTerminated()) {
+    tc.ReThrow();
   }
 }
 
@@ -905,10 +990,18 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
       cb_it->second.Reset();
       g_promise_reject_callbacks.erase(cb_it);
     }
+    auto hooks_it = g_promise_hooks.find(env->isolate);
+    if (hooks_it != g_promise_hooks.end()) {
+      for (auto& hook : hooks_it->second) {
+        hook.Reset();
+      }
+      g_promise_hooks.erase(hooks_it);
+    }
     g_fatal_error_callbacks.erase(env->isolate);
     g_near_heap_limit_callbacks.erase(env->isolate);
   }
   if (env->isolate != nullptr) {
+    env->isolate->SetPromiseHook(nullptr);
     env->isolate->SetPromiseRejectCallback(nullptr);
     env->isolate->SetFatalErrorHandler(nullptr);
     env->isolate->SetOOMErrorHandler(nullptr);
@@ -1287,6 +1380,51 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_reject_callback(napi_env env,
     slot.Reset(env->isolate, raw.As<v8::Function>());
   }
   env->isolate->SetPromiseRejectCallback(PromiseRejectCallback);
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
+                                                         napi_value init,
+                                                         napi_value before,
+                                                         napi_value after,
+                                                         napi_value resolve) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+
+  std::array<v8::Local<v8::Function>, 4> hooks;
+  if (!GetPromiseHookFunction(env, init, &hooks[0]) ||
+      !GetPromiseHookFunction(env, before, &hooks[1]) ||
+      !GetPromiseHookFunction(env, after, &hooks[2]) ||
+      !GetPromiseHookFunction(env, resolve, &hooks[3])) {
+    return napi_function_expected;
+  }
+
+  std::array<v8::Global<v8::Function>, 4> persistent_hooks;
+  for (size_t i = 0; i < hooks.size(); ++i) {
+    if (!hooks[i].IsEmpty()) {
+      persistent_hooks[i].Reset(env->isolate, hooks[i]);
+    }
+  }
+  const bool has_hooks = HasPromiseHooks(persistent_hooks);
+
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    g_env_by_isolate[env->isolate] = env;
+
+    auto existing = g_promise_hooks.find(env->isolate);
+    if (existing != g_promise_hooks.end()) {
+      for (auto& hook : existing->second) {
+        hook.Reset();
+      }
+    }
+
+    if (has_hooks) {
+      g_promise_hooks[env->isolate] = std::move(persistent_hooks);
+    } else if (existing != g_promise_hooks.end()) {
+      g_promise_hooks.erase(existing);
+    }
+  }
+
+  env->isolate->SetPromiseHook(has_hooks ? PromiseHookCallback : nullptr);
   return napi_ok;
 }
 

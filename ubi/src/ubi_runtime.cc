@@ -650,6 +650,175 @@ int EmitProcessExitOnFatalException(napi_env env, int default_exit_code) {
   return has_exit_code ? final_exit_code : default_exit_code;
 }
 
+bool DomainHasErrorHandler(napi_env env, napi_value domain) {
+  if (env == nullptr || domain == nullptr) return false;
+  napi_valuetype domain_type = napi_undefined;
+  if (napi_typeof(env, domain, &domain_type) != napi_ok ||
+      (domain_type != napi_object && domain_type != napi_function)) {
+    return false;
+  }
+
+  napi_value listener_count_fn = nullptr;
+  napi_valuetype listener_count_type = napi_undefined;
+  if (napi_get_named_property(env, domain, "listenerCount", &listener_count_fn) != napi_ok ||
+      listener_count_fn == nullptr ||
+      napi_typeof(env, listener_count_fn, &listener_count_type) != napi_ok ||
+      listener_count_type != napi_function) {
+    return false;
+  }
+
+  napi_value error_name = nullptr;
+  if (napi_create_string_utf8(env, "error", NAPI_AUTO_LENGTH, &error_name) != napi_ok ||
+      error_name == nullptr) {
+    return false;
+  }
+
+  napi_value count_value = nullptr;
+  napi_value argv[1] = {error_name};
+  if (napi_call_function(env, domain, listener_count_fn, 1, argv, &count_value) != napi_ok ||
+      count_value == nullptr) {
+    bool has_pending = false;
+    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+      napi_value ignored = nullptr;
+      (void)napi_get_and_clear_last_exception(env, &ignored);
+    }
+    return false;
+  }
+
+  uint32_t count = 0;
+  return napi_get_value_uint32(env, count_value, &count) == napi_ok && count > 0;
+}
+
+bool HasActiveDomainErrorHandler(napi_env env) {
+  if (env == nullptr) return false;
+
+  napi_value global = nullptr;
+  napi_value process_obj = nullptr;
+  napi_value current_domain = nullptr;
+  if (napi_get_global(env, &global) == napi_ok &&
+      global != nullptr &&
+      napi_get_named_property(env, global, "process", &process_obj) == napi_ok &&
+      process_obj != nullptr &&
+      napi_get_named_property(env, process_obj, "domain", &current_domain) == napi_ok &&
+      current_domain != nullptr &&
+      !IsNullOrUndefinedValue(env, current_domain) &&
+      DomainHasErrorHandler(env, current_domain)) {
+    return true;
+  }
+
+  napi_value require_fn = UbiGetRequireFunction(env);
+  napi_valuetype require_type = napi_undefined;
+  if (require_fn == nullptr ||
+      napi_typeof(env, require_fn, &require_type) != napi_ok ||
+      require_type != napi_function) {
+    return false;
+  }
+
+  napi_value domain_name = nullptr;
+  if (napi_create_string_utf8(env, "domain", NAPI_AUTO_LENGTH, &domain_name) != napi_ok ||
+      domain_name == nullptr) {
+    return false;
+  }
+
+  napi_value domain_module = nullptr;
+  napi_value require_argv[1] = {domain_name};
+  if (napi_call_function(env, global, require_fn, 1, require_argv, &domain_module) != napi_ok ||
+      domain_module == nullptr) {
+    bool has_pending = false;
+    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+      napi_value ignored = nullptr;
+      (void)napi_get_and_clear_last_exception(env, &ignored);
+    }
+    return false;
+  }
+
+  napi_value stack = nullptr;
+  bool is_array = false;
+  if (napi_get_named_property(env, domain_module, "_stack", &stack) != napi_ok ||
+      stack == nullptr ||
+      napi_is_array(env, stack, &is_array) != napi_ok ||
+      !is_array) {
+    return false;
+  }
+
+  uint32_t length = 0;
+  if (napi_get_array_length(env, stack, &length) != napi_ok) return false;
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value domain = nullptr;
+    if (napi_get_element(env, stack, i, &domain) == napi_ok &&
+        domain != nullptr &&
+        !IsNullOrUndefinedValue(env, domain) &&
+        DomainHasErrorHandler(env, domain)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool ShouldAbortOnUncaughtException() {
+  return UbiExecArgvHasFlag("--abort-on-uncaught-exception") ||
+         UbiExecArgvHasFlag("--abort_on_uncaught_exception");
+}
+
+std::string FormatFatalExceptionMessage(napi_env env, napi_value exception) {
+  if (env == nullptr || exception == nullptr) return "Unhandled async exception";
+
+  std::string exception_message;
+  const std::string enhanced_exception =
+      UbiFormatFatalExceptionAfterInspector(env, exception);
+  if (!enhanced_exception.empty()) {
+    exception_message = FormatUncaughtExceptionForStderr(env, enhanced_exception);
+  }
+
+  napi_value stack_value = nullptr;
+  if (exception_message.empty() &&
+      napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok &&
+      stack_value != nullptr) {
+    napi_value stack_string = nullptr;
+    if (napi_coerce_to_string(env, stack_value, &stack_string) == napi_ok &&
+        stack_string != nullptr) {
+      size_t stack_len = 0;
+      if (napi_get_value_string_utf8(env, stack_string, nullptr, 0, &stack_len) == napi_ok &&
+          stack_len > 0) {
+        std::vector<char> stack_buf(stack_len + 1, '\0');
+        size_t copied = 0;
+        if (napi_get_value_string_utf8(
+                env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
+          exception_message.assign(stack_buf.data(), copied);
+        }
+      }
+    }
+  }
+
+  if (exception_message.empty()) {
+    napi_value exception_string = nullptr;
+    if (napi_coerce_to_string(env, exception, &exception_string) == napi_ok &&
+        exception_string != nullptr) {
+      size_t length = 0;
+      if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) == napi_ok) {
+        std::vector<char> buffer(length + 1, '\0');
+        size_t copied = 0;
+        if (napi_get_value_string_utf8(
+                env, exception_string, buffer.data(), buffer.size(), &copied) == napi_ok) {
+          exception_message.assign(buffer.data(), copied);
+        }
+      }
+    }
+  }
+
+  return exception_message.empty() ? "Unhandled async exception" : exception_message;
+}
+
+[[noreturn]] void AbortOnUncaughtException(napi_env env, napi_value exception) {
+  std::string exception_message = FormatFatalExceptionMessage(env, exception);
+  if (!exception_message.empty()) {
+    if (exception_message.back() != '\n') exception_message.push_back('\n');
+    WriteTextToFd(2, exception_message);
+  }
+  std::abort();
+}
+
 bool DispatchUncaughtException(napi_env env,
                                napi_value exception,
                                bool* handled_out,
@@ -707,7 +876,6 @@ bool DispatchUncaughtException(napi_env env,
         if (effective_exception_out != nullptr) {
           *effective_exception_out = pending;
         }
-        (void)napi_throw(env, pending);
       }
     }
     if (DebugExceptionsEnabled()) {
@@ -737,6 +905,38 @@ bool DispatchUncaughtException(napi_env env,
   return true;
 }
 
+int HandleExtractedException(napi_env env, napi_value exception, std::string* error_out) {
+  const bool abort_on_uncaught = ShouldAbortOnUncaughtException();
+  if (abort_on_uncaught && !HasActiveDomainErrorHandler(env)) {
+    AbortOnUncaughtException(env, exception);
+  }
+
+  bool handled = false;
+  napi_value effective_exception = exception;
+  int fatal_exit_code = -1;
+  (void)DispatchUncaughtException(env, exception, &handled, &effective_exception, &fatal_exit_code);
+  if (handled) {
+    if (DebugExceptionsEnabled()) {
+      std::cerr << "[ubi-exc] handled async exception, continue loop\n";
+    }
+    return -1;
+  }
+
+  if (abort_on_uncaught) {
+    AbortOnUncaughtException(env, effective_exception);
+  }
+
+  const int exit_code = EmitProcessExitOnFatalException(
+      env,
+      fatal_exit_code >= 0 ? fatal_exit_code : 1);
+  const std::string exception_message =
+      FormatFatalExceptionMessage(env, effective_exception);
+  if (error_out != nullptr) {
+    *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
+  }
+  return exit_code;
+}
+
 int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   bool has_pending = false;
   if (napi_is_exception_pending(env, &has_pending) != napi_ok || !has_pending) {
@@ -755,64 +955,7 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
     return 1;
   }
 
-  bool handled = false;
-  napi_value effective_exception = exception;
-  int fatal_exit_code = -1;
-  (void)DispatchUncaughtException(env, exception, &handled, &effective_exception, &fatal_exit_code);
-  if (handled) {
-    if (DebugExceptionsEnabled()) {
-      std::cerr << "[ubi-exc] handled async exception, continue loop\n";
-    }
-    return -1;
-  }
-
-  const int exit_code = EmitProcessExitOnFatalException(
-      env,
-      fatal_exit_code >= 0 ? fatal_exit_code : 1);
-
-  std::string exception_message;
-  const std::string enhanced_exception = UbiFormatFatalExceptionAfterInspector(env, effective_exception);
-  if (!enhanced_exception.empty()) {
-    exception_message = FormatUncaughtExceptionForStderr(env, enhanced_exception);
-  }
-  napi_value stack_value = nullptr;
-  if (exception_message.empty() &&
-      napi_get_named_property(env, effective_exception, "stack", &stack_value) == napi_ok &&
-      stack_value != nullptr) {
-    napi_value stack_string = nullptr;
-    if (napi_coerce_to_string(env, stack_value, &stack_string) == napi_ok && stack_string != nullptr) {
-      size_t stack_len = 0;
-      if (napi_get_value_string_utf8(env, stack_string, nullptr, 0, &stack_len) == napi_ok && stack_len > 0) {
-        std::vector<char> stack_buf(stack_len + 1, '\0');
-        size_t copied = 0;
-        if (napi_get_value_string_utf8(env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
-          exception_message.assign(stack_buf.data(), copied);
-        }
-      }
-    }
-  }
-  if (exception_message.empty()) {
-    napi_value exception_string = nullptr;
-    if (napi_coerce_to_string(env, effective_exception, &exception_string) == napi_ok &&
-        exception_string != nullptr) {
-      size_t length = 0;
-      if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) == napi_ok) {
-        std::vector<char> buffer(length + 1, '\0');
-        size_t copied = 0;
-        if (napi_get_value_string_utf8(env, exception_string, buffer.data(), buffer.size(), &copied) == napi_ok) {
-          exception_message.assign(buffer.data(), copied);
-        }
-      }
-    }
-  } else if (!exception_message.empty()) {
-    // `afterInspector` already produced the full fatal exception rendering.
-  } else {
-    exception_message = FormatUncaughtExceptionForStderr(env, exception_message);
-  }
-  if (error_out != nullptr) {
-    *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
-  }
-  return exit_code;
+  return HandleExtractedException(env, exception, error_out);
 }
 
 // Mirrors Node's native tick dispatch by preferring the task_queue callback
@@ -2429,7 +2572,7 @@ int RunScriptWithGlobals(napi_env env,
     const std::string entry_main_module =
         check_syntax_mode ? "internal/main/check_syntax" : "internal/main/run_main_module";
     entry_source =
-        "(function(require, getInternalBinding, internalBinding){ try {"
+        "(function(require, getInternalBinding, internalBinding){"
         "require('" +
         entry_main_module +
         "');"
@@ -2442,14 +2585,7 @@ int RunScriptWithGlobals(napi_env env,
         "  if (__sym && globalThis[__sym]) return globalThis[__sym];"
         "}"
         "return undefined;"
-        "} catch (err) {"
-        "var p = globalThis.process;"
-        "if (p && typeof p._fatalException === 'function') {"
-        "  var handled = p._fatalException(err);"
-        "  if (handled) return;"
-        "}"
-        "throw err;"
-        "} })";
+        "})";
     source_to_run = entry_source.c_str();
     source_is_wrapper_factory = true;
   }
@@ -2530,6 +2666,43 @@ int RunScriptWithGlobals(napi_env env,
     if (has_exit_code) {
       return exit_code;
     }
+    return 0;
+  }
+
+  bool handled_top_level_exception = false;
+  napi_value top_level_exception = nullptr;
+  if (napi_get_and_clear_last_exception(env, &top_level_exception) == napi_ok &&
+      top_level_exception != nullptr) {
+    const int exception_status =
+        HandleExtractedException(env, top_level_exception, error_out);
+    if (exception_status >= 0) {
+      return exception_status;
+    }
+    handled_top_level_exception = true;
+  }
+
+  (void)DrainProcessTickCallback(env);
+  bool has_post_exception = false;
+  if (napi_is_exception_pending(env, &has_post_exception) == napi_ok && has_post_exception) {
+    const int post_exception_status = HandlePendingExceptionAfterLoopStep(env, error_out);
+    if (post_exception_status >= 0) {
+      return post_exception_status;
+    }
+    handled_top_level_exception = true;
+  }
+
+  if (keep_event_loop_alive) {
+    const int loop_result = RunEventLoopUntilQuiescent(env, error_out);
+    if (loop_result >= 0) {
+      return loop_result;
+    }
+  }
+  bool has_exit_code = false;
+  const int exit_code = GetProcessExitCode(env, &has_exit_code);
+  if (has_exit_code) {
+    return exit_code;
+  }
+  if (handled_top_level_exception) {
     return 0;
   }
 

@@ -65,6 +65,14 @@ NAPI_EXTERN napi_status unofficial_napi_enqueue_microtask(napi_env env, napi_val
 NAPI_EXTERN napi_status unofficial_napi_set_promise_reject_callback(napi_env env,
                                                                     napi_value callback);
 
+// Unofficial helper. Sets the per-env Promise lifecycle hooks used by
+// internal/promise_hooks via internalBinding('async_wrap').
+NAPI_EXTERN napi_status unofficial_napi_set_promise_hooks(napi_env env,
+                                                          napi_value init,
+                                                          napi_value before,
+                                                          napi_value after,
+                                                          napi_value resolve);
+
 using unofficial_napi_fatal_error_callback =
     void (*)(napi_env env, const char* location, const char* message);
 using unofficial_napi_oom_error_callback =
