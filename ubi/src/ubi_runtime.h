@@ -17,12 +17,14 @@ int UbiRunScriptSource(napi_env env, const char* source_text, std::string* error
 int UbiRunScriptSourceWithLoop(napi_env env,
                                const char* source_text,
                                std::string* error_out,
-                               bool keep_event_loop_alive);
+                               bool keep_event_loop_alive,
+                               const char* native_main_builtin_id = nullptr);
 int UbiRunScriptFile(napi_env env, const char* script_path, std::string* error_out);
 int UbiRunScriptFileWithLoop(napi_env env,
                                const char* script_path,
                                std::string* error_out,
-                               bool keep_event_loop_alive);
+                               bool keep_event_loop_alive,
+                               const char* native_main_builtin_id = nullptr);
 int UbiRunWorkerThreadMain(napi_env env,
                            const std::vector<std::string>& exec_argv,
                            std::string* error_out);

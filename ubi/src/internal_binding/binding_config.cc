@@ -82,12 +82,17 @@ bool GetProcessConfigVariable(napi_env env, const char* key) {
 }
 
 bool RuntimeHasIntl(napi_env env) {
+#if defined(UBI_HAS_ICU)
+  (void)env;
+  return true;
+#else
   napi_value global = GetGlobal(env);
   napi_value intl = GetNamed(env, global, "Intl");
   if (intl == nullptr) return false;
 
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, intl, &type) == napi_ok && (type == napi_object || type == napi_function);
+#endif
 }
 
 napi_value ConfigGetDefaultLocale(napi_env env, napi_callback_info /*info*/) {
@@ -131,7 +136,12 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
 #else
   const bool openssl_is_boringssl = false;
 #endif
-  const bool has_small_icu = false;
+  const bool has_small_icu =
+#if defined(UBI_HAS_SMALL_ICU)
+      true;
+#else
+      false;
+#endif
   const bool fips_mode =
       GetProcessConfigVariable(env, "openssl_is_fips") || GetProcessConfigVariable(env, "node_fipsinstall");
   const bool is_debug_build = GetProcessConfigVariable(env, "debug");

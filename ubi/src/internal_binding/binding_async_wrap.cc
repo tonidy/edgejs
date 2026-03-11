@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "internal_binding/helpers.h"
+#include "unofficial_napi.h"
+#include "ubi_runtime_platform.h"
 
 namespace internal_binding {
 
@@ -39,6 +41,8 @@ struct AsyncWrapState {
   napi_ref callback_trampoline_ref = nullptr;
   std::array<napi_ref, 4> promise_hooks = {nullptr, nullptr, nullptr, nullptr};
   std::vector<double> overflow_stack;
+  std::vector<double> queued_destroy_async_ids;
+  bool destroy_task_scheduled = false;
 };
 
 struct DestroyHookData {
@@ -123,6 +127,42 @@ void EmitDestroyHookForAsyncId(napi_env env, double async_id) {
   if (napi_create_double(env, async_id, &async_id_value) != napi_ok || async_id_value == nullptr) return;
   napi_value ignored = nullptr;
   napi_call_function(env, hooks, destroy_fn, 1, &async_id_value, &ignored);
+}
+
+void DrainQueuedDestroyHooks(napi_env env, void* /*data*/) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return;
+
+  while (!state->queued_destroy_async_ids.empty()) {
+    std::vector<double> destroy_async_ids;
+    destroy_async_ids.swap(state->queued_destroy_async_ids);
+    for (double async_id : destroy_async_ids) {
+      EmitDestroyHookForAsyncId(env, async_id);
+    }
+  }
+
+  state->destroy_task_scheduled = false;
+}
+
+void QueueDestroyHookForAsyncId(napi_env env, double async_id) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr || async_id <= 0) return;
+
+  state->queued_destroy_async_ids.push_back(async_id);
+  if (state->destroy_task_scheduled) return;
+
+  state->destroy_task_scheduled = true;
+  if (UbiRuntimePlatformEnqueueTask(
+          env,
+          DrainQueuedDestroyHooks,
+          nullptr,
+          nullptr,
+          kUbiRuntimePlatformTaskNone) == napi_ok) {
+    return;
+  }
+
+  state->destroy_task_scheduled = false;
+  DrainQueuedDestroyHooks(env, nullptr);
 }
 
 void DestroyHookFinalizer(napi_env env, void* data, void* /*hint*/) {
@@ -409,27 +449,14 @@ napi_value AsyncWrapClearAsyncIdStack(napi_env env, napi_callback_info /*info*/)
 }
 
 napi_value AsyncWrapQueueDestroyAsyncId(napi_env env, napi_callback_info info) {
-  AsyncWrapState* state = GetState(env);
-  if (state == nullptr || state->hooks_ref == nullptr) return Undefined(env);
-
-  napi_value hooks = GetRefValue(env, state->hooks_ref);
-  if (hooks == nullptr) return Undefined(env);
-
-  napi_value destroy_fn = nullptr;
-  if (napi_get_named_property(env, hooks, "destroy", &destroy_fn) != napi_ok || destroy_fn == nullptr) {
-    return Undefined(env);
-  }
-  napi_valuetype type = napi_undefined;
-  if (napi_typeof(env, destroy_fn, &type) != napi_ok || type != napi_function) return Undefined(env);
-
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-  napi_value async_id = Undefined(env);
-  if (argc >= 1 && argv[0] != nullptr) async_id = argv[0];
-
-  napi_value ignored = nullptr;
-  napi_call_function(env, hooks, destroy_fn, 1, &async_id, &ignored);
+  double async_id = 0;
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_get_value_double(env, argv[0], &async_id);
+  }
+  QueueDestroyHookForAsyncId(env, async_id);
   return Undefined(env);
 }
 
@@ -442,6 +469,11 @@ napi_value AsyncWrapSetPromiseHooks(napi_env env, napi_callback_info info) {
   for (size_t i = 0; i < state->promise_hooks.size(); ++i) {
     SetPromiseHookRef(env, state, i, i < argc ? argv[i] : nullptr);
   }
+  (void)unofficial_napi_set_promise_hooks(env,
+                                          argc > 0 ? argv[0] : nullptr,
+                                          argc > 1 ? argv[1] : nullptr,
+                                          argc > 2 ? argv[2] : nullptr,
+                                          argc > 3 ? argv[3] : nullptr);
   return Undefined(env);
 }
 
@@ -565,6 +597,10 @@ napi_value AsyncWrapGetCallbackTrampoline(napi_env env) {
   AsyncWrapState* state = GetState(env);
   if (state == nullptr) return nullptr;
   return GetRefValue(env, state->callback_trampoline_ref);
+}
+
+void AsyncWrapQueueDestroyId(napi_env env, double async_id) {
+  QueueDestroyHookForAsyncId(env, async_id);
 }
 
 void AsyncWrapPushContext(napi_env env,

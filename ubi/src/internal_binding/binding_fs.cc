@@ -18,12 +18,13 @@
 #include <uv.h>
 #if !defined(_WIN32)
 #include <cerrno>
-#include <unistd.h>
 #endif
+#include "ada.h"
 
 #include "internal_binding/helpers.h"
 #include "../ubi_env_loop.h"
 #include "../ubi_handle_wrap.h"
+#include "../ubi_async_wrap.h"
 #include "../ubi_module_loader.h"
 #include "../ubi_path.h"
 #include "ubi_active_resource.h"
@@ -543,6 +544,12 @@ struct DeferredPromiseSettlement {
   bool reject = false;
 };
 
+struct FsReqCallbackWrap {
+  napi_env env = nullptr;
+  int64_t async_id = 0;
+  bool destroy_queued = false;
+};
+
 void TrackActiveRequest(napi_env env, napi_value req) {
   if (req == nullptr || IsUndefined(env, req)) return;
   UbiTrackActiveRequest(env, req, "FSReqCallback");
@@ -551,6 +558,49 @@ void TrackActiveRequest(napi_env env, napi_value req) {
 void UntrackActiveRequest(napi_env env, napi_value req) {
   if (req == nullptr || IsUndefined(env, req)) return;
   UbiUntrackActiveRequest(env, req);
+}
+
+FsReqCallbackWrap* UnwrapFsReqCallback(napi_env env, napi_value req) {
+  if (env == nullptr || req == nullptr || IsUndefined(env, req)) return nullptr;
+  void* data = nullptr;
+  if (napi_unwrap(env, req, &data) != napi_ok || data == nullptr) return nullptr;
+  return static_cast<FsReqCallbackWrap*>(data);
+}
+
+void QueueFsReqCallbackDestroy(FsReqCallbackWrap* wrap) {
+  if (wrap == nullptr || wrap->destroy_queued || wrap->async_id <= 0) return;
+  UbiAsyncWrapQueueDestroyId(wrap->env, wrap->async_id);
+  wrap->destroy_queued = true;
+}
+
+void FSReqCallbackFinalize(napi_env env, void* data, void* /*hint*/) {
+  auto* wrap = static_cast<FsReqCallbackWrap*>(data);
+  if (wrap == nullptr) return;
+  if (env != nullptr) {
+    wrap->env = env;
+  }
+  QueueFsReqCallbackDestroy(wrap);
+  delete wrap;
+}
+
+void InvokeFsReqCallback(napi_env env,
+                         napi_value req,
+                         napi_value oncomplete,
+                         size_t argc,
+                         napi_value* argv) {
+  if (env == nullptr || req == nullptr || oncomplete == nullptr) return;
+  FsReqCallbackWrap* wrap = UnwrapFsReqCallback(env, req);
+  napi_value ignored = nullptr;
+  (void)UbiAsyncWrapMakeCallback(env,
+                                 wrap != nullptr ? wrap->async_id : -1,
+                                 req,
+                                 req,
+                                 oncomplete,
+                                 argc,
+                                 argv,
+                                 &ignored,
+                                 kUbiMakeCallbackNone);
+  QueueFsReqCallbackDestroy(wrap);
 }
 
 void DestroyDeferredReqCompletion(DeferredReqCompletion* completion) {
@@ -592,21 +642,18 @@ void InvokeDeferredReqCompletion(napi_env env, DeferredReqCompletion* completion
 
   if (err != nullptr && !IsUndefined(env, err)) {
     napi_value argv[1] = {err};
-    napi_value ignored = nullptr;
-    napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+    InvokeFsReqCallback(env, req, oncomplete, 1, argv);
   } else if (value != nullptr && !IsUndefined(env, value)) {
     napi_value null_value = nullptr;
     napi_get_null(env, &null_value);
     napi_value argv[3] = {null_value != nullptr ? null_value : Undefined(env), value, extra};
-    napi_value ignored = nullptr;
     const size_t argc = (extra != nullptr && !IsUndefined(env, extra)) ? 3 : 2;
-    napi_call_function(env, req, oncomplete, argc, argv, &ignored);
+    InvokeFsReqCallback(env, req, oncomplete, argc, argv);
   } else {
     napi_value null_value = nullptr;
     napi_get_null(env, &null_value);
     napi_value argv[1] = {null_value != nullptr ? null_value : Undefined(env)};
-    napi_value ignored = nullptr;
-    napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+    InvokeFsReqCallback(env, req, oncomplete, 1, argv);
   }
   DestroyDeferredReqCompletion(completion);
 }
@@ -810,21 +857,18 @@ void CompleteReq(napi_env env, ReqKind kind, napi_value req, napi_value oncomple
   if (ScheduleDeferredReqCompletion(env, req, oncomplete, err, value)) return;
   if (err != nullptr && !IsUndefined(env, err)) {
     napi_value argv[1] = {err};
-    napi_value ignored = nullptr;
-    napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+    InvokeFsReqCallback(env, req, oncomplete, 1, argv);
     return;
   }
   napi_value null_value = nullptr;
   napi_get_null(env, &null_value);
   if (value != nullptr && !IsUndefined(env, value)) {
     napi_value argv[2] = {null_value != nullptr ? null_value : Undefined(env), value};
-    napi_value ignored = nullptr;
-    napi_call_function(env, req, oncomplete, 2, argv, &ignored);
+    InvokeFsReqCallback(env, req, oncomplete, 2, argv);
     return;
   }
   napi_value argv[1] = {null_value != nullptr ? null_value : Undefined(env)};
-  napi_value ignored = nullptr;
-  napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+  InvokeFsReqCallback(env, req, oncomplete, 1, argv);
 }
 
 void CompleteReqWithExtra(napi_env env,
@@ -838,22 +882,19 @@ void CompleteReqWithExtra(napi_env env,
   if (ScheduleDeferredReqCompletion(env, req, oncomplete, err, value, extra)) return;
   if (err != nullptr && !IsUndefined(env, err)) {
     napi_value argv[1] = {err};
-    napi_value ignored = nullptr;
-    napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+    InvokeFsReqCallback(env, req, oncomplete, 1, argv);
     return;
   }
   napi_value null_value = nullptr;
   napi_get_null(env, &null_value);
   if (value != nullptr && !IsUndefined(env, value)) {
     napi_value argv[3] = {null_value != nullptr ? null_value : Undefined(env), value, extra};
-    napi_value ignored = nullptr;
     const size_t argc = (extra != nullptr && !IsUndefined(env, extra)) ? 3 : 2;
-    napi_call_function(env, req, oncomplete, argc, argv, &ignored);
+    InvokeFsReqCallback(env, req, oncomplete, argc, argv);
     return;
   }
   napi_value argv[1] = {null_value != nullptr ? null_value : Undefined(env)};
-  napi_value ignored = nullptr;
-  napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+  InvokeFsReqCallback(env, req, oncomplete, 1, argv);
 }
 
 napi_value CompleteVoidRawFsMethod(napi_env env,
@@ -1273,8 +1314,7 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
         argv[1] = value;
         argc = (extra != nullptr && !IsUndefined(env, extra)) ? 3 : 2;
       }
-      napi_value ignored = nullptr;
-      (void)UbiMakeCallback(env, req, oncomplete, argc, argv, &ignored);
+      InvokeFsReqCallback(env, req, oncomplete, argc, argv);
     }
   }
 
@@ -1938,6 +1978,17 @@ napi_value FSReqCallbackCtor(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  if (this_arg == nullptr) return Undefined(env);
+
+  auto* wrap = new FsReqCallbackWrap();
+  wrap->env = env;
+  wrap->async_id = UbiAsyncWrapNextId(env);
+  if (napi_wrap(env, this_arg, wrap, FSReqCallbackFinalize, nullptr, nullptr) != napi_ok) {
+    delete wrap;
+    return this_arg;
+  }
+  UbiAsyncWrapEmitInitString(
+      env, wrap->async_id, "FSREQCALLBACK", UbiAsyncWrapExecutionAsyncId(env), this_arg);
   return this_arg != nullptr ? this_arg : Undefined(env);
 }
 
@@ -3253,14 +3304,18 @@ napi_value FsLegacyMainResolve(napi_env env, napi_callback_info info) {
   std::string package_path;
   if (argc < 1 || !ValueToUtf8(env, argv[0], &package_path)) return Undefined(env);
 
-  if (argc >= 3 && argv[2] != nullptr) {
-    napi_valuetype t = napi_undefined;
-    if (napi_typeof(env, argv[2], &t) != napi_ok || (t != napi_string && t != napi_object)) {
-      napi_throw_type_error(env,
-                            "ERR_INVALID_ARG_TYPE",
-                            "The \"base\" argument must be of type string or an instance of URL.");
-      return nullptr;
-    }
+  if (argc < 3 || argv[2] == nullptr) {
+    napi_throw_type_error(env,
+                          "ERR_INVALID_ARG_TYPE",
+                          "The \"base\" argument must be of type string or an instance of URL.");
+    return nullptr;
+  }
+  napi_valuetype base_type = napi_undefined;
+  if (napi_typeof(env, argv[2], &base_type) != napi_ok || base_type != napi_string) {
+    napi_throw_type_error(env,
+                          "ERR_INVALID_ARG_TYPE",
+                          "The \"base\" argument must be of type string or an instance of URL.");
+    return nullptr;
   }
 
   static const char* ext[] = {"", ".js", ".json", ".node", "/index.js", "/index.json", "/index.node",
@@ -3298,7 +3353,19 @@ napi_value FsLegacyMainResolve(napi_env env, napi_callback_info info) {
     }
   }
 
-  napi_throw_error(env, "ERR_MODULE_NOT_FOUND", "Cannot find package main entry");
+  std::string base_string;
+  ValueToUtf8(env, argv[2], &base_string);
+  auto base_url = ada::parse<ada::url_aggregator>(base_string);
+  if (!base_url) {
+    napi_throw_error(env, "ERR_INVALID_URL", "Invalid URL");
+    return nullptr;
+  }
+
+  const std::string module_base = ubi_path::NormalizeFileURLOrPath(base_string);
+  const std::string missing = package_main.empty() ? fallback + ".js" : package_path + "/" + package_main;
+  napi_throw_error(env,
+                   "ERR_MODULE_NOT_FOUND",
+                   ("Cannot find package '" + missing + "' imported from " + module_base).c_str());
   return nullptr;
 }
 

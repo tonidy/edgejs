@@ -2,6 +2,7 @@
 #include "ubi_buffer.h"
 #include "ubi_cares_wrap.h"
 #include "ubi_crypto.h"
+#include "ubi_env_loop.h"
 #include "ubi_errors_binding.h"
 #include "ubi_encoding.h"
 #include "ubi_fs.h"
@@ -36,6 +37,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -48,6 +50,27 @@
 #include "unofficial_napi.h"
 
 namespace {
+
+#if defined(NODE_OPENSSL_DEFAULT_CIPHER_LIST)
+#define UBI_DEFAULT_CIPHER_LIST_CORE NODE_OPENSSL_DEFAULT_CIPHER_LIST
+#else
+#define UBI_DEFAULT_CIPHER_LIST_CORE                                           \
+  "TLS_AES_256_GCM_SHA384:"                                                    \
+  "TLS_CHACHA20_POLY1305_SHA256:"                                              \
+  "TLS_AES_128_GCM_SHA256:"                                                    \
+  "ECDHE-RSA-AES128-GCM-SHA256:"                                               \
+  "ECDHE-ECDSA-AES128-GCM-SHA256:"                                             \
+  "ECDHE-RSA-AES256-GCM-SHA384:"                                               \
+  "ECDHE-ECDSA-AES256-GCM-SHA384:"                                             \
+  "DHE-RSA-AES128-GCM-SHA256:"                                                 \
+  "ECDHE-RSA-AES128-SHA256:"                                                   \
+  "DHE-RSA-AES128-SHA256:"                                                     \
+  "ECDHE-RSA-AES256-SHA384:"                                                   \
+  "DHE-RSA-AES256-SHA384:"                                                     \
+  "ECDHE-RSA-AES256-SHA256:"                                                   \
+  "DHE-RSA-AES256-SHA256:"                                                     \
+  "HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -103,19 +126,79 @@ void RemoveRequireContextsForState(ModuleLoaderState* state) {
   }
 }
 
-void OnModuleLoaderEnvCleanup(void* arg) {
-  napi_env env = static_cast<napi_env>(arg);
-  g_loader_cleanup_hook_registered.erase(env);
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
 
+void FinalizeTraceEventsState(napi_env env) {
+  auto it = g_trace_events_states.find(env);
+  if (it == g_trace_events_states.end()) return;
+
+  TraceEventsBindingState& state = it->second;
+  DeleteRefIfPresent(env, &state.binding_ref);
+  DeleteRefIfPresent(env, &state.state_update_handler_ref);
+  for (auto& kv : state.category_buffers) {
+    DeleteRefIfPresent(env, &kv.second.typed_array_ref);
+    kv.second.data = nullptr;
+  }
+  state.category_buffers.clear();
+  state.category_refcounts.clear();
+  g_trace_events_states.erase(it);
+}
+
+void FinalizeContextifyBindingRef(napi_env env) {
+  auto it = g_contextify_binding_refs.find(env);
+  if (it == g_contextify_binding_refs.end()) return;
+  DeleteRefIfPresent(env, &it->second);
+  g_contextify_binding_refs.erase(it);
+}
+
+void FinalizeModuleLoaderState(napi_env env) {
   auto loader_it = g_loader_states.find(env);
   if (loader_it != g_loader_states.end()) {
     ModuleLoaderState* state = &loader_it->second;
     RemoveRequireContextsForState(state);
+
+    for (auto& kv : state->module_cache) {
+      DeleteRefIfPresent(env, &kv.second);
+    }
+    state->module_cache.clear();
+
+    for (auto& kv : state->binding_cache) {
+      DeleteRefIfPresent(env, &kv.second);
+    }
+    state->binding_cache.clear();
+
+    for (auto& kv : state->internal_binding_cache) {
+      DeleteRefIfPresent(env, &kv.second);
+    }
+    state->internal_binding_cache.clear();
+
+    DeleteRefIfPresent(env, &state->cache_object_ref);
+    DeleteRefIfPresent(env, &state->primordials_ref);
+    DeleteRefIfPresent(env, &state->internal_binding_ref);
+    DeleteRefIfPresent(env, &state->private_symbols_ref);
+    DeleteRefIfPresent(env, &state->per_isolate_symbols_ref);
+    DeleteRefIfPresent(env, &state->require_ref);
+    DeleteRefIfPresent(env, &state->native_builtins_binding_ref);
+    DeleteRefIfPresent(env, &state->internal_binding_loader_ref);
+    DeleteRefIfPresent(env, &state->require_builtin_loader_ref);
+    state->entry_dir.clear();
+
     g_loader_states.erase(loader_it);
   }
 
-  g_trace_events_states.erase(env);
-  g_contextify_binding_refs.erase(env);
+  FinalizeTraceEventsState(env);
+  FinalizeContextifyBindingRef(env);
+}
+
+void OnModuleLoaderEnvCleanup(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  g_loader_cleanup_hook_registered.erase(env);
+  if (UbiGetExistingEnvLoop(env) != nullptr) return;
+  FinalizeModuleLoaderState(env);
 }
 
 void EnsureModuleLoaderCleanupHook(napi_env env) {
@@ -147,6 +230,10 @@ void ReplaceAll(std::string* text, const std::string& from, const std::string& t
 }
 
 bool RuntimeHasIntl(napi_env env) {
+#if defined(UBI_HAS_ICU)
+  (void)env;
+  return true;
+#else
   napi_value global = nullptr;
   if (env == nullptr || napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
 
@@ -155,6 +242,7 @@ bool RuntimeHasIntl(napi_env env) {
 
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, intl, &type) == napi_ok && (type == napi_object || type == napi_function);
+#endif
 }
 
 void ReplaceJsonBooleanOrNumber(std::string* text, const char* key, bool value) {
@@ -226,7 +314,13 @@ std::string LoadBuiltinsConfigJson(bool has_intl) {
     // Ubi ships its own ICU-backed encoding support and should advertise that
     // in the serialized config consumed by bootstrap/node.
     ReplaceJsonBooleanOrNumber(&body, "v8_enable_i18n_support", has_intl);
-    ReplaceJsonBooleanOrNumber(&body, "icu_small", false);
+    ReplaceJsonBooleanOrNumber(&body,
+                               "icu_small",
+#if defined(UBI_HAS_SMALL_ICU)
+                               true);
+#else
+                               false);
+#endif
     cached_value = body;
     if (!cached_value.empty()) return cached_value;
   }
@@ -236,7 +330,13 @@ std::string LoadBuiltinsConfigJson(bool has_intl) {
   cached_value = std::string("{") +
                  "\"variables\":{" +
                  "\"v8_enable_i18n_support\":" + (has_intl ? "1" : "0") + "," +
-                 "\"icu_small\":false," +
+                 "\"icu_small\":" +
+#if defined(UBI_HAS_SMALL_ICU)
+                 "true,"
+#else
+                 "false,"
+#endif
+                 +
                  "\"node_use_amaro\":false," +
                  "\"node_builtin_shareable_builtins\":[" +
                  "\"deps/cjs-module-lexer/lexer.js\"," +
@@ -753,6 +853,28 @@ static bool IsPerContextBuiltinId(const std::string& id);
 static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state);
 static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state);
 static napi_value GetStatePerIsolateSymbols(napi_env env, ModuleLoaderState* state);
+static napi_value GetStateInternalBinding(napi_env env, ModuleLoaderState* state);
+static napi_value GetGlobalInternalBindingFunction(napi_env env, napi_value global);
+
+enum class NativeBuiltinExecutionKind {
+  kUnsupported,
+  kPerContext,
+  kBootstrapRealm,
+  kBootstrapOrMain,
+};
+
+static NativeBuiltinExecutionKind GetNativeBuiltinExecutionKind(const std::string& id) {
+  if (IsPerContextBuiltinId(id)) {
+    return NativeBuiltinExecutionKind::kPerContext;
+  }
+  if (id == "internal/bootstrap/realm") {
+    return NativeBuiltinExecutionKind::kBootstrapRealm;
+  }
+  if (id.rfind("internal/bootstrap/", 0) == 0 || id.rfind("internal/main/", 0) == 0) {
+    return NativeBuiltinExecutionKind::kBootstrapOrMain;
+  }
+  return NativeBuiltinExecutionKind::kUnsupported;
+}
 
 static const std::vector<std::string>& CollectRuntimeBuiltinIds() {
   static const std::vector<std::string> ids = []() {
@@ -1070,7 +1192,8 @@ static bool IsPerContextBuiltinId(const std::string& id) {
 }
 
 static bool ShouldCacheInternalBinding(const std::string& name) {
-  return name != "encoding_binding" && name != "url" && name != "url_pattern";
+  (void)name;
+  return true;
 }
 
 static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state) {
@@ -1086,6 +1209,239 @@ static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state)
 static napi_value GetStatePerIsolateSymbols(napi_env env, ModuleLoaderState* state) {
   if (state == nullptr) return nullptr;
   return GetRefValue(env, state->per_isolate_symbols_ref);
+}
+
+static bool IsFunctionValue(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+static napi_value GetStateInternalBindingLoader(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->internal_binding_loader_ref);
+}
+
+static napi_value GetStateInternalBinding(napi_env env, ModuleLoaderState* state) {
+  napi_value internal_binding = GetStateInternalBindingLoader(env, state);
+  if (IsFunctionValue(env, internal_binding)) {
+    return internal_binding;
+  }
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->internal_binding_ref);
+}
+
+static bool CreateStringArray(napi_env env,
+                              std::initializer_list<const char*> values,
+                              napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+
+  napi_value array = nullptr;
+  if (napi_create_array_with_length(env, values.size(), &array) != napi_ok || array == nullptr) {
+    return false;
+  }
+
+  size_t index = 0;
+  for (const char* value : values) {
+    napi_value entry = nullptr;
+    if (napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &entry) != napi_ok ||
+        entry == nullptr ||
+        napi_set_element(env, array, index++, entry) != napi_ok) {
+      return false;
+    }
+  }
+
+  *out = array;
+  return true;
+}
+
+static bool ThrowNativeBuiltinExecutionError(napi_env env,
+                                             const std::string& id,
+                                             const std::string& message) {
+  const std::string full_message = "Failed to execute builtin '" + id + "': " + message;
+  napi_throw_error(env, nullptr, full_message.c_str());
+  return false;
+}
+
+static bool ResolveNativeBuiltinCompileInput(napi_env env,
+                                             ModuleLoaderState* state,
+                                             const std::string& id,
+                                             napi_value* params_out,
+                                             std::vector<napi_value>* argv_out) {
+  if (params_out == nullptr || argv_out == nullptr) return false;
+  *params_out = nullptr;
+  argv_out->clear();
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return ThrowNativeBuiltinExecutionError(env, id, "failed to fetch global object");
+  }
+
+  napi_value process_obj = nullptr;
+  if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    return ThrowNativeBuiltinExecutionError(env, id, "process object is unavailable");
+  }
+
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+
+  const NativeBuiltinExecutionKind kind = GetNativeBuiltinExecutionKind(id);
+  switch (kind) {
+    case NativeBuiltinExecutionKind::kPerContext: {
+      napi_value exports_obj = nullptr;
+      if (napi_create_object(env, &exports_obj) != napi_ok || exports_obj == nullptr) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to create per-context exports object");
+      }
+
+      napi_value primordials = GetStatePrimordials(env, state);
+      if (primordials == nullptr) primordials = undefined;
+      if (napi_set_named_property(env, exports_obj, "primordials", primordials) != napi_ok) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to initialize per-context exports");
+      }
+
+      napi_value private_symbols = GetStatePrivateSymbols(env, state);
+      if (private_symbols == nullptr) private_symbols = undefined;
+      napi_value per_isolate_symbols = GetStatePerIsolateSymbols(env, state);
+      if (per_isolate_symbols == nullptr) per_isolate_symbols = undefined;
+
+      if (!CreateStringArray(env,
+                             {"exports", "primordials", "privateSymbols", "perIsolateSymbols"},
+                             params_out)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to build parameter list");
+      }
+      argv_out->assign({exports_obj, primordials, private_symbols, per_isolate_symbols});
+      return true;
+    }
+    case NativeBuiltinExecutionKind::kBootstrapRealm: {
+      napi_value get_linked_binding = nullptr;
+      if (napi_get_named_property(env, global, "getLinkedBinding", &get_linked_binding) != napi_ok ||
+          !IsFunctionValue(env, get_linked_binding)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "getLinkedBinding is unavailable");
+      }
+
+      napi_value get_internal_binding = nullptr;
+      if (napi_get_named_property(env, global, "getInternalBinding", &get_internal_binding) != napi_ok ||
+          !IsFunctionValue(env, get_internal_binding)) {
+        get_internal_binding = GetGlobalInternalBindingFunction(env, global);
+      }
+      if (!IsFunctionValue(env, get_internal_binding)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "getInternalBinding is unavailable");
+      }
+
+      napi_value primordials = GetStatePrimordials(env, state);
+      if (primordials == nullptr) primordials = undefined;
+
+      if (!CreateStringArray(env,
+                             {"process", "getLinkedBinding", "getInternalBinding", "primordials"},
+                             params_out)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to build parameter list");
+      }
+      argv_out->assign({process_obj, get_linked_binding, get_internal_binding, primordials});
+      return true;
+    }
+    case NativeBuiltinExecutionKind::kBootstrapOrMain: {
+      napi_value require_builtin = nullptr;
+      if (state != nullptr) {
+        require_builtin = GetRefValue(env, state->require_builtin_loader_ref);
+      }
+      if (!IsFunctionValue(env, require_builtin)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "requireBuiltin loader is unavailable");
+      }
+
+      napi_value internal_binding = GetStateInternalBinding(env, state);
+      if (!IsFunctionValue(env, internal_binding)) {
+        internal_binding = GetGlobalInternalBindingFunction(env, global);
+      }
+      if (!IsFunctionValue(env, internal_binding)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "internalBinding loader is unavailable");
+      }
+
+      napi_value primordials = GetStatePrimordials(env, state);
+      if (primordials == nullptr) primordials = undefined;
+
+      if (!CreateStringArray(env,
+                             {"process", "require", "internalBinding", "primordials"},
+                             params_out)) {
+        return ThrowNativeBuiltinExecutionError(env, id, "failed to build parameter list");
+      }
+      argv_out->assign({process_obj, require_builtin, internal_binding, primordials});
+      return true;
+    }
+    case NativeBuiltinExecutionKind::kUnsupported:
+      return ThrowNativeBuiltinExecutionError(env, id, "unsupported native execution kind");
+  }
+
+  return false;
+}
+
+static bool ExecuteBuiltinFromNative(napi_env env, ModuleLoaderState* state, const std::string& id, napi_value* out) {
+  if (out != nullptr) *out = nullptr;
+  if (env == nullptr || state == nullptr || id.empty()) return false;
+
+  fs::path resolved;
+  if (!builtin_catalog::ResolveBuiltinId(id, &resolved)) {
+    return ThrowNativeBuiltinExecutionError(env, id, "builtin source was not found");
+  }
+
+  const std::string source = ReadTextFile(resolved);
+  if (source.empty()) {
+    std::ifstream probe(resolved);
+    if (!probe.is_open()) {
+      return ThrowNativeBuiltinExecutionError(env, id, "builtin source could not be read");
+    }
+  }
+
+  napi_value params = nullptr;
+  std::vector<napi_value> argv;
+  if (!ResolveNativeBuiltinCompileInput(env, state, id, &params, &argv)) {
+    return false;
+  }
+
+  const std::string source_url = "node:" + id;
+  napi_value code = nullptr;
+  napi_value filename = nullptr;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  if (napi_create_string_utf8(env, source.c_str(), source.size(), &code) != napi_ok ||
+      code == nullptr ||
+      napi_create_string_utf8(env, source_url.c_str(), NAPI_AUTO_LENGTH, &filename) != napi_ok ||
+      filename == nullptr) {
+    return ThrowNativeBuiltinExecutionError(env, id, "failed to create compile inputs");
+  }
+
+  napi_value compile_result = nullptr;
+  if (unofficial_napi_contextify_compile_function(env,
+                                                  code,
+                                                  filename,
+                                                  0,
+                                                  0,
+                                                  undefined,
+                                                  false,
+                                                  undefined,
+                                                  undefined,
+                                                  params,
+                                                  undefined,
+                                                  &compile_result) != napi_ok ||
+      compile_result == nullptr) {
+    return false;
+  }
+
+  napi_value compiled_fn = nullptr;
+  if (napi_get_named_property(env, compile_result, "function", &compiled_fn) != napi_ok ||
+      !IsFunctionValue(env, compiled_fn)) {
+    return ThrowNativeBuiltinExecutionError(env, id, "compiled function is unavailable");
+  }
+
+  napi_value call_result = nullptr;
+  if (napi_call_function(env, undefined, compiled_fn, argv.size(), argv.data(), &call_result) != napi_ok) {
+    return false;
+  }
+
+  if (out != nullptr) {
+    *out = call_result;
+  }
+  return true;
 }
 
 using BindingFactory = napi_value (*)(napi_env env);
@@ -1229,8 +1585,14 @@ static std::string ReadCliMarkdown() {
   const fs::path cwd = fs::current_path(ec);
   if (ec) return "";
   const std::vector<fs::path> candidates = {
+      cwd / "node-test" / "doc" / "api" / "cli.md",
+      cwd / "doc" / "api" / "cli.md",
       cwd / "node" / "doc" / "api" / "cli.md",
+      cwd / ".." / "node-test" / "doc" / "api" / "cli.md",
+      cwd / ".." / "doc" / "api" / "cli.md",
       cwd / ".." / "node" / "doc" / "api" / "cli.md",
+      cwd / ".." / ".." / "node-test" / "doc" / "api" / "cli.md",
+      cwd / ".." / ".." / "doc" / "api" / "cli.md",
       cwd / ".." / ".." / "node" / "doc" / "api" / "cli.md",
   };
   for (const auto& path : candidates) {
@@ -1398,6 +1760,7 @@ static bool LooksLikeCliOptionToken(const std::string& token) {
       "--experimental-import-meta-resolve",
       "--experimental-loader",
       "--experimental-report",
+      "--experimental-strip-types",
       "--experimental-transform-types",
       "--experimental-wasm-modules",
       "--experimental-worker",
@@ -1442,6 +1805,7 @@ static bool LooksLikeCliOptionToken(const std::string& token) {
       "--tls-cipher-list",
       "--tls-keylog",
       "--trace-deprecation",
+      "--trace-exit",
       "--trace-require-module",
       "--trace-sigint",
       "--trace-tls",
@@ -1481,7 +1845,6 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       "--entry-url",
       "--experimental-addon-modules",
       "--experimental-default-config-file",
-      "--experimental-detect-module",
       "--experimental-eventsource",
       "--experimental-fetch",
       "--experimental-global-customevent",
@@ -1492,8 +1855,8 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       "--experimental-print-required-tla",
       "--experimental-quic",
       "--no-experimental-quic",
-      "--experimental-require-module",
       "--experimental-report",
+      "--experimental-strip-types",
       "--experimental-sqlite",
       "--no-experimental-sqlite",
       "--experimental-test-coverage",
@@ -1552,6 +1915,8 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
   };
   const std::vector<const char*> bool_true = {
       "--async-context-frame",
+      "--experimental-detect-module",
+      "--experimental-require-module",
       "--network-family-autoselection",
       "--warnings",
   };
@@ -1572,7 +1937,7 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       {"--test-isolation", "process"},
       {"--test-rerun-failures", ""},
       {"--test-shard", ""},
-      {"--tls-cipher-list", "HIGH:!aNULL:!eNULL"},
+      {"--tls-cipher-list", UBI_DEFAULT_CIPHER_LIST_CORE},
       {"--tls-keylog", ""},
       {"--unhandled-rejections", "throw"},
       {"--watch-kill-signal", "SIGTERM"},
@@ -1695,6 +2060,8 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
 
     if (key == "-r") key = "--require";
     if (key == "--loader") key = "--experimental-loader";
+    if (key == "--experimental-strip-types") key = "--strip-types";
+    if (key == "--no-experimental-strip-types") key = "--no-strip-types";
 
     if (eq == std::string::npos && key.rfind("--no-", 0) == 0) {
       if (bool_option_set.find(key) != bool_option_set.end()) {
@@ -1807,11 +2174,17 @@ static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_i
       "--debug-arraybuffer-allocations",
       "--no-debug-arraybuffer-allocations",
       "--es-module-specifier-resolution",
+      "--experimental-detect-module",
+      "--no-experimental-detect-module",
       "--experimental-fetch",
+      "--experimental-require-module",
+      "--no-experimental-require-module",
       "--experimental-wasm-modules",
       "--experimental-global-customevent",
       "--experimental-global-webcrypto",
       "--experimental-report",
+      "--experimental-strip-types",
+      "--no-experimental-strip-types",
       "--experimental-worker",
       "--node-snapshot",
       "--no-node-snapshot",
@@ -2219,8 +2592,8 @@ static napi_value ModulesSetLazyPathHelpersCallback(napi_env env, napi_callback_
     return UndefinedValue(env);
   }
 
-  napi_set_named_property(env, argv[0], "filename", filename_value);
   napi_set_named_property(env, argv[0], "dirname", dirname_value);
+  napi_set_named_property(env, argv[0], "filename", filename_value);
 
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -3467,6 +3840,9 @@ static napi_value DispatchResolveBinding(napi_env env, void* raw_state, const ch
   if (std::strcmp(name, "url") == 0) {
     return GetOrCreateBinding(state, env, "url", UbiInstallUrlBinding);
   }
+  if (std::strcmp(name, "url_pattern") == 0) {
+    return GetOrCreateBinding(state, env, "url_pattern", UbiInstallUrlPatternBinding);
+  }
   if (std::strcmp(name, "util") == 0) {
     napi_value util = GetCachedBinding(state, env, "util");
     if (util == nullptr) {
@@ -3482,7 +3858,22 @@ static napi_value DispatchResolveBinding(napi_env env, void* raw_state, const ch
     napi_value types = GetCachedBinding(state, env, "types");
     if (types == nullptr) {
       types = UbiGetTypesBinding(env);
-      if (types != nullptr && !IsUndefinedValue(env, types)) types = CacheBinding(state, env, "types", types);
+      if (types != nullptr && !IsUndefinedValue(env, types)) {
+        types = CacheBinding(state, env, "types", types);
+      } else {
+        // Preserve older behavior where "types" could resolve through util.
+        napi_value util = GetCachedBinding(state, env, "util");
+        if (util == nullptr) {
+          util = UbiInstallUtilBinding(env);
+          if (util != nullptr && !IsUndefinedValue(env, util)) {
+            napi_value cached_util = CacheBinding(state, env, "util", util);
+            util = cached_util;
+          }
+        }
+        if (util != nullptr && !IsUndefinedValue(env, util)) {
+          types = CacheBinding(state, env, "types", util);
+        }
+      }
     }
     return types;
   }
@@ -3834,9 +4225,7 @@ bool EvaluateJsModule(napi_env env,
     if (per_isolate_symbols == nullptr) napi_get_undefined(env, &per_isolate_symbols);
     wrapper_args = {primordials_val, private_symbols, per_isolate_symbols};
   } else {
-    if (state != nullptr && state->internal_binding_ref != nullptr) {
-      napi_get_reference_value(env, state->internal_binding_ref, &internal_binding_val);
-    }
+    internal_binding_val = GetStateInternalBinding(env, state);
     if (internal_binding_val == nullptr) {
       internal_binding_val = GetGlobalInternalBindingFunction(env, global);
     }
@@ -4229,12 +4618,19 @@ napi_value UbiGetInternalBinding(napi_env env) {
   if (env == nullptr) return nullptr;
   auto it = g_loader_states.find(env);
   if (it == g_loader_states.end()) return nullptr;
-  if (it->second.internal_binding_ref == nullptr) return nullptr;
-  napi_value out = nullptr;
-  if (napi_get_reference_value(env, it->second.internal_binding_ref, &out) != napi_ok || out == nullptr) {
-    return nullptr;
-  }
-  return out;
+  return GetStateInternalBinding(env, &it->second);
+}
+
+napi_value UbiGetBuiltinInternalBinding(napi_env env) {
+  if (env == nullptr) return nullptr;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return nullptr;
+  return GetStateInternalBindingLoader(env, &it->second);
+}
+
+void UbiFinalizeModuleLoaderEnv(napi_env env) {
+  if (env == nullptr) return;
+  FinalizeModuleLoaderState(env);
 }
 
 bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out) {
@@ -4242,6 +4638,13 @@ bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out) {
   auto it = g_loader_states.find(env);
   if (it == g_loader_states.end()) return false;
   return CallRequireBuiltinLoader(env, &it->second, id, out);
+}
+
+bool UbiExecuteBuiltin(napi_env env, const char* id, napi_value* out) {
+  if (env == nullptr || id == nullptr || id[0] == '\0') return false;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return false;
+  return ExecuteBuiltinFromNative(env, &it->second, id, out);
 }
 
 napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) {

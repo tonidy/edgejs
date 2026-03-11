@@ -324,6 +324,85 @@ add_library(ubi_node_api STATIC
   src/unofficial_napi_testing_until_gc.cc
 )
 
+set(UBI_ICU_INCLUDE_DIRS
+  "${PROJECT_ROOT}/node/deps/icu-small/source/common"
+  "${PROJECT_ROOT}/node/deps/icu-small/source/i18n"
+  "${PROJECT_ROOT}/node/deps/icu-small/source/stubdata"
+)
+set(UBI_ICU_LINK_LIBS "")
+if(NOT UBI_IS_WASIX_TARGET)
+  file(GLOB_RECURSE UBI_ICU_COMMON_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_ROOT}/node/deps/icu-small/source/common/*.cpp"
+  )
+  file(GLOB_RECURSE UBI_ICU_I18N_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_ROOT}/node/deps/icu-small/source/i18n/*.cpp"
+  )
+
+  set(UBI_ICU_BASE_DEFINES
+    U_ATTRIBUTE_DEPRECATED=
+    UCONFIG_NO_SERVICE=1
+    U_ENABLE_DYLOAD=0
+    U_STATIC_IMPLEMENTATION=1
+    U_HAVE_STD_STRING=1
+    UCONFIG_NO_BREAK_ITERATION=0
+    U_DISABLE_RENAMING=1
+  )
+
+  add_library(ubi_icu_stubdata STATIC
+    "${PROJECT_ROOT}/node/deps/icu-small/source/stubdata/stubdata.cpp"
+  )
+  target_include_directories(ubi_icu_stubdata
+    PUBLIC
+      "${PROJECT_ROOT}/node/deps/icu-small/source/common"
+      "${PROJECT_ROOT}/node/deps/icu-small/source/stubdata"
+  )
+  target_compile_definitions(ubi_icu_stubdata
+    PRIVATE
+      ${UBI_ICU_BASE_DEFINES}
+      U_COMMON_IMPLEMENTATION=1
+  )
+
+  add_library(ubi_icu_common STATIC
+    ${UBI_ICU_COMMON_SOURCES}
+  )
+  target_include_directories(ubi_icu_common
+    PUBLIC
+      "${PROJECT_ROOT}/node/deps/icu-small/source/common"
+  )
+  target_compile_definitions(ubi_icu_common
+    PRIVATE
+      ${UBI_ICU_BASE_DEFINES}
+      U_COMMON_IMPLEMENTATION=1
+  )
+  target_link_libraries(ubi_icu_common
+    PUBLIC
+      ubi_icu_stubdata
+  )
+
+  add_library(ubi_icu_i18n STATIC
+    ${UBI_ICU_I18N_SOURCES}
+  )
+  target_include_directories(ubi_icu_i18n
+    PUBLIC
+      "${PROJECT_ROOT}/node/deps/icu-small/source/common"
+      "${PROJECT_ROOT}/node/deps/icu-small/source/i18n"
+  )
+  target_compile_definitions(ubi_icu_i18n
+    PRIVATE
+      ${UBI_ICU_BASE_DEFINES}
+      U_I18N_IMPLEMENTATION=1
+  )
+  target_link_libraries(ubi_icu_i18n
+    PUBLIC
+      ubi_icu_common
+  )
+
+  list(APPEND UBI_ICU_LINK_LIBS
+    ubi_icu_i18n
+    ubi_icu_common
+  )
+endif()
+
 add_library(ubi_ncrypto STATIC
   "${PROJECT_ROOT}/deps/ncrypto/ncrypto.cc"
   "${PROJECT_ROOT}/deps/ncrypto/engine.cc"
@@ -595,12 +674,12 @@ target_include_directories(ubi_runtime
     "${PROJECT_ROOT}/deps"
     "${PROJECT_ROOT}/deps/llhttp/include"
     "${PROJECT_ROOT}/deps/ncrypto"
-    "${PROJECT_ROOT}/deps/icu-small/source/common"
-    "${PROJECT_ROOT}/deps/icu-small/source/i18n"
+    ${UBI_ICU_INCLUDE_DIRS}
 )
 target_link_libraries(ubi_runtime
   PUBLIC
     ubi_node_api
+    ${UBI_ICU_LINK_LIBS}
   PRIVATE
     ubi_icui18n
     ubi_icuuc
@@ -615,14 +694,13 @@ target_link_libraries(ubi_runtime
     OpenSSL::Crypto
     zlibstatic
 )
-if(APPLE)
-  target_link_libraries(ubi_runtime PRIVATE icucore)
-endif()
 if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
   target_link_libraries(ubi_runtime PUBLIC napi_v8)
 endif()
 target_compile_definitions(ubi_runtime
   PRIVATE
+    UBI_HAS_ICU=1
+    UBI_HAS_SMALL_ICU=1
     UBI_EMBEDDED_V8_VERSION="${UBI_EMBEDDED_V8_VERSION}"
 )
 if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")

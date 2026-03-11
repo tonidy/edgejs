@@ -5,9 +5,10 @@
 
 namespace internal_binding {
 
-napi_value ResolveUrl(napi_env env, const ResolveOptions& /*options*/) {
-  napi_value out = UbiInstallUrlBinding(env);
-  return out != nullptr ? out : Undefined(env);
+napi_value ResolveUrl(napi_env env, const ResolveOptions& options) {
+  if (options.callbacks.resolve_binding == nullptr) return Undefined(env);
+  napi_value binding = options.callbacks.resolve_binding(env, options.state, "url");
+  return (binding == nullptr || IsUndefined(env, binding)) ? Undefined(env) : binding;
 }
 
 }  // namespace internal_binding

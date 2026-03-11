@@ -247,7 +247,8 @@ int RunRawNodeTestScript(napi_env env,
 
 int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path,
                                      std::string* error_out,
-                                     bool redirect_stdio_to_files = false);
+                                     bool redirect_stdio_to_files = false,
+                                     bool use_pseudo_tty = false);
 
 int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* error_out) {
   return RunRawNodeTestScript(env, relative_path, error_out, false);
@@ -270,6 +271,12 @@ int RunRawNodeTestScript(napi_env env,
   const std::string script_rel = has_suite_prefix ? rel_path : ("parallel/" + rel_path);
   const bool is_parallel_suite = StartsWith(script_rel, "parallel/");
   const bool is_pseudo_tty_suite = StartsWith(script_rel, "pseudo-tty/");
+  if (is_pseudo_tty_suite && !keep_event_loop_alive) {
+    return RunRawNodeTestScriptInSubprocess(node_test_relative_path,
+                                            error_out,
+                                            true,
+                                            true);
+  }
   const bool needs_global_serialization =
       StartsWith(script_rel, "sequential/") || StartsWith(script_rel, "pummel/");
   ScopedExclusiveFileLock suite_lock(
@@ -402,11 +409,13 @@ std::string ReadFileText(const std::filesystem::path& path) {
 
 int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path,
                                      std::string* error_out,
-                                     bool redirect_stdio_to_files) {
+                                     bool redirect_stdio_to_files,
+                                     bool use_pseudo_tty) {
 #if defined(NAPI_V8_NODE_ROOT_PATH) || defined(PROJECT_ROOT_PATH)
 #if defined(_WIN32)
   (void)node_test_relative_path;
   (void)redirect_stdio_to_files;
+  (void)use_pseudo_tty;
   if (error_out != nullptr) {
     *error_out = "Raw subprocess runner is not implemented on win32.";
   }
@@ -414,6 +423,13 @@ int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path,
 #else
   (void)ResolveUbiCliPathForRawSubprocess;
   namespace fs = std::filesystem;
+  const std::string rel_path = node_test_relative_path ? std::string(node_test_relative_path) : std::string();
+  const bool has_suite_prefix = rel_path.find('/') != std::string::npos;
+  const std::string script_rel = has_suite_prefix ? rel_path : ("parallel/" + rel_path);
+  if (StartsWith(script_rel, "pseudo-tty/")) {
+    use_pseudo_tty = true;
+    redirect_stdio_to_files = true;
+  }
   fs::path stdout_path;
   fs::path stderr_path;
   int stdout_fd = -1;
@@ -469,6 +485,40 @@ int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path,
     // Put each raw-test subprocess tree in its own process group so the parent
     // the parent can always reap/kill descendants after the child exits.
     (void)setpgid(0, 0);
+    if (use_pseudo_tty) {
+      const bool is_parallel_suite = StartsWith(script_rel, "parallel/");
+      const fs::path node_root_path = ResolveNodeRootPathForRawScript(script_rel);
+      const fs::path script_path = ResolveRawNodeScriptPath(node_test_relative_path);
+      const fs::path input_path = script_path.parent_path() / (script_path.stem().string() + ".in");
+      const std::string node_test_dir = (node_root_path / "test").string();
+      const std::string test_serial_id = MakeTestSerialId(script_rel);
+      const fs::path pty_helper = node_root_path / "test" / "tools" / "pseudo-tty.py";
+      const fs::path ubi_path = ResolveUbiCliPathForRawSubprocess();
+
+      setenv("NODE_TEST_DIR", node_test_dir.c_str(), 1);
+      setenv("NODE_TEST_KNOWN_GLOBALS", "0", 1);
+      setenv("TEST_SERIAL_ID", test_serial_id.c_str(), 1);
+      setenv("TEST_THREAD_ID", test_serial_id.c_str(), 1);
+      setenv("TEST_PARALLEL", is_parallel_suite ? "1" : "0", 1);
+      unsetenv("UBI_FORCE_STDIO_TTY");
+
+      if (fs::exists(input_path)) {
+        const int input_fd = open(input_path.c_str(), O_RDONLY);
+        if (input_fd >= 0) {
+          (void)dup2(input_fd, STDIN_FILENO);
+          close(input_fd);
+        }
+      }
+
+      execlp("python3",
+             "python3",
+             pty_helper.c_str(),
+             ubi_path.c_str(),
+             script_path.c_str(),
+             static_cast<char*>(nullptr));
+      _exit(70);
+    }
+
     void* scope = nullptr;
     napi_env env = nullptr;
     if (unofficial_napi_create_env(8, &env, &scope) != napi_ok || env == nullptr) {

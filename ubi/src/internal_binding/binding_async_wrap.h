@@ -7,6 +7,7 @@ namespace internal_binding {
 
 napi_value AsyncWrapGetHooksObject(napi_env env);
 napi_value AsyncWrapGetCallbackTrampoline(napi_env env);
+void AsyncWrapQueueDestroyId(napi_env env, double async_id);
 void AsyncWrapPushContext(napi_env env,
                           double async_id,
                           double trigger_async_id,

@@ -2,6 +2,7 @@
 #include "ubi_active_resource.h"
 #include "ubi_env_loop.h"
 #include "ubi_module_loader.h"
+#include "ubi_runtime.h"
 #include "ubi_worker_env.h"
 
 #include <algorithm>
@@ -46,9 +47,11 @@
 #include "acorn_version.h"
 #include "cjs_module_lexer_version.h"
 #include "node_version.h"
+#include "ubi_version.h"
 #include "unofficial_napi.h"
 #include "ubi_node_addon_compat.h"
 #include "ubi_timers_host.h"
+#include "ubi_worker_control.h"
 
 #if defined(_WIN32)
 #include <io.h>
@@ -83,7 +86,7 @@ constexpr double kNanosPerSec = 1e9;
 uint64_t g_process_start_time_ns = uv_hrtime();
 std::string g_ubi_exec_path;
 std::string g_ubi_argv0;
-std::string g_process_title = "ubi";
+std::string g_process_title = "node";
 uint32_t g_process_debug_port = 9229;
 std::mutex g_process_umask_mutex;
 std::mutex g_process_dlopen_mutex;
@@ -153,8 +156,12 @@ void CloseDynamicLibrary(uv_lib_t* lib) {
 #endif
 }
 
+#ifndef UBI_STRINGIFY_HELPER
 #define UBI_STRINGIFY_HELPER(x) #x
+#endif
+#ifndef UBI_STRINGIFY
 #define UBI_STRINGIFY(x) UBI_STRINGIFY_HELPER(x)
+#endif
 
 struct ProcessMethodsBindingState {
   napi_ref binding_ref = nullptr;
@@ -438,6 +445,10 @@ std::string ReadTextFileIfExists(const std::filesystem::path& path) {
 }
 
 bool RuntimeHasIntl(napi_env env) {
+#if defined(UBI_HAS_ICU)
+  (void)env;
+  return true;
+#else
   napi_value global = nullptr;
   if (env == nullptr || napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
 
@@ -446,6 +457,7 @@ bool RuntimeHasIntl(napi_env env) {
 
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, intl, &type) == napi_ok && (type == napi_object || type == napi_function);
+#endif
 }
 
 std::string FindNodeConfigGypiText() {
@@ -492,7 +504,14 @@ bool EnsureProcessConfigVariablesForUbi(napi_env env, napi_value config_obj) {
 
   const int32_t has_intl = RuntimeHasIntl(env) ? 1 : 0;
   if (!SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", has_intl) ||
-      !SetProcessConfigVariableInt(env, variables_obj, "icu_small", 0) ||
+      !SetProcessConfigVariableInt(env,
+                                   variables_obj,
+                                   "icu_small",
+#if defined(UBI_HAS_SMALL_ICU)
+                                   1) ||
+#else
+                                   0) ||
+#endif
       !SetProcessConfigVariableInt(env, variables_obj, "node_use_amaro", 0)) {
     return false;
   }
@@ -1056,6 +1075,7 @@ std::vector<ProcessVersionEntry> BuildProcessVersionEntries(bool has_intl) {
       {"simdjson", SIMDJSON_VERSION},
       {"simdutf", SIMDUTF_VERSION},
       {"undici", GetUndiciVersion()},
+      {"ubi", UBI_VERSION_STRING},
       {"uv", uv_version_string()},
       {"uvwasi", kUvwasiVersion},
       {"v8", UBI_EMBEDDED_V8_VERSION},
@@ -3522,13 +3542,52 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
     napi_valuetype arg_type = napi_undefined;
     if (napi_typeof(env, args[0], &arg_type) == napi_ok && arg_type != napi_undefined) napi_get_value_int32(env, args[0], &exit_code);
   }
+  if (UbiExecArgvHasFlag("--trace-exit")) {
+    std::ostringstream warning;
+    warning << "(node:" << uv_os_getpid();
+    if (!UbiWorkerEnvOwnsProcessState(env)) {
+      warning << ", thread:" << UbiWorkerEnvThreadId(env);
+    }
+    warning << ") WARNING: Exited the environment with code " << exit_code << "\n";
+
+    napi_value global = nullptr;
+    napi_value error_ctor = nullptr;
+    napi_value error_obj = nullptr;
+    napi_value stack_value = nullptr;
+    std::string stack;
+    if (napi_get_global(env, &global) == napi_ok &&
+        global != nullptr &&
+        napi_get_named_property(env, global, "Error", &error_ctor) == napi_ok &&
+        error_ctor != nullptr &&
+        napi_new_instance(env, error_ctor, 0, nullptr, &error_obj) == napi_ok &&
+        error_obj != nullptr &&
+        napi_get_named_property(env, error_obj, "stack", &stack_value) == napi_ok &&
+        stack_value != nullptr) {
+      stack = NapiValueToUtf8(env, stack_value);
+      const size_t first_newline = stack.find('\n');
+      if (first_newline != std::string::npos) {
+        stack.erase(0, first_newline + 1);
+      } else {
+        stack.clear();
+      }
+    }
+
+    std::cerr << warning.str();
+    if (!stack.empty()) {
+      std::cerr << stack;
+      if (stack.back() != '\n') std::cerr << "\n";
+    }
+    std::cerr.flush();
+  }
   if (!UbiWorkerEnvOwnsProcessState(env)) {
+    UbiWorkerStopAllForEnv(env);
     UbiWorkerEnvRequestStop(env);
     uv_loop_t* loop = UbiGetEnvLoop(env);
     if (loop != nullptr) uv_stop(loop);
     (void)unofficial_napi_terminate_execution(env);
     return nullptr;
   }
+  UbiWorkerStopAllForEnv(env);
   std::exit(exit_code);
   return nullptr;
 }
@@ -3838,12 +3897,12 @@ napi_value ProcessMethodsPatchProcessObjectCallback(napi_env env, napi_callback_
   napi_property_descriptor descriptors[3] = {};
   descriptors[0].utf8name = "title";
   descriptors[0].getter = ProcessObjectTitleGetter;
-  descriptors[0].setter = ProcessObjectTitleSetter;
+  descriptors[0].setter = UbiWorkerEnvOwnsProcessState(env) ? ProcessObjectTitleSetter : nullptr;
   descriptors[1].utf8name = "ppid";
   descriptors[1].getter = ProcessObjectPpidGetter;
   descriptors[2].utf8name = "debugPort";
   descriptors[2].getter = ProcessObjectDebugPortGetter;
-  descriptors[2].setter = ProcessObjectDebugPortSetter;
+  descriptors[2].setter = UbiWorkerEnvOwnsProcessState(env) ? ProcessObjectDebugPortSetter : nullptr;
   napi_define_properties(env, argv[0], 3, descriptors);
 
   // Node's process object has a custom constructor on its prototype where
@@ -3893,10 +3952,13 @@ napi_value ProcessMethodsLoadEnvFileCallback(napi_env env, napi_callback_info in
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
 
   napi_value util_binding = nullptr;
-  napi_value internal_binding = nullptr;
+  napi_value internal_binding = UbiGetInternalBinding(env);
   napi_valuetype internal_binding_type = napi_undefined;
-  if (napi_get_named_property(env, global, "internalBinding", &internal_binding) == napi_ok &&
-      internal_binding != nullptr &&
+  if (internal_binding == nullptr &&
+      napi_get_named_property(env, global, "internalBinding", &internal_binding) != napi_ok) {
+    internal_binding = nullptr;
+  }
+  if (internal_binding != nullptr &&
       napi_typeof(env, internal_binding, &internal_binding_type) == napi_ok &&
       internal_binding_type == napi_function) {
     napi_value util_name = nullptr;
@@ -4704,9 +4766,18 @@ napi_status UbiInstallProcessObject(napi_env env,
   status = napi_set_named_property(env, process_obj, "execArgv", exec_argv_arr);
   if (status != napi_ok) return status;
 
-  const std::string title = process_title.empty() ? g_ubi_exec_path : process_title;
-  g_process_title = title;
-  (void)uv_set_process_title(g_process_title.c_str());
+  const bool owns_process_state = UbiWorkerEnvOwnsProcessState(env);
+  std::string title = process_title;
+  if (title.empty()) {
+    title = GetProcessTitleString();
+  }
+  if (title.empty()) {
+    title = "node";
+  }
+  if (owns_process_state && !process_title.empty()) {
+    g_process_title = title;
+    (void)uv_set_process_title(g_process_title.c_str());
+  }
   napi_value title_value = nullptr;
   status = napi_create_string_utf8(env, title.c_str(), NAPI_AUTO_LENGTH, &title_value);
   if (status != napi_ok || title_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;

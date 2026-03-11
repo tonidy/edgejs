@@ -9,6 +9,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -31,6 +32,7 @@
 namespace {
 
 constexpr const char kUsage[] = "Usage: ubi <script.js>";
+constexpr const char kSafeModeUnavailable[] = "--safe mode is not enabled in this release of ubi";
 constexpr unsigned kMaxSignal = 32;
 std::once_flag g_cli_init_once;
 
@@ -179,6 +181,10 @@ bool OptionConsumesNextToken(const std::string& token) {
       "--env-file",
       "--env-file-if-exists",
       "--experimental-config-file",
+      "--experimental-loader",
+      "--loader",
+      "--import",
+      "--conditions",
       "--run",
       "--allow-fs-read",
       "--allow-fs-write",
@@ -222,6 +228,7 @@ bool IsBooleanOptionForNegation(const std::string& option) {
       "--experimental-quic",
       "--experimental-require-module",
       "--experimental-report",
+      "--experimental-strip-types",
       "--experimental-sqlite",
       "--experimental-test-coverage",
       "--experimental-test-module-mocks",
@@ -382,6 +389,7 @@ bool IsRecognizedCliOptionToken(const std::string& token) {
            key == "--input-type";
   }
   if (OptionConsumesNextToken(token)) return true;
+  if (token == "--experimental-strip-types") return true;
   if (IsBooleanOptionForNegation(token)) return true;
   if (token.rfind("--no-", 0) == 0) return true;
   if (token.rfind("--env-file=", 0) == 0 ||
@@ -401,6 +409,42 @@ bool ValidateNodeOptions(const std::vector<std::string>& node_options_tokens, st
       }
       return false;
     }
+  }
+  return true;
+}
+
+bool HasExactOptionToken(const std::vector<std::string>& tokens, const char* option) {
+  for (const auto& token : tokens) {
+    if (token == option) return true;
+  }
+  return false;
+}
+
+bool ValidateCaOptions(const ubi_options::EffectiveCliState& state, std::string* error_out) {
+  const bool use_openssl_ca = HasExactOptionToken(state.effective_tokens, "--use-openssl-ca");
+  const bool use_bundled_ca = HasExactOptionToken(state.effective_tokens, "--use-bundled-ca");
+  if (use_openssl_ca && use_bundled_ca) {
+    if (error_out != nullptr) {
+      *error_out = FormatCliError("either --use-openssl-ca or --use-bundled-ca can be used, not both");
+    }
+    return false;
+  }
+  return true;
+}
+
+bool ValidateTraceRequireModuleOption(const ubi_options::EffectiveCliState& state,
+                                      std::string* error_out) {
+  for (const auto& token : state.effective_tokens) {
+    constexpr std::string_view kPrefix = "--trace-require-module=";
+    if (token.rfind(kPrefix, 0) != 0) continue;
+    const std::string value = token.substr(kPrefix.size());
+    if (value == "all" || value == "no-node-modules") {
+      return true;
+    }
+    if (error_out != nullptr) {
+      *error_out = "invalid value for --trace-require-module";
+    }
+    return false;
   }
   return true;
 }
@@ -518,9 +562,17 @@ bool StdinIsTTY() {
 #endif
 }
 
-int RunCliBuiltin(const char* source_text, std::string* error_out) {
+int RunCliBuiltin(const char* source_text,
+                  const char* native_main_builtin_id,
+                  std::string* error_out) {
   return RunWithFreshEnv(
-      [&](napi_env env) { return UbiRunScriptSourceWithLoop(env, source_text, error_out, true); },
+      [&](napi_env env) {
+        return UbiRunScriptSourceWithLoop(env,
+                                          source_text,
+                                          error_out,
+                                          true,
+                                          native_main_builtin_id);
+      },
       error_out);
 }
 
@@ -590,6 +642,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
   bool saw_check = false;
   bool print_flag = false;
   bool has_eval_string = false;
+  bool force_repl = false;
 
   auto set_requires_argument_error = [&](const std::string& token) {
     if (error_out != nullptr) {
@@ -607,6 +660,12 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       return false;
     }
     if (!ValidateNodeOptions(out_state->node_options_tokens, error_out)) {
+      return false;
+    }
+    if (!ValidateCaOptions(*out_state, error_out)) {
+      return false;
+    }
+    if (!ValidateTraceRequireModuleOption(*out_state, error_out)) {
       return false;
     }
     ApplyEnvUpdates(out_state->env_updates);
@@ -651,6 +710,12 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       set_requires_argument_error(token.substr(0, token.size() - 1));
       return 9;
     }
+    if (token == "--safe") {
+      if (error_out != nullptr) {
+        *error_out = kSafeModeUnavailable;
+      }
+      return 1;
+    }
 
     if (token == "-c" || token == "--check") {
       raw_exec_argv.push_back(token);
@@ -660,6 +725,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
     }
     if (token == "-i" || token == "--interactive") {
       raw_exec_argv.push_back(token);
+      force_repl = true;
       mode = CliMode::kInteractive;
       continue;
     }
@@ -733,7 +799,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
 
   UbiSetExecArgv(raw_exec_argv);
 
-  if (mode == CliMode::kInteractive) {
+  if (force_repl) {
     if (RawExecArgvHasInputType(raw_exec_argv)) {
       if (error_out != nullptr) {
         *error_out = "Cannot specify --input-type for REPL";
@@ -741,8 +807,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       return 1;
     }
     UbiSetScriptArgv({});
-    static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
-    return RunCliBuiltin(kInteractiveMain, error_out);
+    return RunCliBuiltin(";", "internal/main/repl", error_out);
   }
 
   if (has_eval_string || (print_flag && mode == CliMode::kPrint)) {
@@ -754,8 +819,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       if (argv[argi] != nullptr) script_argv.emplace_back(argv[argi]);
     }
     UbiSetScriptArgv(script_argv);
-    static constexpr const char kEvalStringMain[] = "require('internal/main/eval_string');";
-    return RunCliBuiltin(kEvalStringMain, error_out);
+    return RunCliBuiltin(";", "internal/main/eval_string", error_out);
   }
 
   if (mode == CliMode::kRun) {
@@ -772,9 +836,6 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       }
     }
     UbiSetScriptArgv(script_argv);
-    static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
-    static constexpr const char kEvalStdinMain[] = "require('internal/main/eval_stdin');";
-    static constexpr const char kCheckSyntaxMain[] = "require('internal/main/check_syntax');";
     static constexpr const char kCheckSyntaxModuleStdinMain[] =
         "/*__ubi_skip_pre_execution__*/"
         "const { prepareMainThreadExecution, markBootstrapComplete } = "
@@ -795,11 +856,11 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
         "});";
     if (mode == CliMode::kCheck) {
       if (RawExecArgvHasInputType(raw_exec_argv)) {
-        return RunCliBuiltin(kCheckSyntaxModuleStdinMain, error_out);
+        return RunCliBuiltin(kCheckSyntaxModuleStdinMain, nullptr, error_out);
       }
-      return RunCliBuiltin(kCheckSyntaxMain, error_out);
+      return RunCliBuiltin(";", "internal/main/check_syntax", error_out);
     }
-    return RunCliBuiltin(StdinIsTTY() ? kInteractiveMain : kEvalStdinMain, error_out);
+    return RunCliBuiltin(";", StdinIsTTY() ? "internal/main/repl" : "internal/main/eval_stdin", error_out);
   }
 
   script_argv.reserve(static_cast<size_t>(argc - (script_index + 1)));

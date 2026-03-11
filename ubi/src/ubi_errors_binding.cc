@@ -1,11 +1,11 @@
 #include "ubi_errors_binding.h"
 
-#include <cctype>
-#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
+#include "unofficial_napi.h"
 
 namespace {
 
@@ -17,12 +17,6 @@ struct ErrorsBindingState {
   napi_ref enhance_fatal_stack_before_inspector_ref = nullptr;
   napi_ref enhance_fatal_stack_after_inspector_ref = nullptr;
   bool source_maps_enabled = false;
-};
-
-struct ErrorsStackLocation {
-  std::string script_resource_name;
-  int line_number = 0;
-  int start_column = 0;
 };
 
 std::unordered_map<napi_env, ErrorsBindingState> g_errors_states;
@@ -237,203 +231,43 @@ napi_value ErrorsSetEnhanceStackForFatalException(napi_env env, napi_callback_in
   return MakeUndefined(env);
 }
 
-std::string TrimAsciiWhitespace(std::string value) {
-  size_t start = 0;
-  while (start < value.size() &&
-         std::isspace(static_cast<unsigned char>(value[start])) != 0) {
-    ++start;
-  }
-  size_t end = value.size();
-  while (end > start &&
-         std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
-    --end;
-  }
-  return value.substr(start, end - start);
-}
-
-bool ParsePositiveDecimal(const std::string& text, int* out) {
-  if (out == nullptr || text.empty()) return false;
-  int value = 0;
-  for (char ch : text) {
-    if (ch < '0' || ch > '9') return false;
-    value = (value * 10) + (ch - '0');
-  }
-  *out = value;
-  return true;
-}
-
-bool ParseStackLocationSuffix(const std::string& location, ErrorsStackLocation* out) {
-  if (out == nullptr) return false;
-  const size_t last_colon = location.rfind(':');
-  if (last_colon == std::string::npos) return false;
-  const size_t mid_colon = location.rfind(':', last_colon - 1);
-  if (mid_colon == std::string::npos) return false;
-  int line_number = 0;
-  int start_column = 0;
-  if (!ParsePositiveDecimal(location.substr(mid_colon + 1, last_colon - mid_colon - 1), &line_number)) {
-    return false;
-  }
-  if (!ParsePositiveDecimal(location.substr(last_colon + 1), &start_column)) {
-    return false;
-  }
-  std::string script_resource_name = TrimAsciiWhitespace(location.substr(0, mid_colon));
-  if (script_resource_name.empty()) return false;
-  out->script_resource_name = std::move(script_resource_name);
-  out->line_number = line_number;
-  out->start_column = start_column;
-  return true;
-}
-
-bool ParseStackLineForLocation(const std::string& line, ErrorsStackLocation* out) {
-  std::string text = TrimAsciiWhitespace(line);
-  if (text.empty()) return false;
-
-  if (text.rfind("at ", 0) == 0) {
-    text = TrimAsciiWhitespace(text.substr(3));
-  }
-
-  const size_t open_paren = text.rfind('(');
-  const size_t close_paren = text.rfind(')');
-  if (open_paren != std::string::npos &&
-      close_paren != std::string::npos &&
-      close_paren > open_paren) {
-    if (ParseStackLocationSuffix(text.substr(open_paren + 1, close_paren - open_paren - 1), out)) {
-      return true;
-    }
-  }
-
-  return ParseStackLocationSuffix(text, out);
-}
-
-bool ParseErrorStackForLocation(const std::string& stack, ErrorsStackLocation* out) {
-  if (out == nullptr || stack.empty()) return false;
-  size_t offset = 0;
-  bool first_line = true;
-  while (offset <= stack.size()) {
-    const size_t newline = stack.find('\n', offset);
-    const std::string line = newline == std::string::npos
-                                 ? stack.substr(offset)
-                                 : stack.substr(offset, newline - offset);
-    if (!first_line && ParseStackLineForLocation(line, out)) {
-      return true;
-    }
-    first_line = false;
-    if (newline == std::string::npos) break;
-    offset = newline + 1;
-  }
-  return false;
-}
-
-std::string ScriptResourceNameToFilePath(std::string script_resource_name) {
-  script_resource_name = TrimAsciiWhitespace(std::move(script_resource_name));
-  if (script_resource_name.empty()) return "";
-  if (script_resource_name.rfind("file://", 0) == 0) {
-    std::string path = script_resource_name.substr(7);
-    if (path.rfind("localhost/", 0) == 0) {
-      path = path.substr(9);
-    }
-    if (path.size() > 2 && path[0] == '/' && std::isalpha(static_cast<unsigned char>(path[1])) != 0 &&
-        path[2] == ':') {
-      path = path.substr(1);
-    }
-    return path;
-  }
-  if (script_resource_name.rfind("node:", 0) == 0) return "";
-  if (script_resource_name == "<anonymous>" ||
-      script_resource_name == "[eval]" ||
-      script_resource_name == "evalmachine.<anonymous>") {
-    return "";
-  }
-  return script_resource_name;
-}
-
-std::string ReadSourceLineAt(const std::string& file_path, int line_number) {
-  if (file_path.empty() || line_number <= 0) return "";
-  std::ifstream file(file_path);
-  if (!file.is_open()) return "";
-  std::string line;
-  for (int i = 0; i < line_number; ++i) {
-    if (!std::getline(file, line)) return "";
-  }
-  return line;
-}
-
 napi_value ErrorsGetErrorSourcePositions(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
 
-  std::string source_line;
-  std::string script_resource_name;
-  int32_t line_number = 0;
-  int32_t start_column = 0;
-
-  if (argc >= 1 && argv[0] != nullptr) {
-    napi_value stack_value = nullptr;
-    if (napi_get_named_property(env, argv[0], "stack", &stack_value) == napi_ok && stack_value != nullptr) {
-      const std::string stack = ValueToUtf8(env, stack_value);
-      ErrorsStackLocation location;
-      if (ParseErrorStackForLocation(stack, &location)) {
-        script_resource_name = location.script_resource_name;
-        line_number = location.line_number;
-        // JS consumers expect 0-based source columns, while stack traces use 1-based columns.
-        start_column = location.start_column > 0 ? location.start_column - 1 : 0;
-
-        auto it = g_errors_states.find(env);
-        const bool source_maps_enabled =
-            it != g_errors_states.end() && it->second.source_maps_enabled;
-        const napi_ref source_map_ref =
-            it != g_errors_states.end() ? it->second.get_source_map_error_source_ref : nullptr;
-
-        // Prefer JS-side source-map aware callback when enabled.
-        if (source_maps_enabled && source_map_ref != nullptr) {
-          napi_value cb = nullptr;
-          if (napi_get_reference_value(env, source_map_ref, &cb) == napi_ok && cb != nullptr) {
-            napi_valuetype cb_type = napi_undefined;
-            if (napi_typeof(env, cb, &cb_type) == napi_ok && cb_type == napi_function) {
-              napi_value global = nullptr;
-              napi_value script_name_v = nullptr;
-              napi_value line_v = nullptr;
-              napi_value column_v = nullptr;
-              napi_value mapped_v = nullptr;
-              if (napi_get_global(env, &global) == napi_ok &&
-                  global != nullptr &&
-                  napi_create_string_utf8(
-                      env, script_resource_name.c_str(), NAPI_AUTO_LENGTH, &script_name_v) ==
-                      napi_ok &&
-                  script_name_v != nullptr &&
-                  napi_create_int32(env, line_number, &line_v) == napi_ok &&
-                  line_v != nullptr &&
-                  napi_create_int32(env, start_column, &column_v) == napi_ok &&
-                  column_v != nullptr) {
-                napi_value mapped_argv[3] = {script_name_v, line_v, column_v};
-                if (napi_call_function(env, global, cb, 3, mapped_argv, &mapped_v) == napi_ok &&
-                    mapped_v != nullptr) {
-                  napi_valuetype mapped_type = napi_undefined;
-                  if (napi_typeof(env, mapped_v, &mapped_type) == napi_ok && mapped_type == napi_string) {
-                    source_line = ValueToUtf8(env, mapped_v);
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        if (source_line.empty()) {
-          source_line = ReadSourceLineAt(
-              ScriptResourceNameToFilePath(location.script_resource_name),
-              location.line_number);
-        }
-      }
-    }
-  }
-
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return nullptr;
-  SetNamedString(env, out, "sourceLine", source_line);
-  SetNamedString(env, out, "scriptResourceName", script_resource_name);
-  SetNamedInt32(env, out, "lineNumber", line_number);
-  SetNamedInt32(env, out, "startColumn", start_column);
+
+  if (argc < 1 || argv[0] == nullptr) {
+    SetNamedString(env, out, "sourceLine", "");
+    SetNamedString(env, out, "scriptResourceName", "");
+    SetNamedInt32(env, out, "lineNumber", 0);
+    SetNamedInt32(env, out, "startColumn", 0);
+    return out;
+  }
+
+  unofficial_napi_error_source_positions positions = {};
+  if (unofficial_napi_get_error_source_positions(env, argv[0], &positions) != napi_ok) {
+    SetNamedString(env, out, "sourceLine", "");
+    SetNamedString(env, out, "scriptResourceName", "");
+    SetNamedInt32(env, out, "lineNumber", 0);
+    SetNamedInt32(env, out, "startColumn", 0);
+    return out;
+  }
+
+  if (positions.source_line != nullptr) {
+    napi_set_named_property(env, out, "sourceLine", positions.source_line);
+  } else {
+    SetNamedString(env, out, "sourceLine", "");
+  }
+  if (positions.script_resource_name != nullptr) {
+    napi_set_named_property(env, out, "scriptResourceName", positions.script_resource_name);
+  } else {
+    SetNamedString(env, out, "scriptResourceName", "");
+  }
+  SetNamedInt32(env, out, "lineNumber", positions.line_number);
+  SetNamedInt32(env, out, "startColumn", positions.start_column);
   return out;
 }
 

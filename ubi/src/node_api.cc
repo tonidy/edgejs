@@ -2,6 +2,7 @@
 #include "node_api_types.h"
 #include "ubi_async_wrap.h"
 #include "ubi_env_loop.h"
+#include "ubi_module_loader.h"
 #include "ubi_runtime.h"
 
 #include <atomic>
@@ -147,6 +148,7 @@ void CleanupEnvLoopOnTeardown(void* arg) {
     DrainAndCloseEnvLoop(loop);
     delete loop;
   }
+  UbiFinalizeModuleLoaderEnv(env);
   MaybeEraseEnvState(env);
 }
 
@@ -738,6 +740,7 @@ napi_status UbiEnsureEnvLoop(napi_env env, uv_loop_t** loop_out) {
       delete loop;
       return napi_generic_failure;
     }
+    (void)uv_loop_configure(loop, UV_METRICS_IDLE_TIME);
     state.loop = loop;
   }
   if (loop_out != nullptr) *loop_out = state.loop;

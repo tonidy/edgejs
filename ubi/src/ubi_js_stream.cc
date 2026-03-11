@@ -19,6 +19,8 @@ namespace {
 struct JsStreamWrap {
   napi_env env = nullptr;
   UbiStreamBase base{};
+  std::vector<uint8_t> pending_read;
+  bool pending_eof = false;
 };
 
 JsStreamWrap* FromBase(UbiStreamBase* base) {
@@ -62,6 +64,10 @@ bool IsFunction(napi_env env, napi_value value) {
   return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
 }
 
+bool HasOnRead(const JsStreamWrap* wrap) {
+  return wrap != nullptr && wrap->base.onread_ref != nullptr;
+}
+
 std::string ValueToUtf8(napi_env env, napi_value value) {
   if (env == nullptr || value == nullptr) return {};
   napi_value string_value = nullptr;
@@ -88,43 +94,14 @@ int32_t CallMethodReturningInt32(napi_env env,
     return fallback;
   }
   napi_value result = nullptr;
-  if (UbiAsyncWrapMakeCallback(env, async_id, self, self, fn, argc, argv, &result, kUbiMakeCallbackNone) != napi_ok ||
+  if (UbiAsyncWrapMakeCallback(
+          env, async_id, self, self, fn, argc, argv, &result, kUbiMakeCallbackNone) != napi_ok ||
       result == nullptr) {
     return fallback;
   }
   int32_t out = fallback;
   if (napi_get_value_int32(env, result, &out) != napi_ok) return fallback;
   return out;
-}
-
-void FinishReq(napi_env env, napi_value req_obj, int32_t status) {
-  if (env == nullptr || req_obj == nullptr) return;
-  napi_value oncomplete = nullptr;
-  napi_value handle = nullptr;
-  napi_get_named_property(env, req_obj, "handle", &handle);
-  napi_value error = nullptr;
-  if (status < 0) napi_get_named_property(env, req_obj, "error", &error);
-  napi_value argv[3] = {
-      UbiStreamBaseMakeInt32(env, status),
-      handle != nullptr ? handle : UbiStreamBaseUndefined(env),
-      error != nullptr ? error : UbiStreamBaseUndefined(env),
-  };
-  if (napi_get_named_property(env, req_obj, "oncomplete", &oncomplete) != napi_ok || !IsFunction(env, oncomplete)) {
-    UbiStreamReqMarkDone(env, req_obj);
-    return;
-  }
-  napi_value ignored = nullptr;
-  UbiAsyncWrapMakeCallback(
-      env,
-      UbiStreamReqGetAsyncId(env, req_obj),
-      req_obj,
-      req_obj,
-      oncomplete,
-      3,
-      argv,
-      &ignored,
-      kUbiMakeCallbackNone);
-  UbiStreamReqMarkDone(env, req_obj);
 }
 
 napi_value BuildWriteArray(napi_env env, const std::vector<std::vector<uint8_t>>& chunks) {
@@ -188,6 +165,13 @@ napi_value JsStreamCtor(napi_env env, napi_callback_info info) {
   }, nullptr, &wrap->base.wrapper_ref);
   UbiStreamBaseSetWrapperRef(&wrap->base, wrap->base.wrapper_ref);
   UbiStreamBaseSetInitialStreamProperties(&wrap->base, false, false);
+  // Node's native JSStream does not expose an enumerable `reading` own property,
+  // so keep it writable/configurable but hide it from default inspection.
+  napi_property_descriptor reading_desc = {};
+  reading_desc.utf8name = "reading";
+  reading_desc.value = UbiStreamBaseMakeBool(env, false);
+  reading_desc.attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+  (void)napi_define_properties(env, self, 1, &reading_desc);
   return self;
 }
 
@@ -327,6 +311,13 @@ napi_value JsStreamReadBuffer(napi_env env, napi_callback_info info) {
   std::string temp_utf8;
   UbiStreamBaseExtractByteSpan(env, argv[0], &data, &len, &refable, &temp_utf8);
 
+  if (!HasOnRead(wrap)) {
+    if (data != nullptr && len > 0) {
+      wrap->pending_read.insert(wrap->pending_read.end(), data, data + len);
+    }
+    return UbiStreamBaseUndefined(env);
+  }
+
   while (len != 0) {
     uv_buf_t buf = uv_buf_init(nullptr, 0);
     if (!UbiStreamEmitAlloc(&wrap->base.listener_state, len, &buf) || buf.base == nullptr || buf.len == 0) {
@@ -350,6 +341,10 @@ napi_value JsStreamEmitEOF(napi_env env, napi_callback_info info) {
   if (!GetThisAndWrap(env, info, nullptr, nullptr, nullptr, &wrap) || wrap == nullptr) {
     return UbiStreamBaseUndefined(env);
   }
+  if (!HasOnRead(wrap)) {
+    wrap->pending_eof = true;
+    return UbiStreamBaseUndefined(env);
+  }
   UbiStreamEmitRead(&wrap->base.listener_state, UV_EOF, nullptr);
   return UbiStreamBaseUndefined(env);
 }
@@ -357,17 +352,27 @@ napi_value JsStreamEmitEOF(napi_env env, napi_callback_info info) {
 napi_value JsStreamFinishWrite(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr, nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) {
+  JsStreamWrap* wrap = nullptr;
+  if (!GetThisAndWrap(env, info, &argc, argv, nullptr, &wrap) || wrap == nullptr || argc < 2) {
     return UbiStreamBaseUndefined(env);
   }
   int32_t status = 0;
   if (napi_get_value_int32(env, argv[1], &status) != napi_ok) status = UV_EINVAL;
-  FinishReq(env, argv[0], status);
+  UbiStreamBaseEmitAfterWrite(&wrap->base, argv[0], status);
   return UbiStreamBaseUndefined(env);
 }
 
 napi_value JsStreamFinishShutdown(napi_env env, napi_callback_info info) {
-  return JsStreamFinishWrite(env, info);
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  JsStreamWrap* wrap = nullptr;
+  if (!GetThisAndWrap(env, info, &argc, argv, nullptr, &wrap) || wrap == nullptr || argc < 2) {
+    return UbiStreamBaseUndefined(env);
+  }
+  int32_t status = 0;
+  if (napi_get_value_int32(env, argv[1], &status) != napi_ok) status = UV_EINVAL;
+  UbiStreamBaseEmitAfterShutdown(&wrap->base, argv[0], status);
+  return UbiStreamBaseUndefined(env);
 }
 
 napi_value JsStreamGetOnRead(napi_env env, napi_callback_info info) {
@@ -381,7 +386,33 @@ napi_value JsStreamSetOnRead(napi_env env, napi_callback_info info) {
   napi_value argv[1] = {nullptr};
   JsStreamWrap* wrap = nullptr;
   GetThisAndWrap(env, info, &argc, argv, nullptr, &wrap);
-  return UbiStreamBaseSetOnRead(wrap != nullptr ? &wrap->base : nullptr, argc > 0 ? argv[0] : nullptr);
+  napi_value result = UbiStreamBaseSetOnRead(wrap != nullptr ? &wrap->base : nullptr, argc > 0 ? argv[0] : nullptr);
+  if (wrap != nullptr && HasOnRead(wrap)) {
+    const uint8_t* data = wrap->pending_read.data();
+    size_t len = wrap->pending_read.size();
+    while (len != 0) {
+      uv_buf_t buf = uv_buf_init(nullptr, 0);
+      if (!UbiStreamEmitAlloc(&wrap->base.listener_state, len, &buf) || buf.base == nullptr || buf.len == 0) {
+        break;
+      }
+      size_t available = len;
+      if (buf.len < available) available = buf.len;
+      memcpy(buf.base, data, available);
+      data += available;
+      len -= available;
+      wrap->base.bytes_read += available;
+      if (!UbiStreamEmitRead(&wrap->base.listener_state, static_cast<ssize_t>(available), &buf) &&
+          buf.base != nullptr) {
+        free(buf.base);
+      }
+    }
+    wrap->pending_read.clear();
+    if (wrap->pending_eof) {
+      wrap->pending_eof = false;
+      UbiStreamEmitRead(&wrap->base.listener_state, UV_EOF, nullptr);
+    }
+  }
+  return result;
 }
 
 napi_value JsStreamGetAsyncId(napi_env env, napi_callback_info info) {
@@ -475,4 +506,37 @@ napi_value UbiInstallJsStreamBinding(napi_env env) {
 
   napi_set_named_property(env, binding, "JSStream", ctor);
   return binding;
+}
+
+int UbiJsStreamWriteBuffer(UbiStreamBase* base,
+                           napi_value req_obj,
+                           napi_value payload,
+                           bool* async_out) {
+  if (async_out != nullptr) *async_out = false;
+  auto* wrap = FromBase(base);
+  if (wrap == nullptr || base == nullptr || base->env == nullptr) return UV_EBADF;
+
+  napi_value self = UbiStreamBaseGetWrapper(base);
+  if (self == nullptr) return UV_EBADF;
+
+  const uint8_t* data = nullptr;
+  size_t len = 0;
+  bool refable = false;
+  std::string temp_utf8;
+  UbiStreamBaseExtractByteSpan(base->env, payload, &data, &len, &refable, &temp_utf8);
+
+  std::vector<std::vector<uint8_t>> chunks;
+  chunks.emplace_back(data, data + len);
+
+  napi_value status_value = CallOnWrite(base->env, wrap, self, req_obj, chunks, len);
+  int32_t status = UV_EPROTO;
+  if (status_value == nullptr || napi_get_value_int32(base->env, status_value, &status) != napi_ok) {
+    return UV_EPROTO;
+  }
+
+  if (async_out != nullptr && status == 0) {
+    *async_out = true;
+  }
+
+  return status;
 }
