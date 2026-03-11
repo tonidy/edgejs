@@ -235,6 +235,49 @@ target_link_libraries(ubi_zstd
     Threads::Threads
 )
 
+add_library(ubi_nghttp2 STATIC
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_buf.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_callbacks.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_debug.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_extpri.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_frame.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_hd.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_hd_huffman.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_hd_huffman_data.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_helper.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_http.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_map.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_mem.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_alpn.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_option.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_outbound_item.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_pq.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_priority_spec.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_queue.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_ratelim.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_rcbuf.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_session.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_stream.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_submit.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_time.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/nghttp2_version.c"
+  "${PROJECT_ROOT}/deps/nghttp2/lib/sfparse.c"
+)
+target_include_directories(ubi_nghttp2
+  PUBLIC
+    "${PROJECT_ROOT}/deps/nghttp2/lib/includes"
+  PRIVATE
+    "${PROJECT_ROOT}/deps/nghttp2/lib"
+)
+target_compile_definitions(ubi_nghttp2
+  PUBLIC
+    NGHTTP2_STATICLIB
+  PRIVATE
+    BUILDING_NGHTTP2
+    HAVE_CONFIG_H
+    _U_=
+)
+
 if(UBI_IS_WASIX_TARGET)
   set(UBI_OPENSSL_WASIX_ROOT
     "${PROJECT_ROOT}/deps/openssl-wasix"
@@ -476,6 +519,7 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_fs.cc
   src/internal_binding/binding_fs_dir.cc
   src/internal_binding/binding_heap_utils.cc
+  src/internal_binding/binding_http2.cc
   src/internal_binding/binding_http_parser.cc
   src/internal_binding/binding_icu.cc
   src/internal_binding/binding_js_udp_wrap.cc
@@ -497,6 +541,7 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_serdes.cc
   src/internal_binding/binding_signal_wrap.cc
   src/internal_binding/binding_spawn_sync.cc
+  src/internal_binding/binding_stream_pipe.cc
   src/internal_binding/binding_stream_wrap.cc
   src/internal_binding/binding_string_decoder.cc
   src/internal_binding/binding_symbols.cc
@@ -573,6 +618,7 @@ target_link_libraries(ubi_runtime
     ubi_ada
     ubi_ncrypto
     ubi_brotli
+    ubi_nghttp2
     ubi_zstd
     uv_a
     c-ares::cares

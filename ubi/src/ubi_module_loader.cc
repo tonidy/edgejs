@@ -879,7 +879,6 @@ static NativeBuiltinExecutionKind GetNativeBuiltinExecutionKind(const std::strin
 static const std::vector<std::string>& CollectRuntimeBuiltinIds() {
   static const std::vector<std::string> ids = []() {
     std::vector<std::string> out = builtin_catalog::AllBuiltinIds();
-    out.erase(std::remove(out.begin(), out.end(), "http2"), out.end());
     return out;
   }();
   return ids;

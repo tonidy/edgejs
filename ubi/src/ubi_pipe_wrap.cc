@@ -358,6 +358,7 @@ napi_value PipeReadStart(napi_env env, napi_callback_info info) {
   GetThis(env, info, nullptr, nullptr, &wrap);
   if (wrap == nullptr) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   int rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&wrap->handle), OnAlloc, OnRead);
+  if (rc == UV_EALREADY) rc = 0;
   UbiStreamBaseSetReading(&wrap->base, rc == 0);
   return UbiStreamBaseMakeInt32(env, rc);
 }
@@ -367,6 +368,7 @@ napi_value PipeReadStop(napi_env env, napi_callback_info info) {
   GetThis(env, info, nullptr, nullptr, &wrap);
   if (wrap == nullptr) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   int rc = uv_read_stop(reinterpret_cast<uv_stream_t*>(&wrap->handle));
+  if (rc == UV_EALREADY) rc = 0;
   UbiStreamBaseSetReading(&wrap->base, false);
   return UbiStreamBaseMakeInt32(env, rc);
 }

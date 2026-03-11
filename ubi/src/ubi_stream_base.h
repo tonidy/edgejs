@@ -18,6 +18,10 @@ struct UbiStreamBaseOps {
   uv_close_cb on_close = nullptr;
   void (*destroy_self)(UbiStreamBase* base) = nullptr;
   napi_value (*accept_pending_handle)(UbiStreamBase* base) = nullptr;
+  int (*write_buffer_direct)(UbiStreamBase* base,
+                             napi_value req_obj,
+                             napi_value payload,
+                             bool* async_out) = nullptr;
 };
 
 struct UbiStreamBase {
@@ -60,6 +64,8 @@ void UbiStreamBaseFinalize(UbiStreamBase* base);
 void UbiStreamBaseOnClosed(UbiStreamBase* base);
 void UbiStreamBaseEmitAfterWrite(UbiStreamBase* base, napi_value req_obj, int status);
 void UbiStreamBaseEmitAfterShutdown(UbiStreamBase* base, napi_value req_obj, int status);
+bool UbiStreamBaseEmitReadBuffer(UbiStreamBase* base, const uint8_t* data, size_t len);
+bool UbiStreamBaseEmitEOF(UbiStreamBase* base);
 
 bool UbiStreamBasePushListener(UbiStreamBase* base, UbiStreamListener* listener);
 bool UbiStreamBaseRemoveListener(UbiStreamBase* base, UbiStreamListener* listener);
@@ -105,6 +111,10 @@ int UbiStreamBaseWriteBufferDirect(UbiStreamBase* base,
                                    napi_value req_obj,
                                    napi_value payload,
                                    bool* async_out);
+int UbiStreamBaseWritevDirect(UbiStreamBase* base,
+                              napi_value req_obj,
+                              napi_value chunks,
+                              bool* async_out);
 
 size_t UbiTypedArrayElementSize(napi_typedarray_type type);
 bool UbiStreamBaseExtractByteSpan(napi_env env,

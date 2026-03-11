@@ -269,7 +269,8 @@ napi_value TtyReadStart(napi_env env, napi_callback_info info) {
     return UbiStreamBaseMakeInt32(env, UV_EBADF);
   }
 
-  const int rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&wrap->handle), OnAlloc, OnRead);
+  int rc = uv_read_start(reinterpret_cast<uv_stream_t*>(&wrap->handle), OnAlloc, OnRead);
+  if (rc == UV_EALREADY) rc = 0;
   UbiStreamBaseSetReading(&wrap->base, rc == 0);
   return UbiStreamBaseMakeInt32(env, rc);
 }
@@ -281,7 +282,8 @@ napi_value TtyReadStop(napi_env env, napi_callback_info info) {
     return UbiStreamBaseMakeInt32(env, UV_EBADF);
   }
 
-  const int rc = uv_read_stop(reinterpret_cast<uv_stream_t*>(&wrap->handle));
+  int rc = uv_read_stop(reinterpret_cast<uv_stream_t*>(&wrap->handle));
+  if (rc == UV_EALREADY) rc = 0;
   UbiStreamBaseSetReading(&wrap->base, false);
   return UbiStreamBaseMakeInt32(env, rc);
 }

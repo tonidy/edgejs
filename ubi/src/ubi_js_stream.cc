@@ -182,6 +182,7 @@ napi_value JsStreamReadStart(napi_env env, napi_callback_info info) {
     return UbiStreamBaseMakeInt32(env, UV_EBADF);
   }
   int32_t status = CallMethodReturningInt32(env, self, wrap->base.async_id, "onreadstart", 0, nullptr, UV_EPROTO);
+  if (status == UV_EALREADY) status = 0;
   UbiStreamBaseSetReading(&wrap->base, status == 0);
   return UbiStreamBaseMakeInt32(env, status);
 }
@@ -193,6 +194,7 @@ napi_value JsStreamReadStop(napi_env env, napi_callback_info info) {
     return UbiStreamBaseMakeInt32(env, UV_EBADF);
   }
   int32_t status = CallMethodReturningInt32(env, self, wrap->base.async_id, "onreadstop", 0, nullptr, UV_EPROTO);
+  if (status == UV_EALREADY) status = 0;
   UbiStreamBaseSetReading(&wrap->base, false);
   return UbiStreamBaseMakeInt32(env, status);
 }

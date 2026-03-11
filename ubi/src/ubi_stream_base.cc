@@ -782,6 +782,24 @@ void UbiStreamBaseEmitAfterShutdown(UbiStreamBase* base, napi_value req_obj, int
   }
 }
 
+bool UbiStreamBaseEmitReadBuffer(UbiStreamBase* base, const uint8_t* data, size_t len) {
+  if (base == nullptr || data == nullptr || len == 0) return false;
+  char* copy = static_cast<char*>(malloc(len));
+  if (copy == nullptr) return false;
+  memcpy(copy, data, len);
+  uv_buf_t buf = uv_buf_init(copy, static_cast<unsigned int>(len));
+  if (UbiStreamEmitRead(&base->listener_state, static_cast<ssize_t>(len), &buf)) {
+    return true;
+  }
+  free(copy);
+  return false;
+}
+
+bool UbiStreamBaseEmitEOF(UbiStreamBase* base) {
+  if (base == nullptr) return false;
+  return UbiStreamEmitRead(&base->listener_state, UV_EOF, nullptr);
+}
+
 void UbiStreamBaseSetReading(UbiStreamBase* base, bool reading) {
   if (base == nullptr || base->env == nullptr) return;
   napi_value self = UbiStreamBaseGetWrapper(base);
@@ -1062,6 +1080,9 @@ int UbiStreamBaseWriteBufferDirect(UbiStreamBase* base,
                                    bool* async_out) {
   if (async_out != nullptr) *async_out = false;
   if (base == nullptr || base->env == nullptr) return UV_EBADF;
+  if (base->ops != nullptr && base->ops->write_buffer_direct != nullptr) {
+    return base->ops->write_buffer_direct(base, req_obj, payload, async_out);
+  }
 
   if (base->provider_type == kUbiProviderJsStream) {
     return UbiJsStreamWriteBuffer(base, req_obj, payload, async_out);
@@ -1071,6 +1092,40 @@ int UbiStreamBaseWriteBufferDirect(UbiStreamBase* base,
   int32_t status = UV_EINVAL;
   if (status_value == nullptr || napi_get_value_int32(base->env, status_value, &status) != napi_ok) {
     return UV_EINVAL;
+  }
+
+  if (async_out != nullptr && status == 0) {
+    int32_t* state = UbiGetStreamBaseState(base->env);
+    *async_out = state != nullptr && state[kUbiLastWriteWasAsync] != 0;
+  }
+
+  return status;
+}
+
+int UbiStreamBaseWritevDirect(UbiStreamBase* base,
+                              napi_value req_obj,
+                              napi_value chunks,
+                              bool* async_out) {
+  if (async_out != nullptr) *async_out = false;
+  if (base == nullptr || base->env == nullptr || chunks == nullptr) return UV_EBADF;
+
+  napi_value self = UbiStreamBaseGetWrapper(base);
+  if (self == nullptr) return UV_EBADF;
+
+  napi_value writev = nullptr;
+  if (napi_get_named_property(base->env, self, "writev", &writev) != napi_ok || !IsFunction(base->env, writev)) {
+    return UV_EBADF;
+  }
+
+  napi_value argv[3] = {req_obj, chunks, UbiStreamBaseMakeBool(base->env, true)};
+  napi_value result = nullptr;
+  if (napi_call_function(base->env, self, writev, 3, argv, &result) != napi_ok || result == nullptr) {
+    return UV_EPROTO;
+  }
+
+  int32_t status = UV_EPROTO;
+  if (napi_get_value_int32(base->env, result, &status) != napi_ok) {
+    return UV_EPROTO;
   }
 
   if (async_out != nullptr && status == 0) {

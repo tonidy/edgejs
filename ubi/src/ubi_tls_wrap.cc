@@ -333,12 +333,18 @@ struct ParentWriteTask {
   int status = 0;
 };
 
+int TlsWrapStreamBaseWriteBuffer(UbiStreamBase* base,
+                                 napi_value req_obj,
+                                 napi_value payload,
+                                 bool* async_out);
+
 const UbiStreamBaseOps kTlsWrapOps = {
     nullptr,
     nullptr,
     nullptr,
     nullptr,
     nullptr,
+    TlsWrapStreamBaseWriteBuffer,
 };
 
 std::unordered_map<napi_env, TlsBindingState> g_tls_states;
@@ -914,14 +920,17 @@ void CompleteReq(TlsWrap* wrap, napi_ref* req_ref, int status) {
     return;
   }
   napi_value req_obj = GetRefValue(wrap->env, *req_ref);
-  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-  napi_value argv[3] = {
-      MakeInt32(wrap->env, status),
-      self != nullptr ? self : Undefined(wrap->env),
-      status < 0 ? GetNamedValue(wrap->env, req_obj, "error") : Undefined(wrap->env),
-  };
-  UbiStreamBaseInvokeReqOnComplete(wrap->env, req_obj, status, argv, 3);
+  if (req_obj != nullptr) {
+    UbiStreamBaseEmitAfterWrite(&wrap->base, req_obj, status);
+  }
   DeleteRefIfPresent(wrap->env, req_ref);
+}
+
+void CompleteReqNextTurn(TlsWrap* wrap, napi_ref* req_ref, int status) {
+  if (wrap == nullptr || req_ref == nullptr || *req_ref == nullptr) return;
+  if (!ScheduleReqCompletion(wrap, req_ref, status)) {
+    CompleteReq(wrap, req_ref, status);
+  }
 }
 
 void MaybeFinishActiveWrite(TlsWrap* wrap, int status) {
@@ -1561,13 +1570,9 @@ napi_value RunDeferredReqCompletionTask(napi_env env, napi_callback_info info) {
 
   napi_value self = GetRefValue(env, task->self_ref);
   napi_value req_obj = GetRefValue(env, task->req_ref);
-  if (self != nullptr && req_obj != nullptr) {
-    napi_value argv[3] = {
-        MakeInt32(env, task->status),
-        self,
-        task->status < 0 ? GetNamedValue(env, req_obj, "error") : Undefined(env),
-    };
-    UbiStreamBaseInvokeReqOnComplete(env, req_obj, task->status, argv, 3);
+  TlsWrap* wrap = self != nullptr ? FindWrapBySelf(env, self) : nullptr;
+  if (wrap != nullptr && req_obj != nullptr) {
+    UbiStreamBaseEmitAfterWrite(&wrap->base, req_obj, task->status);
   }
   DeleteDeferredReqCompletionTask(env, task);
   return Undefined(env);
@@ -2037,7 +2042,11 @@ bool PumpPendingAppWrites(TlsWrap* wrap) {
         QueueEncryptedWrite(wrap, std::move(encrypted), completion_req_ref);
         TryStartParentWrite(wrap);
       } else {
-        QueueEncryptedWrite(wrap, std::vector<uint8_t>(), completion_req_ref, true);
+        CompleteReqNextTurn(wrap, &completion_req_ref, 0);
+        if (is_current_write) {
+          wrap->write_callback_scheduled = false;
+          CompleteReqNextTurn(wrap, &wrap->active_write_req_ref, 0);
+        }
       }
       made_progress = true;
       continue;
@@ -2057,7 +2066,11 @@ bool PumpPendingAppWrites(TlsWrap* wrap) {
         QueueEncryptedWrite(wrap, std::move(encrypted), completion_req_ref);
         TryStartParentWrite(wrap);
       } else {
-        QueueEncryptedWrite(wrap, std::vector<uint8_t>(), completion_req_ref, true);
+        CompleteReqNextTurn(wrap, &completion_req_ref, 0);
+        if (is_current_write) {
+          wrap->write_callback_scheduled = false;
+          CompleteReqNextTurn(wrap, &wrap->active_write_req_ref, 0);
+        }
       }
       made_progress = true;
       continue;
@@ -2211,7 +2224,8 @@ napi_value TlsWrapCtor(napi_env env, napi_callback_info info) {
 napi_value TlsWrapReadStart(napi_env env, napi_callback_info info) {
   TlsWrap* wrap = UnwrapThis(env, info, nullptr, nullptr, nullptr);
   if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
-  const int32_t rc = CallParentMethodInt(wrap, "readStart", 0, nullptr, nullptr);
+  int32_t rc = CallParentMethodInt(wrap, "readStart", 0, nullptr, nullptr);
+  if (rc == UV_EALREADY) rc = 0;
   UbiStreamBaseSetReading(&wrap->base, rc == 0);
   return MakeInt32(env, rc);
 }
@@ -2219,7 +2233,8 @@ napi_value TlsWrapReadStart(napi_env env, napi_callback_info info) {
 napi_value TlsWrapReadStop(napi_env env, napi_callback_info info) {
   TlsWrap* wrap = UnwrapThis(env, info, nullptr, nullptr, nullptr);
   if (wrap == nullptr) return MakeInt32(env, UV_EINVAL);
-  const int32_t rc = CallParentMethodInt(wrap, "readStop", 0, nullptr, nullptr);
+  int32_t rc = CallParentMethodInt(wrap, "readStop", 0, nullptr, nullptr);
+  if (rc == UV_EALREADY) rc = 0;
   UbiStreamBaseSetReading(&wrap->base, false);
   return MakeInt32(env, rc);
 }
@@ -2228,7 +2243,9 @@ int32_t QueueAppWrite(TlsWrap* wrap, napi_value req_obj, const uint8_t* data, si
   if (wrap == nullptr || wrap->ssl == nullptr) return UV_EINVAL;
   PendingAppWrite pending;
   if (req_obj != nullptr) napi_create_reference(wrap->env, req_obj, 1, &pending.req_ref);
-  pending.data.assign(data, data + len);
+  if (data != nullptr && len > 0) {
+    pending.data.assign(data, data + len);
+  }
   wrap->pending_app_writes.push_back(std::move(pending));
   wrap->base.bytes_written += len;
   SetState(wrap->env, kUbiBytesWritten, static_cast<int32_t>(len));
@@ -2237,6 +2254,30 @@ int32_t QueueAppWrite(TlsWrap* wrap, napi_value req_obj, const uint8_t* data, si
   SetState(wrap->env, kUbiBytesWritten, static_cast<int32_t>(len));
   SetState(wrap->env, kUbiLastWriteWasAsync, 1);
   return 0;
+}
+
+int TlsWrapStreamBaseWriteBuffer(UbiStreamBase* base,
+                                 napi_value req_obj,
+                                 napi_value payload,
+                                 bool* async_out) {
+  if (async_out != nullptr) *async_out = false;
+  if (base == nullptr || base->env == nullptr) return UV_EINVAL;
+  auto* wrap = reinterpret_cast<TlsWrap*>(
+      reinterpret_cast<char*>(base) - offsetof(TlsWrap, base));
+  if (wrap == nullptr || wrap->ssl == nullptr) return UV_EINVAL;
+
+  const uint8_t* data = nullptr;
+  size_t len = 0;
+  bool refable = false;
+  std::string temp_utf8;
+  if (!UbiStreamBaseExtractByteSpan(base->env, payload, &data, &len, &refable, &temp_utf8) ||
+      (len > 0 && data == nullptr)) {
+    return UV_EINVAL;
+  }
+
+  const int32_t rc = QueueAppWrite(wrap, req_obj, data, len);
+  if (async_out != nullptr && rc == 0) *async_out = true;
+  return rc;
 }
 
 napi_value TlsWrapWriteBuffer(napi_env env, napi_callback_info info) {

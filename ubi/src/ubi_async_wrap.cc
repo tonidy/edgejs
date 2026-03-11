@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "internal_binding/binding_async_wrap.h"
+#include "unofficial_napi.h"
 #include <unordered_map>
 #include <unordered_set>
 
@@ -15,6 +16,7 @@ namespace {
 struct AsyncWrapCache {
   napi_ref binding_ref = nullptr;
   napi_ref async_id_fields_ref = nullptr;
+  std::unordered_map<int64_t, napi_ref> context_frame_refs;
 };
 
 std::unordered_map<napi_env, AsyncWrapCache> g_async_wrap_cache;
@@ -31,6 +33,10 @@ void OnAsyncWrapEnvCleanup(void* data) {
   g_async_wrap_cleanup_hooks.erase(env);
   auto it = g_async_wrap_cache.find(env);
   if (it == g_async_wrap_cache.end()) return;
+  for (auto& entry : it->second.context_frame_refs) {
+    ResetRef(env, &entry.second);
+  }
+  it->second.context_frame_refs.clear();
   ResetRef(env, &it->second.binding_ref);
   ResetRef(env, &it->second.async_id_fields_ref);
   g_async_wrap_cache.erase(it);
@@ -96,6 +102,112 @@ napi_value ResolveInternalBinding(napi_env env, const char* name) {
 AsyncWrapCache& GetCache(napi_env env) {
   EnsureAsyncWrapCleanupHook(env);
   return g_async_wrap_cache[env];
+}
+
+bool GetPerIsolateSymbol(napi_env env, const char* name, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  if (env == nullptr || name == nullptr) return false;
+  napi_value symbols = UbiGetPerIsolateSymbols(env);
+  return symbols != nullptr &&
+         napi_get_named_property(env, symbols, name, out) == napi_ok &&
+         *out != nullptr;
+}
+
+bool SetResourceAsyncIds(napi_env env, napi_value resource, int64_t async_id, int64_t trigger_async_id) {
+  if (env == nullptr || resource == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, resource, &type) != napi_ok || (type != napi_object && type != napi_function)) {
+    return false;
+  }
+
+  napi_value async_id_symbol = nullptr;
+  napi_value trigger_async_id_symbol = nullptr;
+  if (!GetPerIsolateSymbol(env, "async_id_symbol", &async_id_symbol) ||
+      !GetPerIsolateSymbol(env, "trigger_async_id_symbol", &trigger_async_id_symbol)) {
+    return false;
+  }
+
+  napi_value async_id_value = nullptr;
+  napi_value trigger_async_id_value = nullptr;
+  if (napi_create_int64(env, async_id, &async_id_value) != napi_ok ||
+      napi_create_int64(env, trigger_async_id, &trigger_async_id_value) != napi_ok ||
+      async_id_value == nullptr ||
+      trigger_async_id_value == nullptr) {
+    return false;
+  }
+
+  return napi_set_property(env, resource, async_id_symbol, async_id_value) == napi_ok &&
+         napi_set_property(env, resource, trigger_async_id_symbol, trigger_async_id_value) == napi_ok;
+}
+
+int64_t GetResourceAsyncId(napi_env env, napi_value resource, const char* symbol_name) {
+  if (env == nullptr || resource == nullptr || symbol_name == nullptr) return 0;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, resource, &type) != napi_ok || (type != napi_object && type != napi_function)) {
+    return 0;
+  }
+
+  napi_value symbol = nullptr;
+  napi_value value = nullptr;
+  int64_t out = 0;
+  if (!GetPerIsolateSymbol(env, symbol_name, &symbol) ||
+      napi_get_property(env, resource, symbol, &value) != napi_ok ||
+      value == nullptr ||
+      napi_get_value_int64(env, value, &out) != napi_ok) {
+    return 0;
+  }
+  return out;
+}
+
+napi_value GetCurrentAsyncContextFrame(napi_env env) {
+  if (env == nullptr) return nullptr;
+  napi_value value = nullptr;
+  if (unofficial_napi_get_continuation_preserved_embedder_data(env, &value) != napi_ok) {
+    return nullptr;
+  }
+  return value;
+}
+
+void SetCurrentAsyncContextFrame(napi_env env, napi_value value) {
+  if (env == nullptr) return;
+  if (value == nullptr) {
+    napi_get_undefined(env, &value);
+  }
+  (void)unofficial_napi_set_continuation_preserved_embedder_data(env, value);
+}
+
+void StoreAsyncContextFrame(napi_env env, int64_t async_id) {
+  if (env == nullptr || async_id <= 0) return;
+  AsyncWrapCache& cache = GetCache(env);
+  auto it = cache.context_frame_refs.find(async_id);
+  if (it != cache.context_frame_refs.end()) {
+    ResetRef(env, &it->second);
+    cache.context_frame_refs.erase(it);
+  }
+
+  napi_value frame = GetCurrentAsyncContextFrame(env);
+  if (frame == nullptr) return;
+  napi_ref ref = nullptr;
+  if (napi_create_reference(env, frame, 1, &ref) != napi_ok || ref == nullptr) return;
+  cache.context_frame_refs.emplace(async_id, ref);
+}
+
+void DeleteStoredAsyncContextFrame(napi_env env, int64_t async_id) {
+  if (env == nullptr || async_id <= 0) return;
+  AsyncWrapCache& cache = GetCache(env);
+  auto it = cache.context_frame_refs.find(async_id);
+  if (it == cache.context_frame_refs.end()) return;
+  ResetRef(env, &it->second);
+  cache.context_frame_refs.erase(it);
+}
+
+napi_value GetStoredAsyncContextFrame(napi_env env, int64_t async_id) {
+  if (env == nullptr || async_id <= 0) return nullptr;
+  AsyncWrapCache& cache = GetCache(env);
+  auto it = cache.context_frame_refs.find(async_id);
+  if (it == cache.context_frame_refs.end()) return nullptr;
+  return GetRefValue(env, it->second);
 }
 
 napi_value GetAsyncWrapBinding(napi_env env) {
@@ -263,6 +375,10 @@ void UbiAsyncWrapEmitInitString(napi_env env,
                                 int64_t trigger_async_id,
                                 napi_value resource) {
   if (env == nullptr || async_id <= 0 || type == nullptr) return;
+  StoreAsyncContextFrame(env, async_id);
+  if (resource != nullptr) {
+    (void)SetResourceAsyncIds(env, resource, async_id, trigger_async_id);
+  }
   napi_value hooks = internal_binding::AsyncWrapGetHooksObject(env);
   if (hooks == nullptr) return;
 
@@ -342,18 +458,37 @@ napi_status UbiAsyncWrapMakeCallback(napi_env env,
                                      napi_value* result,
                                      int flags) {
   if (env == nullptr || recv == nullptr || callback == nullptr) return napi_invalid_arg;
-  if (async_id < 0) {
-    return UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
+  napi_value effective_resource = resource != nullptr ? resource : recv;
+  bool pushed_async_context = false;
+  napi_value prior_context_frame = nullptr;
+  bool swapped_context_frame = false;
+  if (async_id > 0 && effective_resource != nullptr) {
+    int64_t trigger_async_id = GetResourceAsyncId(env, effective_resource, "trigger_async_id_symbol");
+    if (trigger_async_id <= 0) trigger_async_id = UbiAsyncWrapExecutionAsyncId(env);
+    UbiAsyncWrapPushContext(env, async_id, trigger_async_id, effective_resource);
+    pushed_async_context = true;
+  }
+  if (async_id > 0) {
+    prior_context_frame = GetCurrentAsyncContextFrame(env);
+    SetCurrentAsyncContextFrame(env, GetStoredAsyncContextFrame(env, async_id));
+    swapped_context_frame = true;
   }
 
   napi_value trampoline = internal_binding::AsyncWrapGetCallbackTrampoline(env);
+  napi_status status = napi_ok;
   if (trampoline == nullptr) {
-    return UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
+    status = UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
+    if (swapped_context_frame) SetCurrentAsyncContextFrame(env, prior_context_frame);
+    if (pushed_async_context) UbiAsyncWrapPopContext(env, async_id);
+    return status;
   }
 
   napi_valuetype trampoline_type = napi_undefined;
   if (napi_typeof(env, trampoline, &trampoline_type) != napi_ok || trampoline_type != napi_function) {
-    return UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
+    status = UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
+    if (swapped_context_frame) SetCurrentAsyncContextFrame(env, prior_context_frame);
+    if (pushed_async_context) UbiAsyncWrapPopContext(env, async_id);
+    return status;
   }
 
   napi_value async_id_v = nullptr;
@@ -366,12 +501,16 @@ napi_status UbiAsyncWrapMakeCallback(napi_env env,
   for (size_t i = 0; i < argc; ++i) {
     trampoline_argv.push_back(argv != nullptr ? argv[i] : internal_binding::Undefined(env));
   }
-  return UbiMakeCallbackWithFlags(
+  status = UbiMakeCallbackWithFlags(
       env, recv, trampoline, trampoline_argv.size(), trampoline_argv.data(), result, flags);
+  if (swapped_context_frame) SetCurrentAsyncContextFrame(env, prior_context_frame);
+  if (pushed_async_context) UbiAsyncWrapPopContext(env, async_id);
+  return status;
 }
 
 void UbiAsyncWrapQueueDestroyId(napi_env env, int64_t async_id) {
   if (env == nullptr || async_id <= 0) return;
+  DeleteStoredAsyncContextFrame(env, async_id);
   internal_binding::AsyncWrapQueueDestroyId(env, static_cast<double>(async_id));
 }
 

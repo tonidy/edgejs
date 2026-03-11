@@ -25,6 +25,7 @@ napi_value ResolveFsEventWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveFs(napi_env env, const ResolveOptions& options);
 napi_value ResolveFsDir(napi_env env, const ResolveOptions& options);
 napi_value ResolveHeapUtils(napi_env env, const ResolveOptions& options);
+napi_value ResolveHttp2(napi_env env, const ResolveOptions& options);
 napi_value ResolveHttpParser(napi_env env, const ResolveOptions& options);
 napi_value ResolveIcu(napi_env env, const ResolveOptions& options);
 napi_value ResolveJsUdpWrap(napi_env env, const ResolveOptions& options);
@@ -46,6 +47,7 @@ napi_value ResolveSea(napi_env env, const ResolveOptions& options);
 napi_value ResolveSignalWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveSerdes(napi_env env, const ResolveOptions& options);
 napi_value ResolveSpawnSync(napi_env env, const ResolveOptions& options);
+napi_value ResolveStreamPipe(napi_env env, const ResolveOptions& options);
 napi_value ResolveStreamWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveStringDecoder(napi_env env, const ResolveOptions& options);
 napi_value ResolveSymbols(napi_env env, const ResolveOptions& options);
@@ -75,7 +77,7 @@ struct BindingResolverEntry {
   ResolverFn resolver;
 };
 
-constexpr std::array<BindingResolverEntry, 58> kResolvers = {{
+constexpr std::array<BindingResolverEntry, 60> kResolvers = {{
     {"async_wrap", ResolveAsyncWrap},
     {"async_context_frame", ResolveAsyncContextFrame},
     {"block_list", ResolveBlockList},
@@ -94,6 +96,7 @@ constexpr std::array<BindingResolverEntry, 58> kResolvers = {{
     {"fs", ResolveFs},
     {"fs_dir", ResolveFsDir},
     {"heap_utils", ResolveHeapUtils},
+    {"http2", ResolveHttp2},
     {"http_parser", ResolveHttpParser},
     {"icu", ResolveIcu},
     {"js_udp_wrap", ResolveJsUdpWrap},
@@ -115,6 +118,7 @@ constexpr std::array<BindingResolverEntry, 58> kResolvers = {{
     {"serdes", ResolveSerdes},
     {"signal_wrap", ResolveSignalWrap},
     {"spawn_sync", ResolveSpawnSync},
+    {"stream_pipe", ResolveStreamPipe},
     {"stream_wrap", ResolveStreamWrap},
     {"string_decoder", ResolveStringDecoder},
     {"symbols", ResolveSymbols},

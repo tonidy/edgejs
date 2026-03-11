@@ -1,4 +1,5 @@
 #include "internal_binding/dispatch.h"
+#include "internal_binding/binding_performance.h"
 
 #include <chrono>
 #include <cstdint>
@@ -36,6 +37,8 @@ enum PerformanceEntryType {
 struct PerformanceBindingState {
   napi_ref binding_ref = nullptr;
   napi_ref milestones_ref = nullptr;
+  napi_ref observer_counts_ref = nullptr;
+  napi_ref observer_callback_ref = nullptr;
   uint64_t time_origin_ns = 0;
   double time_origin_timestamp_us = 0;
 };
@@ -57,6 +60,8 @@ void OnPerformanceEnvCleanup(void* data) {
   if (it == g_performance_states.end()) return;
   DeleteRefIfPresent(env, &it->second.binding_ref);
   DeleteRefIfPresent(env, &it->second.milestones_ref);
+  DeleteRefIfPresent(env, &it->second.observer_counts_ref);
+  DeleteRefIfPresent(env, &it->second.observer_callback_ref);
   g_performance_states.erase(it);
 }
 
@@ -182,7 +187,21 @@ napi_value HistogramConstructorCallback(napi_env env, napi_callback_info /*info*
   return out != nullptr ? out : Undefined(env);
 }
 
-napi_value SetupObserversCallback(napi_env env, napi_callback_info /*info*/) {
+napi_value SetupObserversCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
+    return Undefined(env);
+  }
+  auto it = g_performance_states.find(env);
+  if (it == g_performance_states.end()) return Undefined(env);
+  DeleteRefIfPresent(env, &it->second.observer_callback_ref);
+  if (argc >= 1 && argv[0] != nullptr) {
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, argv[0], &type) == napi_ok && type == napi_function) {
+      (void)napi_create_reference(env, argv[0], 1, &it->second.observer_callback_ref);
+    }
+  }
   return Undefined(env);
 }
 
@@ -194,7 +213,23 @@ napi_value RemoveGarbageCollectionTrackingCallback(napi_env env, napi_callback_i
   return Undefined(env);
 }
 
-napi_value NotifyCallback(napi_env env, napi_callback_info /*info*/) {
+napi_value NotifyCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 5;
+  napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
+    return Undefined(env);
+  }
+  auto it = g_performance_states.find(env);
+  if (it == g_performance_states.end() || it->second.observer_callback_ref == nullptr) {
+    return Undefined(env);
+  }
+  napi_value callback = nullptr;
+  if (napi_get_reference_value(env, it->second.observer_callback_ref, &callback) != napi_ok || callback == nullptr) {
+    return Undefined(env);
+  }
+  napi_value global = GetGlobal(env);
+  napi_value ignored = nullptr;
+  (void)napi_call_function(env, global, callback, argc, argv, &ignored);
   return Undefined(env);
 }
 
@@ -259,6 +294,49 @@ void SetMilestoneValue(napi_env env, napi_value milestones, uint32_t index, doub
 
 }  // namespace
 
+bool PerformanceHasObserver(napi_env env, uint32_t type_index) {
+  auto it = g_performance_states.find(env);
+  if (it == g_performance_states.end() || it->second.observer_counts_ref == nullptr) return false;
+  napi_value observer_counts = nullptr;
+  if (napi_get_reference_value(env, it->second.observer_counts_ref, &observer_counts) != napi_ok ||
+      observer_counts == nullptr) {
+    return false;
+  }
+  napi_value count_value = nullptr;
+  if (napi_get_element(env, observer_counts, type_index, &count_value) != napi_ok || count_value == nullptr) {
+    return false;
+  }
+  double count = 0;
+  if (napi_get_value_double(env, count_value, &count) != napi_ok) return false;
+  return count > 0;
+}
+
+void PerformanceEmitEntry(napi_env env,
+                          const char* name,
+                          const char* entry_type,
+                          double start_time,
+                          double duration,
+                          napi_value details) {
+  auto it = g_performance_states.find(env);
+  if (it == g_performance_states.end() || it->second.observer_callback_ref == nullptr) return;
+  napi_value callback = nullptr;
+  if (napi_get_reference_value(env, it->second.observer_callback_ref, &callback) != napi_ok || callback == nullptr) {
+    return;
+  }
+
+  napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, details != nullptr ? details : Undefined(env)};
+  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &argv[0]) != napi_ok ||
+      napi_create_string_utf8(env, entry_type, NAPI_AUTO_LENGTH, &argv[1]) != napi_ok ||
+      napi_create_double(env, start_time, &argv[2]) != napi_ok ||
+      napi_create_double(env, duration, &argv[3]) != napi_ok) {
+    return;
+  }
+
+  napi_value global = GetGlobal(env);
+  napi_value ignored = nullptr;
+  (void)napi_call_function(env, global, callback, 5, argv, &ignored);
+}
+
 napi_value ResolvePerformance(napi_env env, const ResolveOptions& /*options*/) {
   EnsurePerformanceCleanupHook(env);
   const napi_value undefined = Undefined(env);
@@ -298,6 +376,8 @@ napi_value ResolvePerformance(napi_env env, const ResolveOptions& /*options*/) {
     for (uint32_t i = 0; i < kEntryInvalid; i++) {
       SetMilestoneValue(env, observer_counts, i, 0);
     }
+    DeleteRefIfPresent(env, &state.observer_counts_ref);
+    napi_create_reference(env, observer_counts, 1, &state.observer_counts_ref);
     napi_set_named_property(env, out, "observerCounts", observer_counts);
   }
 

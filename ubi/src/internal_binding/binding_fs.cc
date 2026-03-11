@@ -1528,8 +1528,8 @@ void FileHandleFinalize(napi_env env, void* data, void* /*hint*/) {
 }
 
 napi_value FileHandleCtor(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
   napi_value this_arg = nullptr;
   napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   if (this_arg == nullptr) return nullptr;
@@ -1537,7 +1537,17 @@ napi_value FileHandleCtor(napi_env env, napi_callback_info info) {
   wrap->env = env;
   wrap->async_id = g_next_file_handle_async_id++;
   if (argc >= 1 && argv[0] != nullptr) napi_get_value_int32(env, argv[0], &wrap->fd);
+  int64_t offset = 0;
+  int64_t length = -1;
+  if (argc >= 2 && argv[1] != nullptr) (void)napi_get_value_int64(env, argv[1], &offset);
+  if (argc >= 3 && argv[2] != nullptr) (void)napi_get_value_int64(env, argv[2], &length);
+  napi_value offset_value = nullptr;
+  napi_value length_value = nullptr;
+  napi_create_int64(env, offset, &offset_value);
+  napi_create_int64(env, length, &length_value);
   napi_wrap(env, this_arg, wrap, FileHandleFinalize, nullptr, &wrap->wrapper_ref);
+  if (offset_value != nullptr) napi_set_named_property(env, this_arg, "offset", offset_value);
+  if (length_value != nullptr) napi_set_named_property(env, this_arg, "length", length_value);
   return this_arg;
 }
 
