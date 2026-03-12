@@ -11,7 +11,6 @@
 #include "edge_async_wrap.h"
 #include "edge_runtime.h"
 #include "edge_stream_base.h"
-#include "edge_stream_listener.h"
 #include "edge_stream_wrap.h"
 
 namespace {
@@ -19,8 +18,6 @@ namespace {
 struct JsStreamWrap {
   napi_env env = nullptr;
   EdgeStreamBase base{};
-  std::vector<uint8_t> pending_read;
-  bool pending_eof = false;
 };
 
 JsStreamWrap* FromBase(EdgeStreamBase* base) {
@@ -64,8 +61,11 @@ bool IsFunction(napi_env env, napi_value value) {
   return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
 }
 
-bool HasOnRead(const JsStreamWrap* wrap) {
-  return wrap != nullptr && wrap->base.onread_ref != nullptr;
+napi_value GetNamedValue(napi_env env, napi_value obj, const char* key) {
+  if (env == nullptr || obj == nullptr || key == nullptr) return nullptr;
+  napi_value out = nullptr;
+  if (napi_get_named_property(env, obj, key, &out) != napi_ok) return nullptr;
+  return out;
 }
 
 std::string ValueToUtf8(napi_env env, napi_value value) {
@@ -88,15 +88,14 @@ int32_t CallMethodReturningInt32(napi_env env,
                                  size_t argc,
                                  napi_value* argv,
                                  int32_t fallback) {
+  (void)async_id;
   if (env == nullptr || self == nullptr || method_name == nullptr) return fallback;
   napi_value fn = nullptr;
   if (napi_get_named_property(env, self, method_name, &fn) != napi_ok || !IsFunction(env, fn)) {
     return fallback;
   }
   napi_value result = nullptr;
-  if (EdgeAsyncWrapMakeCallback(
-          env, async_id, self, self, fn, argc, argv, &result, kEdgeMakeCallbackNone) != napi_ok ||
-      result == nullptr) {
+  if (napi_call_function(env, self, fn, argc, argv, &result) != napi_ok || result == nullptr) {
     return fallback;
   }
   int32_t out = fallback;
@@ -313,13 +312,6 @@ napi_value JsStreamReadBuffer(napi_env env, napi_callback_info info) {
   std::string temp_utf8;
   EdgeStreamBaseExtractByteSpan(env, argv[0], &data, &len, &refable, &temp_utf8);
 
-  if (!HasOnRead(wrap)) {
-    if (data != nullptr && len > 0) {
-      wrap->pending_read.insert(wrap->pending_read.end(), data, data + len);
-    }
-    return EdgeStreamBaseUndefined(env);
-  }
-
   while (len != 0) {
     uv_buf_t buf = uv_buf_init(nullptr, 0);
     if (!EdgeStreamEmitAlloc(&wrap->base.listener_state, len, &buf) || buf.base == nullptr || buf.len == 0) {
@@ -341,10 +333,6 @@ napi_value JsStreamReadBuffer(napi_env env, napi_callback_info info) {
 napi_value JsStreamEmitEOF(napi_env env, napi_callback_info info) {
   JsStreamWrap* wrap = nullptr;
   if (!GetThisAndWrap(env, info, nullptr, nullptr, nullptr, &wrap) || wrap == nullptr) {
-    return EdgeStreamBaseUndefined(env);
-  }
-  if (!HasOnRead(wrap)) {
-    wrap->pending_eof = true;
     return EdgeStreamBaseUndefined(env);
   }
   EdgeStreamEmitRead(&wrap->base.listener_state, UV_EOF, nullptr);
@@ -388,33 +376,7 @@ napi_value JsStreamSetOnRead(napi_env env, napi_callback_info info) {
   napi_value argv[1] = {nullptr};
   JsStreamWrap* wrap = nullptr;
   GetThisAndWrap(env, info, &argc, argv, nullptr, &wrap);
-  napi_value result = EdgeStreamBaseSetOnRead(wrap != nullptr ? &wrap->base : nullptr, argc > 0 ? argv[0] : nullptr);
-  if (wrap != nullptr && HasOnRead(wrap)) {
-    const uint8_t* data = wrap->pending_read.data();
-    size_t len = wrap->pending_read.size();
-    while (len != 0) {
-      uv_buf_t buf = uv_buf_init(nullptr, 0);
-      if (!EdgeStreamEmitAlloc(&wrap->base.listener_state, len, &buf) || buf.base == nullptr || buf.len == 0) {
-        break;
-      }
-      size_t available = len;
-      if (buf.len < available) available = buf.len;
-      memcpy(buf.base, data, available);
-      data += available;
-      len -= available;
-      wrap->base.bytes_read += available;
-      if (!EdgeStreamEmitRead(&wrap->base.listener_state, static_cast<ssize_t>(available), &buf) &&
-          buf.base != nullptr) {
-        free(buf.base);
-      }
-    }
-    wrap->pending_read.clear();
-    if (wrap->pending_eof) {
-      wrap->pending_eof = false;
-      EdgeStreamEmitRead(&wrap->base.listener_state, UV_EOF, nullptr);
-    }
-  }
-  return result;
+  return EdgeStreamBaseSetOnRead(wrap != nullptr ? &wrap->base : nullptr, argc > 0 ? argv[0] : nullptr);
 }
 
 napi_value JsStreamGetAsyncId(napi_env env, napi_callback_info info) {

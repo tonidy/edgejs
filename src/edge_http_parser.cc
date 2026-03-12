@@ -1,6 +1,7 @@
 #include "edge_http_parser.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -78,6 +79,8 @@ struct Parser {
   bool got_exception = false;
   bool pending_pause = false;
   bool headers_completed = false;
+  bool trim_header_value_prefix = false;
+  bool propagate_callback_exceptions = false;
   uint64_t header_nread = 0;
   uint64_t chunk_extensions_nread = 0;
   uint64_t max_http_header_size = 8 * 1024;
@@ -122,12 +125,14 @@ napi_value CreateUint8ArrayCopy(napi_env env, const char* data, size_t length);
 napi_value CreateBufferCopy(napi_env env, const char* data, size_t length);
 napi_value GetWrappedObject(napi_env env, napi_ref ref);
 int FlushHeadersToJs(Parser* p);
+void ClearConsumedStreamBinding(Parser* p);
 void ParserDetachFromConnectionsList(Parser* p);
 void ParserQueueDestroy(Parser* p);
 bool DispatchConsumedParserRead(Parser* p,
                                 napi_value parser_obj,
                                 const char* data,
                                 size_t len);
+bool ParserShouldIgnoreConsumedRead(Parser* p, napi_value parser_obj);
 
 bool AcquireParserReadBuffer(napi_env env, size_t suggested_size, uv_buf_t* out) {
   if (env == nullptr || out == nullptr) return false;
@@ -191,6 +196,11 @@ bool ParserConsumedListenerOnRead(EdgeStreamListener* listener,
 
   napi_value parser_obj = GetWrappedObject(p->env, p->wrapper_ref);
   if (parser_obj != nullptr) {
+    if (ParserShouldIgnoreConsumedRead(p, parser_obj)) {
+      release();
+      ClearConsumedStreamBinding(p);
+      return true;
+    }
     (void)DispatchConsumedParserRead(
         p,
         parser_obj,
@@ -292,6 +302,51 @@ napi_value CreateBufferCopy(napi_env env, const char* data, size_t length) {
   return out;
 }
 
+bool ParserShouldIgnoreConsumedRead(Parser* p, napi_value parser_obj) {
+  if (p == nullptr || parser_obj == nullptr) return false;
+
+  napi_value socket = nullptr;
+  napi_valuetype socket_type = napi_undefined;
+  if (napi_get_named_property(p->env, parser_obj, "socket", &socket) != napi_ok ||
+      socket == nullptr ||
+      napi_typeof(p->env, socket, &socket_type) != napi_ok ||
+      socket_type != napi_object) {
+    return false;
+  }
+
+  napi_value destroyed_value = nullptr;
+  bool destroyed = false;
+  if (napi_get_named_property(p->env, socket, "destroyed", &destroyed_value) == napi_ok &&
+      destroyed_value != nullptr &&
+      napi_get_value_bool(p->env, destroyed_value, &destroyed) == napi_ok &&
+      destroyed) {
+    return true;
+  }
+
+  napi_value socket_parser = nullptr;
+  napi_valuetype socket_parser_type = napi_undefined;
+  if (napi_get_named_property(p->env, socket, "parser", &socket_parser) == napi_ok &&
+      socket_parser != nullptr &&
+      napi_typeof(p->env, socket_parser, &socket_parser_type) == napi_ok &&
+      (socket_parser_type == napi_object || socket_parser_type == napi_function)) {
+    bool same_parser = false;
+    if (napi_strict_equals(p->env, socket_parser, parser_obj, &same_parser) == napi_ok &&
+        !same_parser) {
+      return true;
+    }
+  }
+
+  napi_value handle = nullptr;
+  napi_valuetype handle_type = napi_undefined;
+  if (napi_get_named_property(p->env, socket, "_handle", &handle) == napi_ok &&
+      napi_typeof(p->env, handle, &handle_type) == napi_ok &&
+      (handle_type == napi_null || handle_type == napi_undefined)) {
+    return true;
+  }
+
+  return false;
+}
+
 int CallIndexedNoArgs(Parser* p, uint32_t index, bool skip_task_queues = false) {
   napi_value self = GetWrappedObject(p->env, p->wrapper_ref);
   if (self == nullptr) return 0;
@@ -302,9 +357,15 @@ int CallIndexedNoArgs(Parser* p, uint32_t index, bool skip_task_queues = false) 
   if (t != napi_function) return 0;
   napi_value result = nullptr;
   bool has_pending = false;
-  const int callback_flags =
-      skip_task_queues ? kEdgeMakeCallbackSkipTaskQueues : kEdgeMakeCallbackNone;
-  if (EdgeMakeCallbackWithFlags(p->env, self, cb, 0, nullptr, &result, callback_flags) != napi_ok ||
+  napi_status status = napi_ok;
+  if (p->propagate_callback_exceptions) {
+    status = napi_call_function(p->env, self, cb, 0, nullptr, &result);
+  } else {
+    const int callback_flags =
+        skip_task_queues ? kEdgeMakeCallbackSkipTaskQueues : kEdgeMakeCallbackNone;
+    status = EdgeMakeCallbackWithFlags(p->env, self, cb, 0, nullptr, &result, callback_flags);
+  }
+  if (status != napi_ok ||
       (napi_is_exception_pending(p->env, &has_pending) == napi_ok && has_pending)) {
     p->got_exception = true;
     llhttp_set_error_reason(&p->parser, "HPE_JS_EXCEPTION:JS Exception");
@@ -325,6 +386,7 @@ int ParserOnMessageBegin(llhttp_t* llp) {
   p->status_message.clear();
   p->last_was_value = false;
   p->headers_completed = false;
+  p->trim_header_value_prefix = false;
   p->chunk_extensions_nread = 0;
   p->have_flushed = false;
   p->last_message_start = uv_hrtime();
@@ -370,15 +432,27 @@ int ParserOnHeaderField(llhttp_t* llp, const char* at, size_t length) {
     p->last_was_value = false;
   }
   p->fields.back().append(at, length);
+  p->trim_header_value_prefix = false;
   return 0;
 }
 
 int ParserOnHeaderValue(llhttp_t* llp, const char* at, size_t length) {
   Parser* p = static_cast<Parser*>(llp->data);
-  if (int rv = TrackHeader(p, length); rv != 0) return rv;
-  if (p->values.size() < p->fields.size()) p->values.emplace_back();
-  p->values.back().append(at, length);
+  if (p->values.size() < p->fields.size()) {
+    p->values.emplace_back();
+    p->trim_header_value_prefix = true;
+  }
   p->last_was_value = true;
+  if (p->trim_header_value_prefix) {
+    while (length > 0 && (*at == ' ' || *at == '\t')) {
+      at++;
+      length--;
+    }
+    if (length == 0) return 0;
+    p->trim_header_value_prefix = false;
+  }
+  if (int rv = TrackHeader(p, length); rv != 0) return rv;
+  p->values.back().append(at, length);
   return 0;
 }
 
@@ -428,7 +502,10 @@ int FlushHeadersToJs(Parser* p) {
   napi_value argv[2] = {headers, url_v};
   napi_value ignored = nullptr;
   bool has_pending = false;
-  if (EdgeMakeCallback(p->env, self, cb, 2, argv, &ignored) != napi_ok ||
+  napi_status status = p->propagate_callback_exceptions
+                           ? napi_call_function(p->env, self, cb, 2, argv, &ignored)
+                           : EdgeMakeCallback(p->env, self, cb, 2, argv, &ignored);
+  if (status != napi_ok ||
       (napi_is_exception_pending(p->env, &has_pending) == napi_ok && has_pending)) {
     p->got_exception = true;
     llhttp_set_error_reason(&p->parser, "HPE_JS_EXCEPTION:JS Exception");
@@ -484,13 +561,19 @@ int ParserOnHeadersComplete(llhttp_t* llp) {
 
   napi_value result = nullptr;
   bool has_pending = false;
-  if (EdgeMakeCallbackWithFlags(p->env,
-                               self,
-                               cb,
-                               9,
-                               argv,
-                               &result,
-                               kEdgeMakeCallbackSkipTaskQueues) != napi_ok ||
+  napi_status status = napi_ok;
+  if (p->propagate_callback_exceptions) {
+    status = napi_call_function(p->env, self, cb, 9, argv, &result);
+  } else {
+    status = EdgeMakeCallbackWithFlags(p->env,
+                                       self,
+                                       cb,
+                                       9,
+                                       argv,
+                                       &result,
+                                       kEdgeMakeCallbackSkipTaskQueues);
+  }
+  if (status != napi_ok ||
       (napi_is_exception_pending(p->env, &has_pending) == napi_ok && has_pending)) {
     p->got_exception = true;
     llhttp_set_error_reason(&p->parser, "HPE_JS_EXCEPTION:JS Exception");
@@ -520,7 +603,10 @@ int ParserOnBody(llhttp_t* llp, const char* at, size_t length) {
   napi_value argv[1] = {buf};
   napi_value ignored = nullptr;
   bool has_pending = false;
-  if (EdgeMakeCallback(p->env, self, cb, 1, argv, &ignored) != napi_ok ||
+  napi_status status = p->propagate_callback_exceptions
+                           ? napi_call_function(p->env, self, cb, 1, argv, &ignored)
+                           : EdgeMakeCallback(p->env, self, cb, 1, argv, &ignored);
+  if (status != napi_ok ||
       (napi_is_exception_pending(p->env, &has_pending) == napi_ok && has_pending)) {
     p->got_exception = true;
     llhttp_set_error_reason(&p->parser, "HPE_JS_EXCEPTION:JS Exception");
@@ -639,10 +725,16 @@ napi_value ParserInitialize(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   int32_t type = HTTP_REQUEST;
   if (argc >= 1 && argv[0] != nullptr) napi_get_value_int32(env, argv[0], &type);
-  uint64_t max_header = 8 * 1024;
+  uint64_t max_header = 0;
   if (argc >= 3 && argv[2] != nullptr) {
     double d = 0;
     if (napi_get_value_double(env, argv[2], &d) == napi_ok && d > 0) max_header = static_cast<uint64_t>(d);
+  }
+  if (max_header == 0) {
+    bool found = false;
+    if (!EdgeReadExecArgvUint64Option("--max-http-header-size=", &max_header, &found) || !found) {
+      max_header = 16 * 1024;
+    }
   }
   int32_t lenient = 0;
   if (argc >= 4 && argv[3] != nullptr) napi_get_value_int32(env, argv[3], &lenient);
@@ -657,8 +749,10 @@ napi_value ParserInitialize(napi_env env, napi_callback_info info) {
   p->status_message.clear();
   p->last_was_value = false;
   p->headers_completed = false;
+  p->trim_header_value_prefix = false;
   p->have_flushed = false;
   p->got_exception = false;
+  p->propagate_callback_exceptions = false;
   ClearConsumedStreamBinding(p);
   ParserDetachFromConnectionsList(p);
   if (argc >= 5 && argv[4] != nullptr) {
@@ -839,7 +933,11 @@ napi_value ParserExecute(napi_env env, napi_callback_info info) {
       size_t available = total_len - start;
       if (len > available) len = static_cast<uint32_t>(available);
       const char* ptr = static_cast<const char*>(data) + start;
-      return ParserExecuteCommon(p, ptr, len);
+      const bool restore = p->propagate_callback_exceptions;
+      p->propagate_callback_exceptions = true;
+      napi_value result = ParserExecuteCommon(p, ptr, len);
+      p->propagate_callback_exceptions = restore;
+      return result;
     }
     napi_value zero = nullptr;
     napi_create_uint32(env, 0, &zero);
@@ -859,13 +957,21 @@ napi_value ParserExecute(napi_env env, napi_callback_info info) {
   size_t available = length - start;
   if (len > available) len = static_cast<uint32_t>(available);
   const char* ptr = static_cast<const char*>(data) + start;
-  return ParserExecuteCommon(p, ptr, len);
+  const bool restore = p->propagate_callback_exceptions;
+  p->propagate_callback_exceptions = true;
+  napi_value result = ParserExecuteCommon(p, ptr, len);
+  p->propagate_callback_exceptions = restore;
+  return result;
 }
 
 napi_value ParserFinish(napi_env env, napi_callback_info info) {
   Parser* p = Unwrap<Parser>(env, info);
   if (p == nullptr) return nullptr;
-  return ParserExecuteCommon(p, nullptr, 0);
+  const bool restore = p->propagate_callback_exceptions;
+  p->propagate_callback_exceptions = true;
+  napi_value result = ParserExecuteCommon(p, nullptr, 0);
+  p->propagate_callback_exceptions = restore;
+  return result;
 }
 
 napi_value ParserPause(napi_env env, napi_callback_info info) {
@@ -896,7 +1002,12 @@ napi_value ParserConsume(napi_env env, napi_callback_info info) {
     ClearConsumedStreamBinding(p);
     if (argc >= 1 && argv[0] != nullptr && self != nullptr) {
       EdgeStreamBase* stream = EdgeStreamBaseFromValue(env, argv[0]);
-      if (stream != nullptr && EdgeStreamBasePushListener(stream, &p->consumed_listener)) {
+      if (stream == nullptr) {
+        std::fputs("HTTPParser.consume() failed: invalid stream handle\n", stderr);
+        std::fflush(stderr);
+        std::abort();
+      }
+      if (EdgeStreamBasePushListener(stream, &p->consumed_listener)) {
         p->consumed_stream = stream;
       }
     }
@@ -1045,8 +1156,10 @@ napi_value ConnectionsListExpired(napi_env env, napi_callback_info info) {
 
   std::vector<Parser*> expired;
   for (Parser* p : list->active) {
-    const bool header_expired = !p->headers_completed && headers_deadline > 0 && p->last_message_start < headers_deadline;
-    const bool req_expired = request_deadline > 0 && p->last_message_start < request_deadline;
+    const bool header_expired =
+        !p->headers_completed && headers_deadline > 0 && p->last_message_start <= headers_deadline;
+    const bool req_expired =
+        request_deadline > 0 && p->last_message_start <= request_deadline;
     if (header_expired || req_expired) expired.push_back(p);
   }
   for (Parser* p : expired) list->active.erase(p);

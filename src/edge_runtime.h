@@ -32,6 +32,7 @@ bool EdgeInitializeOpenSslForCli(std::string* error_out);
 void EdgeSetScriptArgv(const std::vector<std::string>& script_argv);
 void EdgeSetExecArgv(const std::vector<std::string>& exec_argv);
 bool EdgeExecArgvHasFlag(const char* flag);
+bool EdgeReadExecArgvUint64Option(const char* prefix, uint64_t* out, bool* found);
 
 enum EdgeMakeCallbackFlags : int {
   kEdgeMakeCallbackNone = 0,

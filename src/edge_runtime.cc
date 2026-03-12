@@ -2911,6 +2911,10 @@ bool EdgeExecArgvHasFlag(const char* flag) {
   return ExecArgvHasFlag(flag);
 }
 
+bool EdgeReadExecArgvUint64Option(const char* prefix, uint64_t* out, bool* found) {
+  return ReadExecArgvUint64Option(prefix, out, found);
+}
+
 napi_status EdgeMakeCallbackWithFlags(napi_env env,
                                      napi_value recv,
                                      napi_value callback,

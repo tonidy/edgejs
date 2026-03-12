@@ -2192,6 +2192,21 @@ napi_value CryptoSecureContextGetTicketKeys(napi_env env, napi_callback_info inf
   return CreateBufferCopy(env, holder->ticket_keys.data(), holder->ticket_keys.size());
 }
 
+napi_value CryptoSecureContextEnableTicketKeyCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  EnsureTicketCallback(holder);
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
+}
+
 napi_value CryptoSecureContextLoadPKCS12(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3] = {nullptr, nullptr, nullptr};
@@ -2488,7 +2503,7 @@ EVP_PKEY* ParsePrivateKeyWithPassphraseImpl(const uint8_t* data,
   };
   auto password_callback = [](char* buf, int size, int /*rwflag*/, void* userdata) -> int {
     auto* span = static_cast<PassphraseSpan*>(userdata);
-    if (span == nullptr) return -1;
+    if (span == nullptr) return 0;
     const size_t buflen = static_cast<size_t>(size);
     if (buflen < span->len) return -1;
     if (span->len > 0 && span->data != nullptr) {
@@ -2502,7 +2517,7 @@ EVP_PKEY* ParsePrivateKeyWithPassphraseImpl(const uint8_t* data,
   PassphraseSpan passphrase_span;
   passphrase_span.data = has_passphrase ? passphrase : nullptr;
   passphrase_span.len = has_passphrase ? passphrase_len : 0;
-  void* passphrase_arg = has_passphrase ? &passphrase_span : nullptr;
+  void* passphrase_arg = &passphrase_span;
   pem_password_cb* password_cb = password_callback;
   EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, password_cb, passphrase_arg);
   const bool looks_like_pem = (len > 0 && data[0] == '-');
@@ -4197,6 +4212,7 @@ napi_value InstallCryptoBinding(napi_env env) {
   SetMethod(env, binding, "secureContextSetSessionTimeout", CryptoSecureContextSetSessionTimeout);
   SetMethod(env, binding, "secureContextSetTicketKeys", CryptoSecureContextSetTicketKeys);
   SetMethod(env, binding, "secureContextGetTicketKeys", CryptoSecureContextGetTicketKeys);
+  SetMethod(env, binding, "secureContextEnableTicketKeyCallback", CryptoSecureContextEnableTicketKeyCallback);
   SetMethod(env, binding, "secureContextLoadPKCS12", CryptoSecureContextLoadPKCS12);
   SetMethod(env, binding, "secureContextSetSigalgs", CryptoSecureContextSetSigalgs);
   SetMethod(env, binding, "secureContextSetECDHCurve", CryptoSecureContextSetECDHCurve);

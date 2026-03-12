@@ -528,6 +528,18 @@ bool ValidateCaOptions(const edge_options::EffectiveCliState& state, std::string
   return true;
 }
 
+bool ValidateTlsProtocolBoundsOptions(const edge_options::EffectiveCliState& state, std::string* error_out) {
+  const bool min_v13 = HasExactOptionToken(state.effective_tokens, "--tls-min-v1.3");
+  const bool max_v12 = HasExactOptionToken(state.effective_tokens, "--tls-max-v1.2");
+  if (min_v13 && max_v12) {
+    if (error_out != nullptr) {
+      *error_out = FormatCliError("either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both");
+    }
+    return false;
+  }
+  return true;
+}
+
 bool ValidateTraceRequireModuleOption(const edge_options::EffectiveCliState& state,
                                       std::string* error_out) {
   for (const auto& token : state.effective_tokens) {
@@ -1020,6 +1032,9 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
       return false;
     }
     if (!ValidateCaOptions(*out_state, error_out)) {
+      return false;
+    }
+    if (!ValidateTlsProtocolBoundsOptions(*out_state, error_out)) {
       return false;
     }
     if (!ValidateTraceRequireModuleOption(*out_state, error_out)) {
