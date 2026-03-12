@@ -2498,15 +2498,15 @@ EVP_PKEY* ParsePrivateKeyWithPassphraseImpl(const uint8_t* data,
                                             bool has_passphrase) {
   ERR_clear_error();
   struct PassphraseSpan {
-    const uint8_t* data = nullptr;
+    const char* data = reinterpret_cast<const char*>(-1);
     size_t len = 0;
   };
   auto password_callback = [](char* buf, int size, int /*rwflag*/, void* userdata) -> int {
     auto* span = static_cast<PassphraseSpan*>(userdata);
-    if (span == nullptr) return 0;
+    if (span == nullptr) return -1;
     const size_t buflen = static_cast<size_t>(size);
     if (buflen < span->len) return -1;
-    if (span->len > 0 && span->data != nullptr) {
+    if (span->len > 0) {
       std::memcpy(buf, span->data, span->len);
     }
     return static_cast<int>(span->len);
@@ -2515,9 +2515,13 @@ EVP_PKEY* ParsePrivateKeyWithPassphraseImpl(const uint8_t* data,
   BIO* bio = BIO_new_mem_buf(data, static_cast<int>(len));
   if (bio == nullptr) return nullptr;
   PassphraseSpan passphrase_span;
-  passphrase_span.data = has_passphrase ? passphrase : nullptr;
-  passphrase_span.len = has_passphrase ? passphrase_len : 0;
-  void* passphrase_arg = &passphrase_span;
+  if (has_passphrase) {
+    if (passphrase != nullptr) {
+      passphrase_span.data = reinterpret_cast<const char*>(passphrase);
+    }
+    passphrase_span.len = passphrase_len;
+  }
+  void* passphrase_arg = has_passphrase ? &passphrase_span : nullptr;
   pem_password_cb* password_cb = password_callback;
   EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, password_cb, passphrase_arg);
   const bool looks_like_pem = (len > 0 && data[0] == '-');
@@ -3087,7 +3091,7 @@ napi_value CryptoPublicEncrypt(napi_env env, napi_callback_info info) {
                                          has_passphrase);
   }
   if (pkey == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid public key");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse public key");
     return nullptr;
   }
   EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
@@ -3174,7 +3178,7 @@ napi_value CryptoPrivateEncrypt(napi_env env, napi_callback_info info) {
                                                  passphrase.size(),
                                                  has_passphrase);
   if (pkey == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid private key");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse private key");
     return nullptr;
   }
   RSA* rsa = EVP_PKEY_get1_RSA(pkey);
@@ -3239,7 +3243,7 @@ napi_value CryptoPrivateDecrypt(napi_env env, napi_callback_info info) {
                                                  passphrase.size(),
                                                  has_passphrase);
   if (pkey == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid private key");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse private key");
     return nullptr;
   }
   EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
@@ -3330,7 +3334,7 @@ napi_value CryptoPublicDecrypt(napi_env env, napi_callback_info info) {
                                          has_passphrase);
   }
   if (pkey == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid public key");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse public key");
     return nullptr;
   }
   RSA* rsa = EVP_PKEY_get1_RSA(pkey);
