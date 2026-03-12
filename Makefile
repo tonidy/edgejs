@@ -62,7 +62,7 @@ dist-only:
 	mkdir -p $(DIST_LIB_DIR)/internal/deps
 	for dep in undici acorn minimatch cjs-module-lexer amaro; do \
 		mkdir -p "$(DIST_LIB_DIR)/internal/deps/$$(dirname "$$dep")"; \
-		cp -R "node/deps/$$dep" "$(DIST_LIB_DIR)/internal/deps/$$dep"; \
+		cp -R "deps/$$dep" "$(DIST_LIB_DIR)/internal/deps/$$dep"; \
 	done
 	if [ "$(UNAME_S)" = "Darwin" ]; then \
 		for bin in $(DIST_BIN_DIR)/edge $(DIST_BIN_DIR)/edgeenv; do \

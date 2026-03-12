@@ -40,7 +40,7 @@ static const char* const kBundledRootCerts[] = {
 #define NODE_WANT_INTERNALS 1
 #define EDGE_UNDEF_NODE_WANT_INTERNALS 1
 #endif
-#include "../../../node/src/node_root_certs.h"
+#include "node_root_certs.h"
 #ifdef EDGE_UNDEF_NODE_WANT_INTERNALS
 #undef EDGE_UNDEF_NODE_WANT_INTERNALS
 #undef NODE_WANT_INTERNALS

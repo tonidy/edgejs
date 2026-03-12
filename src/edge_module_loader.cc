@@ -916,7 +916,7 @@ static bool ResolveNodeModules(const std::string& specifier, const std::string& 
 }
 
 // Resolve bare specifier (e.g. "assert", "path", "node:worker_threads")
-// against lib and selected node/deps internal/deps entries.
+// against lib and selected deps/internal/deps entries.
 bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
   (void)base_dir;
   return builtin_catalog::ResolveBuiltinId(specifier, out);

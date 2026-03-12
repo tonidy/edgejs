@@ -39,7 +39,8 @@ paths, `edge` system bindings should be implemented through `napi/v8` APIs.
 
 ## Roadmap Summary
 
-Detailed milestones are tracked in the public roadmap issue.
+Detailed milestones are tracked in the public roadmap issue:
+<https://github.com/wasmerio/edgejs/issues/8>.
 
 1. **Bootstrap**
    - `edge` executable that creates an environment through `napi/v8`.

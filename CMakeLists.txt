@@ -364,18 +364,19 @@ if(EDGE_NAPI_PROVIDER STREQUAL "imports")
     COMPILE_DEFINITIONS "NAPI_EXTERN=")
 endif()
 
+set(EDGE_ICU_ROOT "${PROJECT_ROOT}/deps/icu-small")
 set(EDGE_ICU_INCLUDE_DIRS
-  "${PROJECT_ROOT}/node/deps/icu-small/source/common"
-  "${PROJECT_ROOT}/node/deps/icu-small/source/i18n"
-  "${PROJECT_ROOT}/node/deps/icu-small/source/stubdata"
+  "${EDGE_ICU_ROOT}/source/common"
+  "${EDGE_ICU_ROOT}/source/i18n"
+  "${EDGE_ICU_ROOT}/source/stubdata"
 )
 set(EDGE_ICU_LINK_LIBS "")
 if(NOT EDGE_IS_WASIX_TARGET)
   file(GLOB_RECURSE EDGE_ICU_COMMON_SOURCES CONFIGURE_DEPENDS
-    "${PROJECT_ROOT}/node/deps/icu-small/source/common/*.cpp"
+    "${EDGE_ICU_ROOT}/source/common/*.cpp"
   )
   file(GLOB_RECURSE EDGE_ICU_I18N_SOURCES CONFIGURE_DEPENDS
-    "${PROJECT_ROOT}/node/deps/icu-small/source/i18n/*.cpp"
+    "${EDGE_ICU_ROOT}/source/i18n/*.cpp"
   )
 
   set(EDGE_ICU_BASE_DEFINES
@@ -389,12 +390,12 @@ if(NOT EDGE_IS_WASIX_TARGET)
   )
 
   add_library(edge_icu_stubdata STATIC
-    "${PROJECT_ROOT}/node/deps/icu-small/source/stubdata/stubdata.cpp"
+    "${EDGE_ICU_ROOT}/source/stubdata/stubdata.cpp"
   )
   target_include_directories(edge_icu_stubdata
     PUBLIC
-      "${PROJECT_ROOT}/node/deps/icu-small/source/common"
-      "${PROJECT_ROOT}/node/deps/icu-small/source/stubdata"
+      "${EDGE_ICU_ROOT}/source/common"
+      "${EDGE_ICU_ROOT}/source/stubdata"
   )
   target_compile_definitions(edge_icu_stubdata
     PRIVATE
@@ -407,7 +408,7 @@ if(NOT EDGE_IS_WASIX_TARGET)
   )
   target_include_directories(edge_icu_common
     PUBLIC
-      "${PROJECT_ROOT}/node/deps/icu-small/source/common"
+      "${EDGE_ICU_ROOT}/source/common"
   )
   target_compile_definitions(edge_icu_common
     PRIVATE
@@ -424,8 +425,8 @@ if(NOT EDGE_IS_WASIX_TARGET)
   )
   target_include_directories(edge_icu_i18n
     PUBLIC
-      "${PROJECT_ROOT}/node/deps/icu-small/source/common"
-      "${PROJECT_ROOT}/node/deps/icu-small/source/i18n"
+      "${EDGE_ICU_ROOT}/source/common"
+      "${EDGE_ICU_ROOT}/source/i18n"
   )
   target_compile_definitions(edge_icu_i18n
     PRIVATE
