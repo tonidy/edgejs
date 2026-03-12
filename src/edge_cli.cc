@@ -183,6 +183,17 @@ void ApplyEnvUpdates(const std::unordered_map<std::string, std::string>& updates
   }
 }
 
+bool IsBooleanOptionEnabled(const std::vector<std::string>& tokens, const char* option) {
+  const std::string prefix = std::string(option) + "=";
+  for (const auto& token : tokens) {
+    if (token == option) return true;
+    if (token.rfind(prefix, 0) != 0) continue;
+    const std::string value = token.substr(prefix.size());
+    if (value != "false" && value != "0") return true;
+  }
+  return false;
+}
+
 bool TokenHasInlineValue(const std::string& token) {
   return token.find('=') != std::string::npos;
 }
@@ -465,6 +476,7 @@ bool IsRecognizedCliOptionToken(const std::string& token) {
   if (TokenHasInlineValue(token)) {
     const std::string key = token.substr(0, token.find('='));
     return OptionConsumesNextToken(key) ||
+           IsBooleanOptionForNegation(key) ||
            key == "--env-file" ||
            key == "--env-file-if-exists" ||
            key == "--experimental-config-file" ||
@@ -1040,7 +1052,6 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
     if (!ValidateTraceRequireModuleOption(*out_state, error_out)) {
       return false;
     }
-    ApplyEnvUpdates(out_state->env_updates);
     for (const auto& warning : out_state->warnings) {
       std::cerr << warning << "\n";
     }
@@ -1171,6 +1182,9 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
   EdgeSetExecArgv(raw_exec_argv);
   ApplySupportedV8Flags(raw_exec_argv);
   const bool use_test_runner = HasExactOptionToken(effective_state.effective_tokens, "--test");
+  const bool use_watch_mode =
+      IsBooleanOptionEnabled(effective_state.effective_tokens, "--watch") ||
+      HasOptionTokenWithInlineValue(effective_state.effective_tokens, "--watch-path");
   bool requested_test_flag = use_test_runner;
   if (!requested_test_flag) {
     for (int argi = script_index; argi < argc; ++argi) {
@@ -1206,6 +1220,45 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
       }
       return 9;
     }
+  }
+
+  if (use_watch_mode) {
+    if (saw_check) {
+      if (error_out != nullptr) {
+        *error_out = FormatCliError("either --watch or --check can be used, not both");
+      }
+      return 9;
+    }
+    if (has_eval_string) {
+      if (error_out != nullptr) {
+        *error_out = FormatCliError("either --watch or --eval can be used, not both");
+      }
+      return 9;
+    }
+    if (force_repl) {
+      if (error_out != nullptr) {
+        *error_out = FormatCliError("either --watch or --interactive can be used, not both");
+      }
+      return 9;
+    }
+    if (HasExactOptionToken(effective_state.effective_tokens, "--test-force-exit")) {
+      if (error_out != nullptr) {
+        *error_out = FormatCliError("either --watch or --test-force-exit can be used, not both");
+      }
+      return 9;
+    }
+    if (!use_test_runner &&
+        !HasOptionTokenWithInlineValue(effective_state.effective_tokens, "--watch-path") &&
+        (script_index >= argc || argv[script_index] == nullptr)) {
+      if (error_out != nullptr) {
+        *error_out = FormatCliError("--watch requires specifying a file");
+      }
+      return 9;
+    }
+  }
+
+  if (!use_watch_mode) {
+    ApplyEnvUpdates(effective_state.env_updates);
   }
 
   if (force_repl) {
@@ -1258,6 +1311,21 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
     }
     EdgeSetScriptArgv(script_argv);
     return RunCliBuiltin(";", "internal/main/test_runner", error_out);
+  }
+
+  if (use_watch_mode) {
+    int command_index = script_index;
+    if (command_index < argc &&
+        argv[command_index] != nullptr &&
+        std::string(argv[command_index]) == "--") {
+      command_index++;
+    }
+    script_argv.reserve(static_cast<size_t>(argc - command_index));
+    for (int argi = command_index; argi < argc; ++argi) {
+      if (argv[argi] != nullptr) script_argv.emplace_back(argv[argi]);
+    }
+    EdgeSetScriptArgv(script_argv);
+    return RunCliBuiltin(";", "internal/main/watch_mode", error_out);
   }
 
   const bool use_stdin_entry =
