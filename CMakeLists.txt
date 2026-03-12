@@ -617,6 +617,7 @@ add_library(edge_runtime STATIC
   src/edge_worker_env.cc
   src/edge_spawn_sync.cc
   src/edge_timers_host.cc
+  src/crypto/edge_crypto_bio.cc
   src/crypto/edge_crypto_binding.cc
   src/edge_crypto.cc
 )

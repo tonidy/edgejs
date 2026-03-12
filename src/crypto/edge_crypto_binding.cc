@@ -1959,10 +1959,14 @@ napi_value CryptoSecureContextSetKey(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   std::string passphrase;
-  bool has_passphrase = false;
+  bool has_passphrase = true;
   if (argc >= 3 && !ReadPassphrase(env, argv[2], &passphrase, &has_passphrase)) {
     ThrowError(env, "ERR_INVALID_ARG_TYPE", "passphrase must be a string or Buffer");
     return nullptr;
+  }
+  if (argc < 3 || IsNullOrUndefined(env, argv[2])) {
+    passphrase.clear();
+    has_passphrase = true;
   }
   EVP_PKEY* pkey = ParsePrivateKeyWithPassphrase(key_bytes,
                                                  key_len,

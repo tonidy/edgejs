@@ -1145,6 +1145,17 @@ napi_value EdgeStreamBaseUndefined(napi_env env) {
 
 void EdgeStreamBaseSetReqError(napi_env env, napi_value req_obj, int status) {
   if (env == nullptr || req_obj == nullptr || status >= 0) return;
+  bool has_error = false;
+  if (napi_has_named_property(env, req_obj, "error", &has_error) == napi_ok && has_error) {
+    napi_value existing = nullptr;
+    napi_valuetype type = napi_undefined;
+    if (napi_get_named_property(env, req_obj, "error", &existing) == napi_ok &&
+        existing != nullptr &&
+        napi_typeof(env, existing, &type) == napi_ok &&
+        type != napi_undefined) {
+      return;
+    }
+  }
   napi_value undefined = nullptr;
   if (napi_get_undefined(env, &undefined) == napi_ok && undefined != nullptr) {
     napi_set_named_property(env, req_obj, "error", undefined);
