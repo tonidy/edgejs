@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./assets/edgejs-logo-white.svg">
     <source media="(prefers-color-scheme: light)" srcset="./assets/edgejs-logo-dark.svg">
-    <img src="./assets/edgejs-logo-dark.svg" alt="Edge.js logo" height="120">
+    <img src="./assets/edgejs-logo-dark.svg" alt="Edge.js logo" height="100">
   </picture>
 </p>
 
