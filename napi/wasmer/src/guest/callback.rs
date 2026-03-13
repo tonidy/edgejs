@@ -1,8 +1,9 @@
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::Mutex;
 
-use wasmer::{FunctionEnvMut, StoreMut, Table, Value};
+use wasmer::{AsStoreMut, FunctionEnvMut, StoreMut, Table, Value};
 
 use crate::{snapi::SnapiEnv, RuntimeEnv};
 
@@ -20,7 +21,11 @@ static CB_TOP_LEVEL: Mutex<Option<CallbackTopLevelState>> = Mutex::new(None);
 
 #[derive(Clone)]
 struct CallbackTopLevelState {
-    store: *mut StoreMut<'static>,
+    // FIXME: remove this, this is terribly unsafe!!
+    // Wasmer's StoreMut is a temporary wrapper around the underlying store
+    // context. Persist the wrapped store pointer, not the StoreMut stack
+    // object, otherwise later callbacks dereference freed stack memory.
+    store_inner: *mut c_void,
     table: Table,
     guest_envs: HashMap<usize, u32>,
 }
@@ -64,10 +69,9 @@ pub fn set_top_level_callback_state(
         .lock()
         .expect("callback top-level mutex poisoned");
     if let Some(table) = table {
-        let raw: *mut StoreMut<'static> =
-            unsafe { std::mem::transmute(store as *mut StoreMut<'_>) };
+        let raw: *mut c_void = unsafe { std::mem::transmute(store.as_store_mut()) };
         *guard = Some(CallbackTopLevelState {
-            store: raw,
+            store_inner: raw,
             table,
             guest_envs,
         });
@@ -120,14 +124,14 @@ pub extern "C" fn snapi_host_invoke_wasm_callback(
             .expect("callback top-level mutex poisoned")
             .clone();
         if let Some(state) = state {
-            let store = unsafe { &mut *state.store };
+            let mut store: StoreMut<'_> = unsafe { std::mem::transmute(state.store_inner) };
             let guest_env = state
                 .guest_envs
                 .get(&(snapi_env as usize))
                 .copied()
                 .unwrap_or(0);
             return call_guest_callback(
-                store,
+                &mut store,
                 &state.table,
                 guest_env as i32,
                 wasm_fn_ptr,
