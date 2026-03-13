@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use napi_wasmer::{run_wasix_main_capture_stdio, run_wasm_main_i32, GuestMount};
+use napi_wasmer::{run_wasix_main_capture_stdio_with_ctx, run_wasm_main_i32, GuestMount, NapiCtx};
 use std::path::{Path, PathBuf};
 
 fn init_tracing() {
@@ -93,6 +93,7 @@ fn main() -> Result<()> {
     }
 
     if entry == "wasix" {
+        let napi = NapiCtx::builder().build();
         let mut guest_args = Vec::new();
         if let Some(script) = script_arg {
             let host_script = PathBuf::from(&script);
@@ -123,7 +124,7 @@ fn main() -> Result<()> {
             guest_args.push(format!("/app/{}", script_name.to_string_lossy()));
         }
         let (exit, _stdout, _stderr) =
-            run_wasix_main_capture_stdio(wasm_path, &guest_args, &extra_mounts)?;
+            run_wasix_main_capture_stdio_with_ctx(&napi, wasm_path, &guest_args, &extra_mounts)?;
         println!("wasix_exit_code={exit}");
         return Ok(());
     }

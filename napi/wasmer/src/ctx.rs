@@ -1,0 +1,234 @@
+use anyhow::{bail, Context, Result};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
+use wasmer_wasix::PluggableRuntime;
+
+use crate::{
+    guest::{
+        callback::{clear_top_level_callback_state, set_top_level_callback_state},
+        napi::{register_env_imports, register_napi_imports},
+    },
+    RuntimeEnv,
+};
+
+#[derive(Debug, Clone, Default)]
+pub struct NapiLimits {
+    pub max_sessions: Option<usize>,
+    pub max_envs: Option<usize>,
+    pub max_total_external_memory: Option<u64>,
+    pub max_total_heap_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub struct NapiCtxBuilder {
+    limits: NapiLimits,
+}
+
+#[derive(Clone, Debug)]
+pub struct NapiCtx {
+    inner: Arc<NapiCtxInner>,
+}
+
+#[derive(Clone)]
+pub struct NapiSession {
+    inner: Arc<NapiSessionInner>,
+}
+
+#[derive(Debug)]
+struct NapiCtxInner {
+    limits: NapiLimits,
+    active_sessions: AtomicUsize,
+}
+
+struct NapiSessionInner {
+    ctx: Arc<NapiCtxInner>,
+    imported_memory_type: Option<wasmer::MemoryType>,
+    imported_table_type: Option<wasmer::TableType>,
+    func_env: Mutex<Option<FunctionEnv<RuntimeEnv>>>,
+}
+
+impl std::fmt::Debug for NapiSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NapiSession").finish_non_exhaustive()
+    }
+}
+
+impl Drop for NapiSessionInner {
+    fn drop(&mut self) {
+        clear_top_level_callback_state();
+        self.ctx.active_sessions.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl NapiCtxBuilder {
+    pub fn max_sessions(mut self, max_sessions: usize) -> Self {
+        self.limits.max_sessions = Some(max_sessions);
+        self
+    }
+
+    pub fn max_envs(mut self, max_envs: usize) -> Self {
+        self.limits.max_envs = Some(max_envs);
+        self
+    }
+
+    pub fn max_total_external_memory(mut self, bytes: u64) -> Self {
+        self.limits.max_total_external_memory = Some(bytes);
+        self
+    }
+
+    pub fn max_total_heap_bytes(mut self, bytes: u64) -> Self {
+        self.limits.max_total_heap_bytes = Some(bytes);
+        self
+    }
+
+    pub fn build(self) -> NapiCtx {
+        NapiCtx {
+            inner: Arc::new(NapiCtxInner {
+                limits: self.limits,
+                active_sessions: AtomicUsize::new(0),
+            }),
+        }
+    }
+}
+
+impl Default for NapiCtx {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
+impl NapiCtx {
+    pub fn builder() -> NapiCtxBuilder {
+        NapiCtxBuilder::default()
+    }
+
+    pub fn limits(&self) -> &NapiLimits {
+        &self.inner.limits
+    }
+
+    pub fn active_sessions(&self) -> usize {
+        self.inner.active_sessions.load(Ordering::Acquire)
+    }
+
+    pub fn new_session(&self, module: &Module) -> Result<NapiSession> {
+        let previous = self.inner.active_sessions.fetch_add(1, Ordering::AcqRel);
+        if let Some(max_sessions) = self.inner.limits.max_sessions {
+            if previous >= max_sessions {
+                self.inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
+                bail!("refusing to create more than {max_sessions} active N-API sessions");
+            }
+        }
+
+        let imported_memory_type = module.imports().find_map(|import| {
+            if import.module() == "env" && import.name() == "memory" {
+                if let ExternType::Memory(ty) = import.ty() {
+                    return Some(*ty);
+                }
+            }
+            None
+        });
+
+        let imported_table_type = module.imports().find_map(|import| {
+            if import.module() == "env" && import.name() == "__indirect_function_table" {
+                if let ExternType::Table(ty) = import.ty() {
+                    return Some(*ty);
+                }
+            }
+            None
+        });
+
+        Ok(NapiSession {
+            inner: Arc::new(NapiSessionInner {
+                ctx: Arc::clone(&self.inner),
+                imported_memory_type,
+                imported_table_type,
+                func_env: Mutex::new(None),
+            }),
+        })
+    }
+
+    pub fn configure_runtime(
+        &self,
+        runtime: &mut PluggableRuntime,
+        module: &Module,
+    ) -> Result<NapiSession> {
+        let session = self.new_session(module)?;
+        session.attach_to_runtime(runtime);
+        Ok(session)
+    }
+}
+
+impl NapiSession {
+    pub fn create_imports(&self, store: &mut StoreMut<'_>) -> Result<Imports> {
+        let mut import_object = Imports::new();
+        register_env_imports(store, &mut import_object);
+
+        let func_env = FunctionEnv::new(store, RuntimeEnv::default());
+        {
+            let mut guard = self
+                .inner
+                .func_env
+                .lock()
+                .expect("poisoned NapiSession mutex");
+            *guard = Some(func_env.clone());
+        }
+        register_napi_imports(store, &func_env, &mut import_object);
+
+        if let Some(memory_type) = self.inner.imported_memory_type {
+            let memory = wasmer::Memory::new(&mut *store, memory_type)?;
+            import_object.define("env", "memory", memory.clone());
+            func_env.as_mut(&mut *store).memory = Some(memory);
+        }
+
+        if let Some(table_type) = self.inner.imported_table_type {
+            let table = Table::new(&mut *store, table_type, Value::FuncRef(None))?;
+            import_object.define("env", "__indirect_function_table", table.clone());
+            func_env.as_mut(&mut *store).table = Some(table);
+        }
+
+        Ok(import_object)
+    }
+
+    pub fn configure_instance(&self, store: &mut StoreMut<'_>, instance: &Instance) -> Result<()> {
+        let func_env = {
+            let guard = self
+                .inner
+                .func_env
+                .lock()
+                .expect("poisoned NapiSession mutex");
+            guard
+                .clone()
+                .context("missing runtime function env during instance setup")?
+        };
+
+        for export_name in ["ubi_guest_malloc", "malloc"] {
+            if let Ok(malloc) = instance
+                .exports
+                .get_typed_function::<i32, i32>(&store, export_name)
+            {
+                func_env.as_mut(&mut *store).malloc_fn = Some(malloc);
+                break;
+            }
+        }
+
+        if let Ok(table) = instance.exports.get_table("__indirect_function_table") {
+            func_env.as_mut(&mut *store).table = Some(table.clone());
+        }
+        let table = func_env.as_ref(&store).table.clone();
+        set_top_level_callback_state(store, table);
+        Ok(())
+    }
+
+    pub fn attach_to_runtime(&self, runtime: &mut PluggableRuntime) {
+        let session = self.clone();
+        runtime.with_additional_imports(move |store| session.create_imports(store));
+
+        let session = self.clone();
+        runtime.with_instance_setup(move |store, instance| {
+            session.configure_instance(store, instance)
+        });
+    }
+}

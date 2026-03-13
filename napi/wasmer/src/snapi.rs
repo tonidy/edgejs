@@ -179,10 +179,8 @@ unsafe extern "C" {
         env_handle: u32,
         error_id: u32,
     ) -> i32;
-    pub fn snapi_bridge_unofficial_mark_promise_as_handled(
-        env_handle: u32,
-        promise_id: u32,
-    ) -> i32;
+    pub fn snapi_bridge_unofficial_mark_promise_as_handled(env_handle: u32, promise_id: u32)
+        -> i32;
     pub fn snapi_bridge_unofficial_get_heap_statistics(
         env_handle: u32,
         stats_out: *mut SnapiUnofficialHeapStatistics,

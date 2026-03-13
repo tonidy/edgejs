@@ -511,27 +511,27 @@ dependencies = [
 
 [[package]]
 name = "cranelift-bforest"
-version = "0.129.0"
+version = "0.129.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "041e02398f3c7ea0b9be704418a237384615732e21a727182a5a94405b7674b8"
+checksum = "9a92d78cc3f087d7e7073828f08d98c7074a3a062b6b29a1b7783ce74305685e"
 dependencies = [
  "cranelift-entity",
 ]
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.129.0"
+version = "0.129.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e8e36a88d22763171cd63a819805ff0c3934eda9a3037ae24de515bf7309f7b"
+checksum = "edcc73d756f2e0d7eda6144fe64a2bc69c624de893cb1be51f1442aed77881d2"
 dependencies = [
  "wasmtime-internal-core",
 ]
 
 [[package]]
 name = "cranelift-codegen"
-version = "0.129.0"
+version = "0.129.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f22f459983f5e5219bf32b3db93fd5e0f1202b732ddf1089848456537e8cd5c"
+checksum = "683d94c2cd0d73b41369b88da1129589bc3a2d99cf49979af1d14751f35b7a1b"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -583,9 +583,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-entity"
-version = "0.129.0"
+version = "0.129.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e30cc7555fd36897f14f34fabe8ce1d21fccbea81ea2cc36181a39209539611f"
+checksum = "59d8e72637246edd2cba337939850caa8b201f6315925ec4c156fdd089999699"
 dependencies = [
  "cranelift-bitset",
  "wasmtime-internal-core",
@@ -593,9 +593,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-frontend"
-version = "0.129.0"
+version = "0.129.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdba5f5120c8659a05efaebf8daf259fd3ab28c533e4012d8eaf21c1c8854f03"
+checksum = "4c31db0085c3dfa131e739c3b26f9f9c84d69a9459627aac1ac4ef8355e3411b"
 dependencies = [
  "cranelift-codegen",
  "log",
@@ -605,9 +605,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.129.0"
+version = "0.129.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba3f2a4a680e2fbf196a26c06fcb7a2090b11b05462f74dcae3261ad7af60e25"
+checksum = "524d804c1ebd8c542e6f64e71aa36934cec17c5da4a9ae3799796220317f5d23"
 
 [[package]]
 name = "cranelift-srcgen"
@@ -3851,6 +3851,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "virtual-fs"
 version = "0.701.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3879,6 +3880,7 @@ dependencies = [
 [[package]]
 name = "virtual-mio"
 version = "0.701.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3894,6 +3896,7 @@ dependencies = [
 [[package]]
 name = "virtual-net"
 version = "0.701.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4146,6 +4149,7 @@ dependencies = [
 [[package]]
 name = "wasmer"
 version = "7.1.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "bindgen",
  "bytes",
@@ -4181,6 +4185,7 @@ dependencies = [
 [[package]]
 name = "wasmer-cache"
 version = "7.1.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "blake3",
  "hex",
@@ -4191,6 +4196,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler"
 version = "7.1.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "backtrace",
  "bytes",
@@ -4225,6 +4231,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-cranelift"
 version = "7.1.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
@@ -4245,6 +4252,7 @@ dependencies = [
 [[package]]
 name = "wasmer-compiler-llvm"
 version = "7.1.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "byteorder",
  "cc",
@@ -4270,6 +4278,7 @@ dependencies = [
 [[package]]
 name = "wasmer-config"
 version = "0.701.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -4291,6 +4300,7 @@ dependencies = [
 [[package]]
 name = "wasmer-derive"
 version = "7.1.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "proc-macro-error2",
  "proc-macro2",
@@ -4301,6 +4311,7 @@ dependencies = [
 [[package]]
 name = "wasmer-journal"
 version = "0.701.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4327,6 +4338,7 @@ dependencies = [
 [[package]]
 name = "wasmer-package"
 version = "0.701.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4354,6 +4366,7 @@ dependencies = [
 [[package]]
 name = "wasmer-types"
 version = "7.1.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "bytecheck",
  "enum-iterator",
@@ -4373,6 +4386,7 @@ dependencies = [
 [[package]]
 name = "wasmer-vm"
 version = "7.1.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "backtrace",
  "bytesize",
@@ -4403,6 +4417,7 @@ dependencies = [
 [[package]]
 name = "wasmer-wasix"
 version = "0.701.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4418,6 +4433,7 @@ dependencies = [
  "dashmap",
  "derive_more",
  "flate2",
+ "fnv",
  "futures",
  "getrandom 0.3.4",
  "getrandom 0.4.1",
@@ -4475,6 +4491,7 @@ dependencies = [
 [[package]]
 name = "wasmer-wasix-types"
 version = "0.701.0-alpha.1"
+source = "git+https://github.com/wasmerio/wasmer?branch=main#e4cd12d4a820c7c18b251388b2442d2d68db525e"
 dependencies = [
  "anyhow",
  "bitflags 2.11.0",
@@ -4519,9 +4536,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-core"
-version = "42.0.0"
+version = "42.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac885f3f89ab3ee7746862d3a0bb7933afb1e79504765142febea50febec470f"
+checksum = "03a4a3f055a804a2f3d86e816a9df78a8fa57762212a8506164959224a40cd48"
 dependencies = [
  "libm",
 ]

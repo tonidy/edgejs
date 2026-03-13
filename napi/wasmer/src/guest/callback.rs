@@ -71,6 +71,13 @@ pub fn set_top_level_callback_state(store: &mut StoreMut<'_>, table: Option<Tabl
     }
 }
 
+pub fn clear_top_level_callback_state() {
+    let mut guard = CB_TOP_LEVEL
+        .lock()
+        .expect("callback top-level mutex poisoned");
+    *guard = None;
+}
+
 /// Rust trampoline called from C++ when a V8 callback fires.
 /// Retrieves the WASM store from the thread-local, then calls
 /// __napi_callback_dispatch in the WASM guest.

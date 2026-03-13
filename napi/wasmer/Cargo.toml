@@ -9,13 +9,32 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-wasmer = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/api", features = ["llvm"] }
-wasmer-compiler-llvm = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/compiler-llvm" }
-wasmer-types = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/types" }
-wasmer-wasix = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/wasix" }
-virtual-fs = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/virtual-fs" }
-virtual-mio = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/virtual-io" }
-wasmer-cache = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/cache" }
+# Published crates variant:
+# wasmer = { version = "=7.1.0-alpha.1", features = ["llvm"] }
+# wasmer-compiler-llvm = { version = "=7.1.0-alpha.1" }
+# wasmer-types = { version = "=7.1.0-alpha.1" }
+# wasmer-wasix = { version = "=0.701.0-alpha.1" }
+# virtual-fs = { version = "0.701.0-alpha.1" }
+# virtual-mio = { version = "0.701.0-alpha.1" }
+# wasmer-cache = { version = "=7.1.0-alpha.1" }
+
+# Git dependency on wasmer
+wasmer = { git = "https://github.com/wasmerio/wasmer", branch = "main", features = ["llvm"] }
+wasmer-compiler-llvm = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
+wasmer-types = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
+wasmer-wasix = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
+virtual-fs = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
+virtual-mio = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
+wasmer-cache = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
+
+# Local path variant:
+# wasmer = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/api", features = ["llvm"] }
+# wasmer-compiler-llvm = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/compiler-llvm" }
+# wasmer-types = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/types" }
+# wasmer-wasix = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/wasix" }
+# virtual-fs = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/virtual-fs" }
+# virtual-mio = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/virtual-io" }
+# wasmer-cache = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/cache" }
 
 [build-dependencies]
 cc = "1"

@@ -69,7 +69,8 @@ fn copy_host_buffer_to_guest(
 ) -> i32 {
     let mut guest_ptr = 0u32;
     if host_ptr != 0 && host_len > 0 {
-        let host_slice = unsafe { std::slice::from_raw_parts(host_ptr as *const u8, host_len as usize) };
+        let host_slice =
+            unsafe { std::slice::from_raw_parts(host_ptr as *const u8, host_len as usize) };
         let Some(ptr) = allocate_guest_bytes(env, host_slice) else {
             unsafe { snapi_bridge_unofficial_free_buffer(host_ptr as *mut c_void) };
             return 1;
@@ -122,20 +123,24 @@ fn guest_unofficial_napi_create_env_with_options(
     env_out_ptr: i32,
     scope_out_ptr: i32,
 ) -> i32 {
-    let (max_young_generation_size_in_bytes, max_old_generation_size_in_bytes, code_range_size_in_bytes, stack_limit) =
-        if options_ptr > 0 {
-            let Some(bytes) = read_guest_bytes(&mut env, options_ptr, 16) else {
-                return 1;
-            };
-            (
-                u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            )
-        } else {
-            (0, 0, 0, 0)
+    let (
+        max_young_generation_size_in_bytes,
+        max_old_generation_size_in_bytes,
+        code_range_size_in_bytes,
+        stack_limit,
+    ) = if options_ptr > 0 {
+        let Some(bytes) = read_guest_bytes(&mut env, options_ptr, 16) else {
+            return 1;
         };
+        (
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
 
     let mut env_handle: u32 = 0;
     let mut scope_handle: u32 = 0;
@@ -890,8 +895,7 @@ fn guest_unofficial_napi_start_heap_profile(
 ) -> i32 {
     let env_handle = if napi_env > 0 { napi_env as u32 } else { 0 };
     let mut started = 0i32;
-    let status =
-        unsafe { snapi_bridge_unofficial_start_heap_profile(env_handle, &mut started) };
+    let status = unsafe { snapi_bridge_unofficial_start_heap_profile(env_handle, &mut started) };
     if status == 0 && started_ptr > 0 {
         write_guest_u8(&mut env, started_ptr as u32, (started != 0) as u8);
     }
