@@ -112,6 +112,28 @@ std::vector<std::string> GetStringArrayValue(napi_env env, napi_value value);
 #define NI_NUMERICSERV 0
 #endif
 
+std::string GetGlibcRuntimeVersion() {
+#ifndef _WIN32
+  const char* (*libc_version)() = nullptr;
+  *(reinterpret_cast<void**>(&libc_version)) =
+      dlsym(RTLD_DEFAULT, "gnu_get_libc_version");
+  if (libc_version != nullptr) {
+    return (*libc_version)();
+  }
+#endif
+  return "";
+}
+
+std::string GetGlibcCompilerVersion() {
+#ifdef __GLIBC__
+  std::ostringstream buf;
+  buf << __GLIBC__ << "." << __GLIBC_MINOR__;
+  return buf.str();
+#else
+  return "";
+#endif
+}
+
 napi_addon_register_func GetNapiInitializerCallback(uv_lib_t* lib) {
   if (lib == nullptr) return nullptr;
   void* symbol = nullptr;
@@ -2299,8 +2321,8 @@ napi_value BuildReportObject(napi_env env,
     SetNamedString(env, header, "host", std::string(host, host_size));
   }
 
-  SetNamedString(env, header, "glibcVersionRuntime", "");
-  SetNamedString(env, header, "glibcVersionCompiler", "");
+  SetNamedString(env, header, "glibcVersionRuntime", GetGlibcRuntimeVersion());
+  SetNamedString(env, header, "glibcVersionCompiler", GetGlibcCompilerVersion());
   SetNamedInt32(env, header, "reportVersion", 5);
   SetNamedValue(env, report, "header", header);
 
@@ -2768,8 +2790,8 @@ std::string BuildNativeFatalReportPayload(napi_env env,
   } else {
     writer.json_keyvalue("host", "");
   }
-  writer.json_keyvalue("glibcVersionRuntime", "");
-  writer.json_keyvalue("glibcVersionCompiler", "");
+  writer.json_keyvalue("glibcVersionRuntime", GetGlibcRuntimeVersion());
+  writer.json_keyvalue("glibcVersionCompiler", GetGlibcCompilerVersion());
   writer.json_objectend();
 
   writer.json_arraystart("nativeStack");
