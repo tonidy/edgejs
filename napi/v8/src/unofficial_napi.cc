@@ -1,5 +1,6 @@
 #include "unofficial_napi.h"
 
+#include <algorithm>
 #include <atomic>
 #include <ctime>
 #include <cstdio>
