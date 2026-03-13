@@ -5,6 +5,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
     println!("cargo:rerun-if-env-changed=NAPI_V8_DEFINES");
+    println!("cargo:rerun-if-env-changed=NAPI_V8_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=NAPI_V8_LIBRARY");
 
     let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -17,13 +19,29 @@ fn main() {
     let napi_include = project_root.join("napi/include");
     let napi_v8_src = napi_v8_dir.join("src");
     let edge_src = project_root.join("src");
-    let libuv_include = project_root.join("deps/libuv-wasix/include");
+    let libuv_include = if project_root.join("deps/libuv-wasix/include").exists() {
+        project_root.join("deps/libuv-wasix/include")
+    } else {
+        project_root.join("deps/uv/include")
+    };
 
     // V8 paths
     let v8_include = std::env::var("V8_INCLUDE_DIR")
-        .expect("V8_INCLUDE_DIR must be set (for example by CI or devshell setup)");
-    let v8_lib = std::env::var("V8_LIB_DIR")
-        .expect("V8_LIB_DIR must be set (for example by CI or devshell setup)");
+        .or_else(|_| std::env::var("NAPI_V8_INCLUDE_DIR"))
+        .expect(
+            "V8 include directory not configured; set V8_INCLUDE_DIR or NAPI_V8_INCLUDE_DIR",
+        );
+    let v8_lib = std::env::var("V8_LIB_DIR").or_else(|_| {
+        std::env::var("NAPI_V8_LIBRARY").map(|path| {
+            std::path::Path::new(&path)
+                .parent()
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .unwrap_or(path)
+        })
+    });
+    let v8_lib = v8_lib
+        .expect("V8 library directory not configured; set V8_LIB_DIR or NAPI_V8_LIBRARY");
+
     let v8_include_dir = std::path::Path::new(&v8_include);
     let v8_lib_dir = std::path::Path::new(&v8_lib);
     assert!(
@@ -51,15 +69,14 @@ fn main() {
         .flag_if_supported("-w")
         .define("NAPI_EXTERN", Some(""))
         .include(&v8_include)
-        .include(napi_include.to_str().unwrap())
-        .include(napi_v8_src.to_str().unwrap())
         .include(edge_src.to_str().unwrap())
         .include(libuv_include.to_str().unwrap())
+        .include(napi_include.to_str().unwrap())
+        .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
         .file("src/edge_environment_shim.cc")
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
         .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap())
-        .file(napi_v8_src.join("edge_v8_platform.cc").to_str().unwrap())
         .file(
             napi_v8_src
                 .join("unofficial_napi_error_utils.cc")
@@ -71,7 +88,8 @@ fn main() {
                 .join("unofficial_napi_contextify.cc")
                 .to_str()
                 .unwrap(),
-        );
+        )
+        .file(napi_v8_src.join("edge_v8_platform.cc").to_str().unwrap());
 
     for raw in v8_defines.split(&[';', ',', ' '][..]) {
         let entry = raw.trim();

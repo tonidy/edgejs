@@ -672,6 +672,7 @@ add_library(edge_runtime STATIC
   src/internal_binding/binding_util.cc
   src/internal_binding/binding_v8.cc
   src/internal_binding/binding_uv.cc
+  src/internal_binding/binding_watchdog.cc
   src/internal_binding/binding_wasm_web_api.cc
   src/internal_binding/binding_worker.cc
   src/internal_binding/binding_zlib.cc
@@ -709,6 +710,7 @@ add_library(edge_runtime STATIC
   src/edge_worker_env.cc
   src/edge_spawn_sync.cc
   src/edge_timers_host.cc
+  src/crypto/edge_crypto_bio.cc
   src/crypto/edge_crypto_binding.cc
   src/edge_crypto.cc
 )

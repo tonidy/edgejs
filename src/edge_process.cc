@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <ctime>
@@ -3784,16 +3786,18 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
     }
     std::cerr.flush();
   }
+  EdgeEnvironmentRunAtExitCallbacks(env);
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->RequestStop();
+  }
+  uv_loop_t* loop = EdgeGetExistingEnvLoop(env);
+  if (loop != nullptr) uv_stop(loop);
+  (void)unofficial_napi_terminate_execution(env);
   if (!EdgeWorkerEnvOwnsProcessState(env)) {
     EdgeWorkerStopAllForEnv(env);
-    EdgeWorkerEnvRequestStop(env);
-    uv_loop_t* loop = EdgeGetEnvLoop(env);
-    if (loop != nullptr) uv_stop(loop);
-    (void)unofficial_napi_terminate_execution(env);
     return nullptr;
   }
   EdgeWorkerStopAllForEnv(env);
-  std::exit(exit_code);
   return nullptr;
 }
 

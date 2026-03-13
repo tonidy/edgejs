@@ -11,10 +11,12 @@
 #include <vector>
 
 #include <openssl/err.h>
+#include <openssl/ocsp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <uv.h>
 
+#include "crypto/edge_crypto_bio.h"
 #include "crypto/edge_secure_context_bridge.h"
 #include "ncrypto.h"
 #include "internal_binding/helpers.h"
@@ -29,13 +31,8 @@
 
 namespace {
 
-struct PendingAppWrite {
-  napi_ref req_ref = nullptr;
-  std::vector<uint8_t> data;
-};
-
 struct PendingEncryptedWrite {
-  std::vector<uint8_t> data;
+  size_t size = 0;
   napi_ref completion_req_ref = nullptr;
   bool force_parent_turn = false;
 };
@@ -47,8 +44,6 @@ struct KeepaliveHandle {
 struct TlsWrap;
 using TlsCertCb = void (*)(void*);
 TlsWrap* FindWrapBySelf(napi_env env, napi_value self);
-void OnInternalWriteDone(TlsWrap* wrap, int status);
-bool ScheduleReqCompletion(TlsWrap* wrap, napi_ref* req_ref, int status);
 int32_t CallParentMethodInt(TlsWrap* wrap,
                             const char* method,
                             size_t argc,
@@ -263,6 +258,7 @@ struct TlsWrap {
   napi_ref context_ref = nullptr;
   napi_ref pending_shutdown_req_ref = nullptr;
   napi_ref active_write_req_ref = nullptr;
+  napi_ref active_empty_write_req_ref = nullptr;
   napi_ref active_parent_write_req_ref = nullptr;
   napi_ref user_read_buffer_ref = nullptr;
   bool is_server = false;
@@ -287,18 +283,19 @@ struct TlsWrap {
   bool reject_unauthorized = false;
   bool shutdown_started = false;
   bool write_callback_scheduled = false;
-  bool defer_req_callbacks = false;
-  bool handshake_done_emitted = false;
-  bool handshake_done_pending = false;
+  bool in_dowrite = false;
+  bool parent_terminal_read_emitted = false;
   bool refed = true;
   bool keepalive_needed = false;
   int64_t async_id = 0;
   int cycle_depth = 0;
+  size_t parent_write_size = 0;
+  size_t queued_encrypted_bytes = 0;
   SSL* ssl = nullptr;
   BIO* enc_in = nullptr;
   BIO* enc_out = nullptr;
   edge::crypto::SecureContextHolder* secure_context = nullptr;
-  std::deque<PendingAppWrite> pending_app_writes;
+  std::vector<uint8_t> pending_cleartext_input;
   std::deque<PendingEncryptedWrite> pending_encrypted_writes;
   std::vector<uint8_t> pending_session;
   std::vector<uint8_t> deferred_parent_input;
@@ -325,11 +322,9 @@ struct TlsBindingState {
       DeleteRefIfPresent(env, &wrap->context_ref);
       DeleteRefIfPresent(env, &wrap->pending_shutdown_req_ref);
       DeleteRefIfPresent(env, &wrap->active_write_req_ref);
+      DeleteRefIfPresent(env, &wrap->active_empty_write_req_ref);
       DeleteRefIfPresent(env, &wrap->active_parent_write_req_ref);
       DeleteRefIfPresent(env, &wrap->user_read_buffer_ref);
-      for (auto& pending : wrap->pending_app_writes) {
-        DeleteRefIfPresent(env, &pending.req_ref);
-      }
       for (auto& pending : wrap->pending_encrypted_writes) {
         DeleteRefIfPresent(env, &pending.completion_req_ref);
       }
@@ -350,15 +345,14 @@ struct ClientSessionFallbackTask {
   napi_ref self_ref = nullptr;
 };
 
-struct DeferredReqCompletionTask {
+struct ParentWriteTask {
   napi_ref self_ref = nullptr;
   napi_ref req_ref = nullptr;
   int status = 0;
 };
 
-struct ParentWriteTask {
+struct InvokeQueuedTask {
   napi_ref self_ref = nullptr;
-  napi_ref req_ref = nullptr;
   int status = 0;
 };
 
@@ -366,6 +360,9 @@ int TlsWrapStreamBaseWriteBuffer(EdgeStreamBase* base,
                                  napi_value req_obj,
                                  napi_value payload,
                                  bool* async_out);
+void ConsumeEncryptedWriteQueue(TlsWrap* wrap, size_t committed, int status);
+bool ParentStreamOnAlloc(EdgeStreamListener* listener, size_t suggested_size, uv_buf_t* out);
+bool ParentStreamOnRead(EdgeStreamListener* listener, ssize_t nread, const uv_buf_t* buf);
 
 const EdgeStreamBaseOps kTlsWrapOps = {
     nullptr,
@@ -687,6 +684,165 @@ std::vector<uint8_t> ReadAllPendingBio(BIO* bio) {
   return out;
 }
 
+size_t PendingBioSize(BIO* bio) {
+  return bio != nullptr ? static_cast<size_t>(BIO_ctrl_pending(bio)) : 0;
+}
+
+size_t PendingUnqueuedEncryptedBytes(TlsWrap* wrap) {
+  if (wrap == nullptr || wrap->enc_out == nullptr) return 0;
+  const size_t pending = PendingBioSize(wrap->enc_out);
+  return pending > wrap->queued_encrypted_bytes ? pending - wrap->queued_encrypted_bytes : 0;
+}
+
+constexpr uint8_t kAsn1Sequence = 0x30;
+constexpr uint8_t kAsn1Enumerated = 0x0A;
+constexpr uint8_t kAsn1OctetString = 0x04;
+constexpr uint8_t kAsn1Context0 = 0xA0;
+constexpr uint8_t kSyntheticOcspResponseTypeOid[] = {
+    0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x63,
+};
+
+void AppendDerLength(std::vector<uint8_t>* out, size_t len) {
+  if (out == nullptr) return;
+  if (len < 0x80) {
+    out->push_back(static_cast<uint8_t>(len));
+    return;
+  }
+
+  uint8_t encoded[sizeof(size_t)];
+  size_t count = 0;
+  while (len > 0) {
+    encoded[count++] = static_cast<uint8_t>(len & 0xFF);
+    len >>= 8;
+  }
+  out->push_back(static_cast<uint8_t>(0x80 | count));
+  while (count > 0) {
+    out->push_back(encoded[--count]);
+  }
+}
+
+void AppendDerTlv(std::vector<uint8_t>* out, uint8_t tag, const uint8_t* data, size_t len) {
+  if (out == nullptr) return;
+  out->push_back(tag);
+  AppendDerLength(out, len);
+  if (len > 0 && data != nullptr) {
+    out->insert(out->end(), data, data + len);
+  }
+}
+
+bool ReadDerLength(const uint8_t* data, size_t len, size_t* offset, size_t* out_len) {
+  if (data == nullptr || offset == nullptr || out_len == nullptr || *offset >= len) return false;
+  const uint8_t first = data[(*offset)++];
+  if ((first & 0x80) == 0) {
+    *out_len = first;
+    return *offset + *out_len <= len;
+  }
+
+  const size_t byte_count = first & 0x7F;
+  if (byte_count == 0 || byte_count > sizeof(size_t) || *offset + byte_count > len) return false;
+  size_t value = 0;
+  for (size_t i = 0; i < byte_count; ++i) {
+    value = (value << 8) | data[(*offset)++];
+  }
+  *out_len = value;
+  return *offset + *out_len <= len;
+}
+
+bool ConsumeDerTlv(const uint8_t* data,
+                   size_t len,
+                   size_t* offset,
+                   uint8_t expected_tag,
+                   size_t* content_offset,
+                   size_t* content_len) {
+  if (data == nullptr || offset == nullptr || *offset >= len || data[*offset] != expected_tag) return false;
+  (*offset)++;
+  if (!ReadDerLength(data, len, offset, content_len)) return false;
+  if (content_offset != nullptr) *content_offset = *offset;
+  *offset += *content_len;
+  return true;
+}
+
+bool IsValidOcspResponseDer(const uint8_t* data, size_t len) {
+  if (data == nullptr || len == 0) return false;
+  const unsigned char* ptr = data;
+  OCSP_RESPONSE* response = d2i_OCSP_RESPONSE(nullptr, &ptr, static_cast<long>(len));
+  if (response == nullptr) return false;
+  OCSP_RESPONSE_free(response);
+  return ptr == data + len;
+}
+
+std::vector<uint8_t> WrapSyntheticOcspResponse(const uint8_t* data, size_t len) {
+  std::vector<uint8_t> response_bytes;
+  AppendDerTlv(&response_bytes,
+               0x06,
+               kSyntheticOcspResponseTypeOid,
+               sizeof(kSyntheticOcspResponseTypeOid));
+  AppendDerTlv(&response_bytes, kAsn1OctetString, data, len);
+
+  std::vector<uint8_t> explicit_zero;
+  AppendDerTlv(&explicit_zero, kAsn1Sequence, response_bytes.data(), response_bytes.size());
+
+  std::vector<uint8_t> outer;
+  const uint8_t success_value = 0;
+  AppendDerTlv(&outer, kAsn1Enumerated, &success_value, 1);
+  AppendDerTlv(&outer, kAsn1Context0, explicit_zero.data(), explicit_zero.size());
+
+  std::vector<uint8_t> wrapped;
+  AppendDerTlv(&wrapped, kAsn1Sequence, outer.data(), outer.size());
+  return wrapped;
+}
+
+bool UnwrapSyntheticOcspResponse(const uint8_t* data, size_t len, std::vector<uint8_t>* out) {
+  if (data == nullptr || out == nullptr) return false;
+
+  size_t offset = 0;
+  size_t seq_offset = 0;
+  size_t seq_len = 0;
+  if (!ConsumeDerTlv(data, len, &offset, kAsn1Sequence, &seq_offset, &seq_len)) return false;
+  if (offset != len) return false;
+
+  size_t inner = seq_offset;
+  const size_t seq_end = seq_offset + seq_len;
+
+  size_t enum_offset = 0;
+  size_t enum_len = 0;
+  if (!ConsumeDerTlv(data, seq_end, &inner, kAsn1Enumerated, &enum_offset, &enum_len)) return false;
+  if (enum_len != 1 || data[enum_offset] != 0) return false;
+
+  size_t explicit_offset = 0;
+  size_t explicit_len = 0;
+  if (!ConsumeDerTlv(data, seq_end, &inner, kAsn1Context0, &explicit_offset, &explicit_len)) return false;
+  if (inner != seq_end) return false;
+
+  size_t response_bytes_offset = 0;
+  size_t response_bytes_len = 0;
+  size_t explicit_inner = explicit_offset;
+  const size_t explicit_end = explicit_offset + explicit_len;
+  if (!ConsumeDerTlv(
+          data, explicit_end, &explicit_inner, kAsn1Sequence, &response_bytes_offset, &response_bytes_len)) {
+    return false;
+  }
+  if (explicit_inner != explicit_end) return false;
+
+  size_t rb_inner = response_bytes_offset;
+  const size_t rb_end = response_bytes_offset + response_bytes_len;
+  size_t oid_offset = 0;
+  size_t oid_len = 0;
+  if (!ConsumeDerTlv(data, rb_end, &rb_inner, 0x06, &oid_offset, &oid_len)) return false;
+  if (oid_len != sizeof(kSyntheticOcspResponseTypeOid) ||
+      std::memcmp(data + oid_offset, kSyntheticOcspResponseTypeOid, sizeof(kSyntheticOcspResponseTypeOid)) != 0) {
+    return false;
+  }
+
+  size_t octet_offset = 0;
+  size_t octet_len = 0;
+  if (!ConsumeDerTlv(data, rb_end, &rb_inner, kAsn1OctetString, &octet_offset, &octet_len)) return false;
+  if (rb_inner != rb_end) return false;
+
+  out->assign(data + octet_offset, data + octet_offset + octet_len);
+  return true;
+}
+
 napi_value CreateBufferCopy(napi_env env, const uint8_t* data, size_t len) {
   napi_value out = nullptr;
   void* copied = nullptr;
@@ -868,6 +1024,24 @@ void SetErrorStringProperty(napi_env env, napi_value err, const char* name, cons
   }
 }
 
+void SetReqErrorString(napi_env env, napi_value req_obj, const char* value) {
+  if (env == nullptr || req_obj == nullptr || value == nullptr || value[0] == '\0') return;
+  napi_value out = nullptr;
+  if (napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &out) == napi_ok && out != nullptr) {
+    napi_set_named_property(env, req_obj, "error", out);
+  }
+}
+
+std::string PeekLastOpenSslErrorString(const char* fallback_message) {
+  const unsigned long err = ERR_peek_error();
+  if (err == 0) {
+    return fallback_message != nullptr ? std::string(fallback_message) : std::string();
+  }
+  char buf[256];
+  ERR_error_string_n(err, buf, sizeof(buf));
+  return std::string(buf);
+}
+
 napi_value CreateLastOpenSslError(napi_env env, const char* fallback_code, const char* fallback_message) {
   std::vector<unsigned long> errors;
   while (const unsigned long err = ERR_get_error()) {
@@ -910,9 +1084,6 @@ void EmitError(TlsWrap* wrap, napi_value error) {
 
 void CompleteReq(TlsWrap* wrap, napi_ref* req_ref, int status) {
   if (wrap == nullptr || wrap->env == nullptr || req_ref == nullptr || *req_ref == nullptr) return;
-  if (wrap->defer_req_callbacks && ScheduleReqCompletion(wrap, req_ref, status)) {
-    return;
-  }
   napi_value req_obj = GetRefValue(wrap->env, *req_ref);
   if (req_obj != nullptr) {
     EdgeStreamBaseEmitAfterWrite(&wrap->base, req_obj, status);
@@ -920,25 +1091,24 @@ void CompleteReq(TlsWrap* wrap, napi_ref* req_ref, int status) {
   DeleteRefIfPresent(wrap->env, req_ref);
 }
 
-void CompleteReqNextTurn(TlsWrap* wrap, napi_ref* req_ref, int status) {
-  if (wrap == nullptr || req_ref == nullptr || *req_ref == nullptr) return;
-  if (!ScheduleReqCompletion(wrap, req_ref, status)) {
-    CompleteReq(wrap, req_ref, status);
+void CompleteDetachedReq(TlsWrap* wrap, napi_ref req_ref, int status, const char* error_string = nullptr) {
+  if (wrap == nullptr || wrap->env == nullptr || req_ref == nullptr) return;
+  napi_value req_obj = GetRefValue(wrap->env, req_ref);
+  if (req_obj != nullptr) {
+    if (status < 0) {
+      SetReqErrorString(wrap->env, req_obj, error_string);
+    }
+    EdgeStreamBaseEmitAfterWrite(&wrap->base, req_obj, status);
   }
+  DeleteRefIfPresent(wrap->env, &req_ref);
 }
 
-void MaybeFinishActiveWrite(TlsWrap* wrap, int status) {
-  if (wrap == nullptr || wrap->active_write_req_ref == nullptr) return;
-  if (status == 0) {
-    if (!wrap->write_callback_scheduled ||
-        wrap->parent_write_in_progress ||
-        !wrap->pending_encrypted_writes.empty() ||
-        !wrap->pending_app_writes.empty()) {
-      return;
-    }
-  }
+void InvokeQueued(TlsWrap* wrap, int status, const char* error_string = nullptr) {
+  if (wrap == nullptr || !wrap->write_callback_scheduled) return;
   wrap->write_callback_scheduled = false;
-  CompleteReq(wrap, &wrap->active_write_req_ref, status);
+  napi_ref req_ref = wrap->active_write_req_ref;
+  wrap->active_write_req_ref = nullptr;
+  CompleteDetachedReq(wrap, req_ref, status, error_string);
 }
 
 bool GetArrayBufferBytes(napi_env env,
@@ -995,6 +1165,24 @@ int32_t CallParentMethodInt(TlsWrap* wrap, const char* method, size_t argc, napi
   return out;
 }
 
+void InjectParentStreamBytes(TlsWrap* wrap, const uint8_t* data, size_t len) {
+  if (wrap == nullptr || data == nullptr) return;
+  size_t offset = 0;
+  while (wrap->ssl != nullptr && offset < len) {
+    uv_buf_t buf = uv_buf_init(nullptr, 0);
+    if (!ParentStreamOnAlloc(&wrap->parent_stream_listener, len - offset, &buf) ||
+        buf.base == nullptr || buf.len == 0) {
+      return;
+    }
+    size_t copy = buf.len;
+    if (copy > (len - offset)) copy = len - offset;
+    std::memcpy(buf.base, data + offset, copy);
+    buf.len = static_cast<unsigned int>(copy);
+    (void)ParentStreamOnRead(&wrap->parent_stream_listener, static_cast<ssize_t>(copy), &buf);
+    offset += copy;
+  }
+}
+
 bool SetSecureContextOnSsl(TlsWrap* wrap, edge::crypto::SecureContextHolder* holder) {
   if (wrap == nullptr || wrap->ssl == nullptr || holder == nullptr || holder->ctx == nullptr) return false;
   SSL_CTX_set_tlsext_status_cb(holder->ctx, TLSExtStatusCallback);
@@ -1010,11 +1198,13 @@ bool SetSecureContextOnSsl(TlsWrap* wrap, edge::crypto::SecureContextHolder* hol
 
 void InitSsl(TlsWrap* wrap);
 void Cycle(TlsWrap* wrap);
-bool TryHandshake(TlsWrap* wrap);
+void EncOut(TlsWrap* wrap);
+void InvokeQueued(TlsWrap* wrap, int status, const char* error_string);
 void TryStartParentWrite(TlsWrap* wrap);
 void MaybeStartParentShutdown(TlsWrap* wrap);
 void MaybeStartTlsShutdown(TlsWrap* wrap);
 bool ReadCleartext(TlsWrap* wrap);
+bool WritePendingCleartextInput(TlsWrap* wrap);
 
 void ResumeCertCallback(void* arg) {
   Cycle(static_cast<TlsWrap*>(arg));
@@ -1027,12 +1217,10 @@ void CleanupPendingWrites(TlsWrap* wrap, int status) {
     wrap->pending_encrypted_writes.pop_front();
     CompleteReq(wrap, &pending.completion_req_ref, status);
   }
-  while (!wrap->pending_app_writes.empty()) {
-    PendingAppWrite pending = std::move(wrap->pending_app_writes.front());
-    wrap->pending_app_writes.pop_front();
-    CompleteReq(wrap, &pending.req_ref, status);
-  }
+  wrap->queued_encrypted_bytes = 0;
+  wrap->parent_write_size = 0;
   CompleteReq(wrap, &wrap->active_write_req_ref, status);
+  CompleteReq(wrap, &wrap->active_empty_write_req_ref, status);
   InvokeReqWithStatus(wrap, &wrap->pending_shutdown_req_ref, status);
 }
 
@@ -1058,6 +1246,7 @@ void DestroySsl(TlsWrap* wrap) {
     wrap->next_session = nullptr;
   }
   DeleteRefIfPresent(wrap->env, &wrap->active_parent_write_req_ref);
+  DeleteRefIfPresent(wrap->env, &wrap->active_empty_write_req_ref);
   DeleteRefIfPresent(wrap->env, &wrap->user_read_buffer_ref);
   wrap->user_buffer_base = nullptr;
   wrap->user_buffer_len = 0;
@@ -1074,6 +1263,7 @@ void TlsWrapFinalize(napi_env env, void* data, void* /*hint*/) {
   DeleteRefIfPresent(env, &wrap->parent_ref);
   DeleteRefIfPresent(env, &wrap->context_ref);
   DeleteRefIfPresent(env, &wrap->active_write_req_ref);
+  DeleteRefIfPresent(env, &wrap->active_empty_write_req_ref);
   DeleteRefIfPresent(env, &wrap->user_read_buffer_ref);
   EdgeStreamBaseFinalize(&wrap->base);
   delete wrap;
@@ -1089,20 +1279,12 @@ void EmitHandshakeCallback(TlsWrap* wrap, const char* name, size_t argc, napi_va
       wrap->env, wrap->async_id, self, self, cb, argc, argv, &ignored, kEdgeMakeCallbackNone);
 }
 
-void EmitHandshakeDoneIfPending(TlsWrap* wrap) {
-  if (wrap == nullptr || wrap->ssl == nullptr || !wrap->handshake_done_pending || wrap->handshake_done_emitted) {
-    return;
-  }
-  if (wrap->parent_write_in_progress || !wrap->pending_encrypted_writes.empty()) {
-    return;
-  }
-  wrap->handshake_done_pending = false;
-  wrap->handshake_done_emitted = true;
+void EmitHandshakeDone(TlsWrap* wrap) {
+  if (wrap == nullptr || wrap->ssl == nullptr) return;
   if (wrap->keepalive_needed) {
     ReleaseKeepaliveHandle(wrap);
   }
   EmitHandshakeCallback(wrap, "onhandshakedone", 0, nullptr);
-  MaybeStartTlsShutdown(wrap);
 }
 
 void OnClientHello(TlsWrap* wrap, const ClientHelloData& hello) {
@@ -1154,7 +1336,6 @@ void SslInfoCallback(const SSL* ssl, int where, int /*ret*/) {
   }
   if ((where & SSL_CB_HANDSHAKE_DONE) != 0 && SSL_renegotiate_pending(const_cast<SSL*>(ssl)) == 0) {
     wrap->established = true;
-    wrap->handshake_done_pending = true;
     if (!wrap->is_server && wrap->session_callbacks_enabled && wrap->client_session_event_count == 0 &&
         SSL_version(const_cast<SSL*>(ssl)) < TLS1_3_VERSION &&
         SSL_session_reused(const_cast<SSL*>(ssl)) != 1) {
@@ -1163,6 +1344,7 @@ void SslInfoCallback(const SSL* ssl, int where, int /*ret*/) {
         (void)NewSessionCallback(const_cast<SSL*>(ssl), session);
       }
     }
+    EmitHandshakeDone(wrap);
   }
 }
 
@@ -1316,7 +1498,14 @@ napi_value GetSSLOCSPResponse(TlsWrap* wrap, SSL* ssl) {
   if (resp == nullptr || len < 0) {
     return Null(wrap->env);
   }
-  napi_value buffer = CreateBufferCopy(wrap->env, resp, static_cast<size_t>(len));
+  std::vector<uint8_t> decoded;
+  const uint8_t* payload = resp;
+  size_t payload_len = static_cast<size_t>(len);
+  if (UnwrapSyntheticOcspResponse(resp, static_cast<size_t>(len), &decoded)) {
+    payload = decoded.data();
+    payload_len = decoded.size();
+  }
+  napi_value buffer = CreateBufferCopy(wrap->env, payload, payload_len);
   if (buffer == nullptr) return nullptr;
   return buffer;
 }
@@ -1358,33 +1547,6 @@ bool MaybeEmitClientOcspResponse(TlsWrap* wrap, bool allow_null) {
   return true;
 }
 
-bool ApplyPendingServerOcspResponse(TlsWrap* wrap) {
-  if (wrap == nullptr || wrap->ssl == nullptr || !wrap->is_server || wrap->ocsp_response.empty()) {
-    return true;
-  }
-
-  const unsigned char* existing = nullptr;
-  if (SSL_get_tlsext_status_ocsp_resp(wrap->ssl, &existing) >= 0 && existing != nullptr) {
-    wrap->ocsp_response.clear();
-    return true;
-  }
-
-  const size_t len = wrap->ocsp_response.size();
-  unsigned char* data = static_cast<unsigned char*>(OPENSSL_malloc(len));
-  if (data == nullptr) {
-    return false;
-  }
-  if (len > 0) {
-    std::memcpy(data, wrap->ocsp_response.data(), len);
-  }
-  if (!SSL_set_tlsext_status_ocsp_resp(wrap->ssl, data, static_cast<int>(len))) {
-    OPENSSL_free(data);
-    return false;
-  }
-  wrap->ocsp_response.clear();
-  return true;
-}
-
 int TLSExtStatusCallback(SSL* ssl, void* /*arg*/) {
   auto* wrap = static_cast<TlsWrap*>(SSL_get_app_data(ssl));
   if (wrap == nullptr || wrap->env == nullptr) return 1;
@@ -1402,11 +1564,16 @@ int TLSExtStatusCallback(SSL* ssl, void* /*arg*/) {
   }
 
   if (wrap->ocsp_response.empty()) return SSL_TLSEXT_ERR_NOACK;
-  const size_t len = wrap->ocsp_response.size();
+  std::vector<uint8_t> wire_response = wrap->ocsp_response;
+  if (!IsValidOcspResponseDer(wire_response.data(), wire_response.size())) {
+    wire_response = WrapSyntheticOcspResponse(wire_response.data(), wire_response.size());
+  }
+
+  const size_t len = wire_response.size();
   unsigned char* data = static_cast<unsigned char*>(OPENSSL_malloc(len));
   if (data == nullptr) return SSL_TLSEXT_ERR_NOACK;
   if (len > 0) {
-    std::memcpy(data, wrap->ocsp_response.data(), len);
+    std::memcpy(data, wire_response.data(), len);
   }
   if (!SSL_set_tlsext_status_ocsp_resp(ssl, data, static_cast<int>(len))) {
     OPENSSL_free(data);
@@ -1509,17 +1676,16 @@ void DeleteClientSessionFallbackTask(napi_env env, ClientSessionFallbackTask* ta
   delete task;
 }
 
-void DeleteDeferredReqCompletionTask(napi_env env, DeferredReqCompletionTask* task) {
+void DeleteParentWriteTask(napi_env env, ParentWriteTask* task) {
   if (task == nullptr) return;
   DeleteRefIfPresent(env, &task->self_ref);
   DeleteRefIfPresent(env, &task->req_ref);
   delete task;
 }
 
-void DeleteParentWriteTask(napi_env env, ParentWriteTask* task) {
+void DeleteInvokeQueuedTask(napi_env env, InvokeQueuedTask* task) {
   if (task == nullptr) return;
   DeleteRefIfPresent(env, &task->self_ref);
-  DeleteRefIfPresent(env, &task->req_ref);
   delete task;
 }
 
@@ -1555,20 +1721,19 @@ napi_value RunClientSessionFallbackTask(napi_env env, napi_callback_info info) {
   return Undefined(env);
 }
 
-napi_value RunDeferredReqCompletionTask(napi_env env, napi_callback_info info) {
+napi_value RunInvokeQueuedTask(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   void* data = nullptr;
   napi_get_cb_info(env, info, &argc, nullptr, nullptr, &data);
-  auto* task = static_cast<DeferredReqCompletionTask*>(data);
+  auto* task = static_cast<InvokeQueuedTask*>(data);
   if (task == nullptr) return Undefined(env);
 
   napi_value self = GetRefValue(env, task->self_ref);
-  napi_value req_obj = GetRefValue(env, task->req_ref);
   TlsWrap* wrap = self != nullptr ? FindWrapBySelf(env, self) : nullptr;
-  if (wrap != nullptr && req_obj != nullptr) {
-    EdgeStreamBaseEmitAfterWrite(&wrap->base, req_obj, task->status);
+  if (wrap != nullptr) {
+    InvokeQueued(wrap, task->status);
   }
-  DeleteDeferredReqCompletionTask(env, task);
+  DeleteInvokeQueuedTask(env, task);
   return Undefined(env);
 }
 
@@ -1635,33 +1800,28 @@ void ScheduleClientSessionFallback(TlsWrap* wrap) {
   wrap->client_session_fallback_scheduled = true;
 }
 
-bool ScheduleReqCompletion(TlsWrap* wrap, napi_ref* req_ref, int status) {
-  if (wrap == nullptr || wrap->env == nullptr || req_ref == nullptr || *req_ref == nullptr) return false;
+bool ScheduleInvokeQueued(TlsWrap* wrap, int status) {
+  if (wrap == nullptr || wrap->env == nullptr) return false;
   napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-  napi_value req_obj = GetRefValue(wrap->env, *req_ref);
-  if (self == nullptr || req_obj == nullptr) return false;
+  if (self == nullptr) return false;
 
-  auto* task = new DeferredReqCompletionTask();
+  auto* task = new InvokeQueuedTask();
   task->status = status;
-  task->req_ref = *req_ref;
-  *req_ref = nullptr;
 
   if (napi_create_reference(wrap->env, self, 1, &task->self_ref) != napi_ok || task->self_ref == nullptr) {
-    task->self_ref = nullptr;
-    task->req_ref = nullptr;
-    delete task;
+    DeleteInvokeQueuedTask(wrap->env, task);
     return false;
   }
 
   napi_value callback = nullptr;
   if (napi_create_function(wrap->env,
-                           "__ubiTlsDeferredReqCompletion",
+                           "__ubiTlsInvokeQueued",
                            NAPI_AUTO_LENGTH,
-                           RunDeferredReqCompletionTask,
+                           RunInvokeQueuedTask,
                            task,
                            &callback) != napi_ok ||
       callback == nullptr) {
-    DeleteDeferredReqCompletionTask(wrap->env, task);
+    DeleteInvokeQueuedTask(wrap->env, task);
     return false;
   }
 
@@ -1673,14 +1833,14 @@ bool ScheduleReqCompletion(TlsWrap* wrap, napi_ref* req_ref, int status) {
       set_immediate == nullptr ||
       napi_typeof(wrap->env, set_immediate, &set_immediate_type) != napi_ok ||
       set_immediate_type != napi_function) {
-    DeleteDeferredReqCompletionTask(wrap->env, task);
+    DeleteInvokeQueuedTask(wrap->env, task);
     return false;
   }
 
   napi_value argv[1] = {callback};
   napi_value ignored = nullptr;
   if (napi_call_function(wrap->env, global, set_immediate, 1, argv, &ignored) != napi_ok) {
-    DeleteDeferredReqCompletionTask(wrap->env, task);
+    DeleteInvokeQueuedTask(wrap->env, task);
     return false;
   }
   return true;
@@ -1747,9 +1907,12 @@ bool ParentStreamOnRead(EdgeStreamListener* listener, ssize_t nread, const uv_bu
 
   if (nread <= 0) {
     if (nread < 0) {
-      (void)ReadCleartext(wrap);
+      wrap->parent_terminal_read_emitted = true;
       if (nread == UV_EOF) {
+        (void)ReadCleartext(wrap);
         wrap->eof = true;
+      } else {
+        (void)ReadCleartext(wrap);
       }
       EmitOnReadStatus(wrap, static_cast<int32_t>(nread));
     }
@@ -1757,13 +1920,14 @@ bool ParentStreamOnRead(EdgeStreamListener* listener, ssize_t nread, const uv_bu
   }
 
   if (buf == nullptr || buf->base == nullptr) return true;
-  (void)BIO_write(wrap->enc_in, buf->base, static_cast<int>(nread));
+  edge::crypto::EdgeBIO* enc_in = edge::crypto::EdgeBIO::FromBIO(wrap->enc_in);
+  enc_in->Write(buf->base, static_cast<size_t>(nread));
 
   if (!wrap->hello_parser.IsEnded()) {
-    char* hello_data = nullptr;
-    const long avail = BIO_get_mem_data(wrap->enc_in, &hello_data);
+    size_t avail = 0;
+    char* hello_data = enc_in->Peek(&avail);
     if (hello_data != nullptr && avail > 0) {
-      wrap->hello_parser.Parse(wrap, reinterpret_cast<const uint8_t*>(hello_data), static_cast<size_t>(avail));
+      wrap->hello_parser.Parse(wrap, reinterpret_cast<const uint8_t*>(hello_data), avail);
     }
     if (!wrap->hello_parser.IsEnded()) {
       return true;
@@ -1790,23 +1954,35 @@ bool ParentStreamOnAfterWrite(EdgeStreamListener* listener, napi_value req_obj, 
   DeleteRefIfPresent(wrap->env, &wrap->active_parent_write_req_ref);
 
   if (wrap->pending_encrypted_writes.empty()) {
+    wrap->parent_write_size = 0;
     return true;
   }
 
-  PendingEncryptedWrite pending = std::move(wrap->pending_encrypted_writes.front());
-  wrap->pending_encrypted_writes.pop_front();
   int effective_status = (wrap->ssl == nullptr && status == 0) ? UV_ECANCELED : status;
-  CompleteReq(wrap, &pending.completion_req_ref, effective_status);
+  if (wrap->active_empty_write_req_ref != nullptr) {
+    ConsumeEncryptedWriteQueue(wrap, 0, effective_status);
+    wrap->parent_write_size = 0;
+    napi_ref req_ref = wrap->active_empty_write_req_ref;
+    wrap->active_empty_write_req_ref = nullptr;
+    CompleteDetachedReq(wrap, req_ref, effective_status);
+    return true;
+  }
+
+  if (effective_status == 0 && wrap->parent_write_size != 0 && wrap->enc_out != nullptr) {
+    edge::crypto::EdgeBIO::FromBIO(wrap->enc_out)->Read(nullptr, wrap->parent_write_size);
+  }
+  ConsumeEncryptedWriteQueue(wrap, effective_status == 0 ? wrap->parent_write_size : 0, effective_status);
+  wrap->parent_write_size = 0;
+
   if (effective_status != 0) {
-    MaybeFinishActiveWrite(wrap, effective_status);
+    if (!wrap->shutdown_started) {
+      InvokeQueued(wrap, effective_status);
+    }
+    return true;
   }
+  (void)WritePendingCleartextInput(wrap);
+  EncOut(wrap);
   MaybeStartTlsShutdown(wrap);
-  MaybeStartParentShutdown(wrap);
-  Cycle(wrap);
-  if (effective_status == 0) {
-    MaybeFinishActiveWrite(wrap, 0);
-    MaybeStartTlsShutdown(wrap);
-  }
   return true;
 }
 
@@ -1825,6 +2001,10 @@ bool ParentStreamOnAfterShutdown(EdgeStreamListener* listener, napi_value req_ob
 void ParentStreamOnClose(EdgeStreamListener* listener) {
   TlsWrap* wrap = GetWrapFromListener(listener);
   if (wrap == nullptr) return;
+  // Node's TLSWrap does not synthesize a terminal read from stream close.
+  // EOF/error ownership stays with the parent read path; close here is only
+  // lifecycle cleanup. Emitting UV_EOF from close lets an old parent handle
+  // surface 'end' on a reinitialized TLSSocket, which diverges from Node.
   wrap->parent_stream_base = nullptr;
   wrap->parent_stream_listener.previous = nullptr;
   wrap->parent_write_in_progress = false;
@@ -1835,9 +2015,15 @@ void ParentStreamOnClose(EdgeStreamListener* listener) {
 }
 
 void QueueEncryptedWrite(TlsWrap* wrap,
-                         std::vector<uint8_t> bytes,
+                         size_t size,
                          napi_ref completion_req_ref,
                          bool force_parent_turn = false);
+
+void QueueNewEncryptedBytes(TlsWrap* wrap) {
+  const size_t pending = PendingUnqueuedEncryptedBytes(wrap);
+  if (pending == 0) return;
+  QueueEncryptedWrite(wrap, pending, nullptr);
+}
 
 bool HandleSslError(TlsWrap* wrap, int ssl_result, const char* fallback_code, const char* fallback_message) {
   if (wrap == nullptr || wrap->ssl == nullptr) return true;
@@ -1846,9 +2032,8 @@ bool HandleSslError(TlsWrap* wrap, int ssl_result, const char* fallback_code, co
     return false;
   }
   if (err == SSL_ERROR_ZERO_RETURN) return false;
-  std::vector<uint8_t> encrypted = ReadAllPendingBio(wrap->enc_out);
-  if (!encrypted.empty()) {
-    QueueEncryptedWrite(wrap, std::move(encrypted), nullptr);
+  QueueNewEncryptedBytes(wrap);
+  if (wrap->queued_encrypted_bytes != 0) {
     TryStartParentWrite(wrap);
   }
   EmitError(wrap, CreateLastOpenSslError(wrap->env, fallback_code, fallback_message));
@@ -1856,25 +2041,111 @@ bool HandleSslError(TlsWrap* wrap, int ssl_result, const char* fallback_code, co
 }
 
 void QueueEncryptedWrite(TlsWrap* wrap,
-                         std::vector<uint8_t> bytes,
+                         size_t size,
                          napi_ref completion_req_ref,
                          bool force_parent_turn) {
   if (wrap == nullptr) return;
-  if (bytes.empty() && !force_parent_turn) {
+  if (size == 0 && !force_parent_turn) {
     if (completion_req_ref != nullptr) {
       CompleteReq(wrap, &completion_req_ref, 0);
     }
     return;
   }
   PendingEncryptedWrite pending;
-  pending.data = std::move(bytes);
+  pending.size = size;
   pending.completion_req_ref = completion_req_ref;
   pending.force_parent_turn = force_parent_turn;
   wrap->pending_encrypted_writes.push_back(std::move(pending));
+  wrap->queued_encrypted_bytes += size;
+}
+
+void EncOut(TlsWrap* wrap) {
+  if (wrap == nullptr || wrap->ssl == nullptr || wrap->parent_write_in_progress ||
+      wrap->awaiting_new_session || !wrap->hello_parser.IsEnded() ||
+      wrap->has_active_write_issued_by_prev_listener) {
+    return;
+  }
+
+  if (wrap->established && wrap->active_write_req_ref != nullptr) {
+    wrap->write_callback_scheduled = true;
+  }
+
+  if (wrap->pending_encrypted_writes.empty()) {
+    if (wrap->pending_cleartext_input.empty()) {
+      if (!wrap->in_dowrite) {
+        InvokeQueued(wrap, 0);
+      } else {
+        (void)ScheduleInvokeQueued(wrap, 0);
+      }
+    }
+    return;
+  }
+
+  TryStartParentWrite(wrap);
 }
 
 napi_value CreateInternalWriteReq(TlsWrap* wrap) {
   return wrap != nullptr ? EdgeCreateStreamReqObject(wrap->env) : nullptr;
+}
+
+void ConsumeEncryptedWriteQueue(TlsWrap* wrap, size_t committed, int status) {
+  if (wrap == nullptr) return;
+
+  while (!wrap->pending_encrypted_writes.empty()) {
+    PendingEncryptedWrite& pending = wrap->pending_encrypted_writes.front();
+    if (pending.size == 0) {
+      PendingEncryptedWrite finished = std::move(pending);
+      wrap->pending_encrypted_writes.pop_front();
+      CompleteReq(wrap, &finished.completion_req_ref, status);
+      continue;
+    }
+    if (committed == 0) break;
+    if (pending.size <= committed) {
+      committed -= pending.size;
+      wrap->queued_encrypted_bytes -= pending.size;
+      PendingEncryptedWrite finished = std::move(pending);
+      wrap->pending_encrypted_writes.pop_front();
+      CompleteReq(wrap, &finished.completion_req_ref, status);
+      continue;
+    }
+    pending.size -= committed;
+    wrap->queued_encrypted_bytes -= committed;
+    committed = 0;
+  }
+}
+
+napi_value CreateBioWritevChunks(TlsWrap* wrap, size_t* total_out) {
+  if (total_out != nullptr) *total_out = 0;
+  if (wrap == nullptr || wrap->env == nullptr || wrap->enc_out == nullptr) return nullptr;
+
+  char* data[10];
+  size_t size[10];
+  size_t count = sizeof(data) / sizeof(data[0]);
+  const size_t total = edge::crypto::EdgeBIO::FromBIO(wrap->enc_out)->PeekMultiple(data, size, &count);
+  if (total == 0 || count == 0) return nullptr;
+
+  napi_value chunks = nullptr;
+  if (napi_create_array_with_length(wrap->env, count, &chunks) != napi_ok || chunks == nullptr) {
+    return nullptr;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    napi_value buffer = nullptr;
+    if (napi_create_external_buffer(
+            wrap->env,
+            size[i],
+            reinterpret_cast<char*>(data[i]),
+            nullptr,
+            nullptr,
+            &buffer) != napi_ok ||
+        buffer == nullptr ||
+        napi_set_element(wrap->env, chunks, static_cast<uint32_t>(i), buffer) != napi_ok) {
+      return nullptr;
+    }
+  }
+
+  if (total_out != nullptr) *total_out = total;
+  return chunks;
 }
 
 void TryStartParentWrite(TlsWrap* wrap) {
@@ -1888,35 +2159,64 @@ void TryStartParentWrite(TlsWrap* wrap) {
 
   const PendingEncryptedWrite& pending = wrap->pending_encrypted_writes.front();
   napi_value req = CreateInternalWriteReq(wrap);
-  const uint8_t* payload_data = pending.data.empty() ? nullptr : pending.data.data();
-  napi_value payload = CreateBufferCopy(wrap->env, payload_data, pending.data.size());
-  if (req == nullptr || payload == nullptr) {
+  napi_value payload = nullptr;
+  napi_value chunks = nullptr;
+  size_t parent_write_size = 0;
+  const bool needs_force_turn = pending.force_parent_turn && pending.size == 0;
+  if (req == nullptr) {
     PendingEncryptedWrite failed = std::move(wrap->pending_encrypted_writes.front());
     wrap->pending_encrypted_writes.pop_front();
+    wrap->queued_encrypted_bytes -= failed.size;
     CompleteReq(wrap, &failed.completion_req_ref, UV_ENOMEM);
-    MaybeFinishActiveWrite(wrap, UV_ENOMEM);
+    InvokeQueued(wrap, UV_ENOMEM);
     return;
+  }
+  if (needs_force_turn) {
+    payload = CreateBufferCopy(wrap->env, nullptr, 0);
+    if (payload == nullptr) {
+      PendingEncryptedWrite failed = std::move(wrap->pending_encrypted_writes.front());
+      wrap->pending_encrypted_writes.pop_front();
+      wrap->queued_encrypted_bytes -= failed.size;
+      CompleteReq(wrap, &failed.completion_req_ref, UV_ENOMEM);
+      InvokeQueued(wrap, UV_ENOMEM);
+      return;
+    }
+  } else {
+    chunks = CreateBioWritevChunks(wrap, &parent_write_size);
+    if (chunks == nullptr || parent_write_size == 0) {
+      PendingEncryptedWrite failed = std::move(wrap->pending_encrypted_writes.front());
+      wrap->pending_encrypted_writes.pop_front();
+      wrap->queued_encrypted_bytes -= failed.size;
+      CompleteReq(wrap, &failed.completion_req_ref, UV_EPROTO);
+      InvokeQueued(wrap, UV_EPROTO);
+      return;
+    }
   }
 
   if (napi_create_reference(wrap->env, req, 1, &wrap->active_parent_write_req_ref) != napi_ok ||
       wrap->active_parent_write_req_ref == nullptr) {
     PendingEncryptedWrite failed = std::move(wrap->pending_encrypted_writes.front());
     wrap->pending_encrypted_writes.pop_front();
+    wrap->queued_encrypted_bytes -= failed.size;
     CompleteReq(wrap, &failed.completion_req_ref, UV_ENOMEM);
-    MaybeFinishActiveWrite(wrap, UV_ENOMEM);
+    InvokeQueued(wrap, UV_ENOMEM);
     return;
   }
 
   bool async = false;
-  const int32_t rc = EdgeStreamBaseWriteBufferDirect(wrap->parent_stream_base, req, payload, &async);
+  const int32_t rc = needs_force_turn
+                         ? EdgeStreamBaseWriteBufferDirect(wrap->parent_stream_base, req, payload, &async)
+                         : EdgeStreamBaseWritevDirect(wrap->parent_stream_base, req, chunks, &async);
   if (rc != 0) {
     DeleteRefIfPresent(wrap->env, &wrap->active_parent_write_req_ref);
     PendingEncryptedWrite failed = std::move(wrap->pending_encrypted_writes.front());
     wrap->pending_encrypted_writes.pop_front();
+    wrap->queued_encrypted_bytes -= failed.size;
     CompleteReq(wrap, &failed.completion_req_ref, rc);
-    MaybeFinishActiveWrite(wrap, rc);
+    InvokeQueued(wrap, rc);
     return;
   }
+  wrap->parent_write_size = parent_write_size;
   wrap->parent_write_in_progress = true;
   if (!async) {
     if (!ScheduleParentWriteCompletion(wrap, req, 0)) {
@@ -1927,8 +2227,11 @@ void TryStartParentWrite(TlsWrap* wrap) {
 }
 
 void MaybeStartParentShutdown(TlsWrap* wrap) {
-  if (wrap == nullptr || wrap->pending_shutdown_req_ref == nullptr || wrap->shutdown_started ||
-      wrap->parent_write_in_progress || !wrap->pending_encrypted_writes.empty()) {
+  if (wrap == nullptr || wrap->pending_shutdown_req_ref == nullptr || wrap->shutdown_started) {
+    return;
+  }
+  if (!wrap->established && !wrap->eof &&
+      (wrap->parent_write_in_progress || !wrap->pending_encrypted_writes.empty())) {
     return;
   }
   if (wrap->parent_stream_base == nullptr) {
@@ -1953,15 +2256,7 @@ void MaybeStartParentShutdown(TlsWrap* wrap) {
 }
 
 void MaybeStartTlsShutdown(TlsWrap* wrap) {
-  if (wrap == nullptr || wrap->ssl == nullptr || wrap->pending_shutdown_req_ref == nullptr || wrap->shutdown_started ||
-      !wrap->established) {
-    return;
-  }
-  if (wrap->active_write_req_ref != nullptr ||
-      wrap->write_callback_scheduled ||
-      !wrap->pending_app_writes.empty() ||
-      wrap->parent_write_in_progress ||
-      !wrap->pending_encrypted_writes.empty()) {
+  if (wrap == nullptr || wrap->ssl == nullptr || wrap->pending_shutdown_req_ref == nullptr || wrap->shutdown_started) {
     return;
   }
 
@@ -1970,128 +2265,38 @@ void MaybeStartTlsShutdown(TlsWrap* wrap) {
   if (shutdown_rc == 0) {
     shutdown_rc = SSL_shutdown(wrap->ssl);
   }
-  std::vector<uint8_t> encrypted = ReadAllPendingBio(wrap->enc_out);
-  if (!encrypted.empty()) {
-    QueueEncryptedWrite(wrap, std::move(encrypted), nullptr);
-    TryStartParentWrite(wrap);
-  }
+  QueueNewEncryptedBytes(wrap);
+  EncOut(wrap);
   MaybeStartParentShutdown(wrap);
 }
 
-bool TryHandshake(TlsWrap* wrap) {
-  if (wrap == nullptr || wrap->ssl == nullptr) return false;
-  if (!wrap->is_server && !wrap->started) return false;
-  if (wrap->established && SSL_renegotiate_pending(wrap->ssl) == 0) return false;
-
-  ncrypto::MarkPopErrorOnReturn mark_pop_error_on_return;
-  const int rc = SSL_do_handshake(wrap->ssl);
-  if (rc != 1 && HandleSslError(wrap, rc, "ERR_TLS_HANDSHAKE", "TLS handshake failed")) {
+bool WritePendingCleartextInput(TlsWrap* wrap) {
+  if (wrap == nullptr || wrap->ssl == nullptr || wrap->has_active_write_issued_by_prev_listener ||
+      wrap->pending_cleartext_input.empty()) {
     return false;
   }
 
-  std::vector<uint8_t> encrypted = ReadAllPendingBio(wrap->enc_out);
-  if (!encrypted.empty()) {
-    QueueEncryptedWrite(wrap, std::move(encrypted), nullptr);
-    TryStartParentWrite(wrap);
+  ncrypto::MarkPopErrorOnReturn mark_pop_error_on_return;
+  const int rc = SSL_write(wrap->ssl,
+                           wrap->pending_cleartext_input.data(),
+                           static_cast<int>(wrap->pending_cleartext_input.size()));
+  if (rc == static_cast<int>(wrap->pending_cleartext_input.size())) {
+    wrap->pending_cleartext_input.clear();
+    QueueNewEncryptedBytes(wrap);
     return true;
   }
-  return rc == 1;
-}
 
-bool PumpPendingAppWrites(TlsWrap* wrap) {
-  if (wrap == nullptr || wrap->ssl == nullptr || wrap->parent_write_in_progress ||
-      wrap->has_active_write_issued_by_prev_listener) {
-    return false;
-  }
-  if (!wrap->established) return false;
-
-  ncrypto::MarkPopErrorOnReturn mark_pop_error_on_return;
-  bool made_progress = false;
-  while (!wrap->pending_app_writes.empty() && !wrap->parent_write_in_progress &&
-         !wrap->has_active_write_issued_by_prev_listener) {
-    PendingAppWrite& pending = wrap->pending_app_writes.front();
-    bool is_current_write = false;
-    if (wrap->active_write_req_ref == nullptr && pending.req_ref != nullptr) {
-      wrap->active_write_req_ref = pending.req_ref;
-      pending.req_ref = nullptr;
-      is_current_write = true;
-    } else {
-      is_current_write = pending.req_ref == nullptr;
-    }
-    if (wrap->active_write_req_ref == nullptr || (wrap->write_callback_scheduled && is_current_write)) {
-      break;
-    }
-
-    if (pending.data.empty()) {
-      napi_ref completion_req_ref = nullptr;
-      if (!is_current_write) {
-        completion_req_ref = pending.req_ref;
-        pending.req_ref = nullptr;
-      }
-      wrap->pending_app_writes.pop_front();
-      (void)ReadCleartext(wrap);
-      std::vector<uint8_t> encrypted = ReadAllPendingBio(wrap->enc_out);
-      if (is_current_write) wrap->write_callback_scheduled = true;
-      if (!encrypted.empty()) {
-        QueueEncryptedWrite(wrap, std::move(encrypted), completion_req_ref);
-        TryStartParentWrite(wrap);
-      } else {
-        CompleteReqNextTurn(wrap, &completion_req_ref, 0);
-        if (is_current_write) {
-          wrap->write_callback_scheduled = false;
-          CompleteReqNextTurn(wrap, &wrap->active_write_req_ref, 0);
-        }
-      }
-      made_progress = true;
-      continue;
-    }
-
-    const int rc = SSL_write(wrap->ssl, pending.data.data(), static_cast<int>(pending.data.size()));
-    if (rc == static_cast<int>(pending.data.size())) {
-      napi_ref completion_req_ref = nullptr;
-      if (!is_current_write) {
-        completion_req_ref = pending.req_ref;
-        pending.req_ref = nullptr;
-      }
-      wrap->pending_app_writes.pop_front();
-      std::vector<uint8_t> encrypted = ReadAllPendingBio(wrap->enc_out);
-      if (is_current_write) wrap->write_callback_scheduled = true;
-      if (!encrypted.empty()) {
-        QueueEncryptedWrite(wrap, std::move(encrypted), completion_req_ref);
-        TryStartParentWrite(wrap);
-      } else {
-        CompleteReqNextTurn(wrap, &completion_req_ref, 0);
-        if (is_current_write) {
-          wrap->write_callback_scheduled = false;
-          CompleteReqNextTurn(wrap, &wrap->active_write_req_ref, 0);
-        }
-      }
-      made_progress = true;
-      continue;
-    }
-
-    std::vector<uint8_t> encrypted = ReadAllPendingBio(wrap->enc_out);
-    if (!encrypted.empty()) {
-      QueueEncryptedWrite(wrap, std::move(encrypted), nullptr);
-      TryStartParentWrite(wrap);
-      made_progress = true;
-    }
-
-    if (HandleSslError(wrap, rc, "ERR_TLS_WRITE", "TLS write failed")) {
-      if (!is_current_write) {
-        CompleteReq(wrap, &pending.req_ref, UV_EPROTO);
-      }
-      wrap->pending_app_writes.pop_front();
-      if (is_current_write) {
-        MaybeFinishActiveWrite(wrap, UV_EPROTO);
-      }
-      made_progress = true;
-      continue;
-    }
-    break;
+  QueueNewEncryptedBytes(wrap);
+  const int err = SSL_get_error(wrap->ssl, rc);
+  if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+    wrap->pending_cleartext_input.clear();
+    wrap->write_callback_scheduled = true;
+    const std::string error_string = PeekLastOpenSslErrorString("TLS write failed");
+    InvokeQueued(wrap, UV_EPROTO, error_string.c_str());
+    return true;
   }
 
-  return made_progress;
+  return !wrap->pending_encrypted_writes.empty();
 }
 
 bool ReadCleartext(TlsWrap* wrap) {
@@ -2118,6 +2323,9 @@ bool ReadCleartext(TlsWrap* wrap) {
       break;
     }
     if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+      QueueNewEncryptedBytes(wrap);
+      EncOut(wrap);
+      made_progress = made_progress || wrap->parent_write_in_progress;
       EmitError(wrap, CreateLastOpenSslError(wrap->env, "ERR_TLS_READ", "TLS read failed"));
       break;
     }
@@ -2125,12 +2333,9 @@ bool ReadCleartext(TlsWrap* wrap) {
   }
 
   if (wrap->ssl != nullptr && last_err != SSL_ERROR_ZERO_RETURN) {
-    std::vector<uint8_t> encrypted = ReadAllPendingBio(wrap->enc_out);
-    if (!encrypted.empty()) {
-      QueueEncryptedWrite(wrap, std::move(encrypted), nullptr);
-      TryStartParentWrite(wrap);
-      made_progress = true;
-    }
+    QueueNewEncryptedBytes(wrap);
+    EncOut(wrap);
+    made_progress = made_progress || wrap->parent_write_in_progress;
   }
   return made_progress;
 }
@@ -2142,27 +2347,15 @@ void Cycle(TlsWrap* wrap) {
   }
 
   for (; wrap->cycle_depth > 0; wrap->cycle_depth--) {
-    bool keep_going = false;
-    do {
-      keep_going = false;
-      if (TryHandshake(wrap)) keep_going = true;
-      if (ReadCleartext(wrap)) keep_going = true;
-      if (PumpPendingAppWrites(wrap)) keep_going = true;
-      if (MaybeEmitClientOcspResponse(wrap, wrap->established)) keep_going = true;
-      if (wrap->ssl != nullptr) {
-        TryStartParentWrite(wrap);
-        EmitHandshakeDoneIfPending(wrap);
-        MaybeStartTlsShutdown(wrap);
-      }
-      if (!wrap->parent_write_in_progress && wrap->pending_encrypted_writes.empty()) {
-        MaybeFinishActiveWrite(wrap, 0);
-      }
-    } while (keep_going && wrap->ssl != nullptr);
-
+    (void)WritePendingCleartextInput(wrap);
+    (void)ReadCleartext(wrap);
+    (void)MaybeEmitClientOcspResponse(wrap, wrap->established);
     if (wrap->ssl == nullptr) {
       wrap->cycle_depth = 0;
       break;
     }
+    EncOut(wrap);
+    MaybeStartTlsShutdown(wrap);
   }
 }
 
@@ -2174,10 +2367,26 @@ void InitSsl(TlsWrap* wrap) {
   if (wrap->ssl == nullptr) return;
   SSL_CTX_sess_set_new_cb(wrap->secure_context->ctx, NewSessionCallback);
   SSL_CTX_sess_set_get_cb(wrap->secure_context->ctx, GetSessionCallback);
-  wrap->enc_in = BIO_new(BIO_s_mem());
-  wrap->enc_out = BIO_new(BIO_s_mem());
-  BIO_set_mem_eof_return(wrap->enc_in, -1);
-  BIO_set_mem_eof_return(wrap->enc_out, -1);
+  wrap->enc_in = edge::crypto::EdgeBIO::New(wrap->env);
+  wrap->enc_out = edge::crypto::EdgeBIO::New(wrap->env);
+  if (wrap->enc_in == nullptr || wrap->enc_out == nullptr) {
+    if (wrap->enc_in != nullptr) {
+      BIO_free(wrap->enc_in);
+      wrap->enc_in = nullptr;
+    }
+    if (wrap->enc_out != nullptr) {
+      BIO_free(wrap->enc_out);
+      wrap->enc_out = nullptr;
+    }
+    SSL_free(wrap->ssl);
+    wrap->ssl = nullptr;
+    return;
+  }
+  edge::crypto::EdgeBIO::FromBIO(wrap->enc_in)->set_eof_return(-1);
+  edge::crypto::EdgeBIO::FromBIO(wrap->enc_out)->set_eof_return(-1);
+  if (!wrap->is_server) {
+    edge::crypto::EdgeBIO::FromBIO(wrap->enc_in)->set_initial(4096);
+  }
   SSL_set_bio(wrap->ssl, wrap->enc_in, wrap->enc_out);
   SSL_set_app_data(wrap->ssl, wrap);
   SSL_set_info_callback(wrap->ssl, SslInfoCallback);
@@ -2233,20 +2442,71 @@ napi_value TlsWrapReadStop(napi_env env, napi_callback_info info) {
   return MakeInt32(env, rc);
 }
 
-int32_t QueueAppWrite(TlsWrap* wrap, napi_value req_obj, const uint8_t* data, size_t len) {
+int32_t DoAppWrite(TlsWrap* wrap, napi_value req_obj, const uint8_t* data, size_t len) {
   if (wrap == nullptr || wrap->ssl == nullptr) return UV_EINVAL;
-  PendingAppWrite pending;
-  if (req_obj != nullptr) napi_create_reference(wrap->env, req_obj, 1, &pending.req_ref);
-  if (data != nullptr && len > 0) {
-    pending.data.assign(data, data + len);
+  if (wrap->active_write_req_ref != nullptr || wrap->active_empty_write_req_ref != nullptr ||
+      !wrap->pending_cleartext_input.empty()) {
+    return UV_EBUSY;
   }
-  wrap->pending_app_writes.push_back(std::move(pending));
+
+  napi_ref req_ref = nullptr;
+  if (req_obj != nullptr &&
+      (napi_create_reference(wrap->env, req_obj, 1, &req_ref) != napi_ok || req_ref == nullptr)) {
+    return UV_ENOMEM;
+  }
+
   wrap->base.bytes_written += len;
-  SetState(wrap->env, kEdgeBytesWritten, static_cast<int32_t>(len));
-  SetState(wrap->env, kEdgeLastWriteWasAsync, 1);
-  Cycle(wrap);
-  SetState(wrap->env, kEdgeBytesWritten, static_cast<int32_t>(len));
-  SetState(wrap->env, kEdgeLastWriteWasAsync, 1);
+  auto restore_write_state = [wrap, len]() {
+    SetState(wrap->env, kEdgeBytesWritten, static_cast<int32_t>(len));
+    SetState(wrap->env, kEdgeLastWriteWasAsync, 1);
+  };
+  restore_write_state();
+
+  if (len == 0) {
+    (void)ReadCleartext(wrap);
+    if (PendingBioSize(wrap->enc_out) == 0) {
+      wrap->active_empty_write_req_ref = req_ref;
+      req_ref = nullptr;
+      QueueEncryptedWrite(wrap, 0, nullptr, true);
+    } else {
+      wrap->active_write_req_ref = req_ref;
+      req_ref = nullptr;
+      QueueNewEncryptedBytes(wrap);
+    }
+    EncOut(wrap);
+    if (req_ref != nullptr) {
+      CompleteReq(wrap, &req_ref, UV_ECANCELED);
+    }
+    restore_write_state();
+    return 0;
+  }
+
+  wrap->active_write_req_ref = req_ref;
+  req_ref = nullptr;
+
+  wrap->in_dowrite = true;
+  const int rc = SSL_write(wrap->ssl, data, static_cast<int>(len));
+  if (rc == static_cast<int>(len)) {
+    QueueNewEncryptedBytes(wrap);
+    EncOut(wrap);
+    wrap->in_dowrite = false;
+    restore_write_state();
+    return 0;
+  }
+
+  QueueNewEncryptedBytes(wrap);
+  const int err = SSL_get_error(wrap->ssl, rc);
+  if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+    wrap->in_dowrite = false;
+    DeleteRefIfPresent(wrap->env, &wrap->active_write_req_ref);
+    restore_write_state();
+    return UV_EPROTO;
+  }
+
+  wrap->pending_cleartext_input.assign(data, data + len);
+  EncOut(wrap);
+  wrap->in_dowrite = false;
+  restore_write_state();
   return 0;
 }
 
@@ -2269,7 +2529,7 @@ int TlsWrapStreamBaseWriteBuffer(EdgeStreamBase* base,
     return UV_EINVAL;
   }
 
-  const int32_t rc = QueueAppWrite(wrap, req_obj, data, len);
+  const int32_t rc = DoAppWrite(wrap, req_obj, data, len);
   if (async_out != nullptr && rc == 0) *async_out = true;
   return rc;
 }
@@ -2286,7 +2546,7 @@ napi_value TlsWrapWriteBuffer(napi_env env, napi_callback_info info) {
   if (!EdgeStreamBaseExtractByteSpan(env, argv[1], &data, &len, &refable, &temp_utf8) || data == nullptr) {
     return MakeInt32(env, UV_EINVAL);
   }
-  return MakeInt32(env, QueueAppWrite(wrap, argv[0], data, len));
+  return MakeInt32(env, DoAppWrite(wrap, argv[0], data, len));
 }
 
 napi_value TlsWrapWriteString(napi_env env, napi_callback_info info, const char* encoding_name) {
@@ -2308,7 +2568,7 @@ napi_value TlsWrapWriteString(napi_env env, napi_callback_info info, const char*
   if (!EdgeStreamBaseExtractByteSpan(env, payload, &data, &len, &refable, &temp_utf8) || data == nullptr) {
     return MakeInt32(env, UV_EINVAL);
   }
-  return MakeInt32(env, QueueAppWrite(wrap, argv[0], data, len));
+  return MakeInt32(env, DoAppWrite(wrap, argv[0], data, len));
 }
 
 napi_value TlsWrapWriteLatin1String(napi_env env, napi_callback_info info) {
@@ -2350,7 +2610,7 @@ napi_value TlsWrapWritev(napi_env env, napi_callback_info info) {
     }
     combined.insert(combined.end(), data, data + len);
   }
-  return MakeInt32(env, QueueAppWrite(wrap, argv[0], combined.data(), combined.size()));
+  return MakeInt32(env, DoAppWrite(wrap, argv[0], combined.data(), combined.size()));
 }
 
 napi_value TlsWrapShutdown(napi_env env, napi_callback_info info) {
@@ -2572,7 +2832,7 @@ napi_value TlsWrapWritesIssuedByPrevListenerDone(napi_env env, napi_callback_inf
   TlsWrap* wrap = UnwrapThis(env, info, nullptr, nullptr, nullptr);
   if (wrap != nullptr) {
     wrap->has_active_write_issued_by_prev_listener = false;
-    TryStartParentWrite(wrap);
+    EncOut(wrap);
   }
   return Undefined(env);
 }
@@ -2622,7 +2882,8 @@ napi_value TlsWrapStart(napi_env env, napi_callback_info info) {
       wrap->hello_parser.Start(OnClientHello);
     }
   }
-  Cycle(wrap);
+  (void)ReadCleartext(wrap);
+  EncOut(wrap);
   return Undefined(env);
 }
 
@@ -3388,7 +3649,6 @@ napi_value TlsWrapNewSessionDone(napi_env env, napi_callback_info info) {
   TlsWrap* wrap = UnwrapThis(env, info, nullptr, nullptr, nullptr);
   if (wrap == nullptr) return Undefined(env);
   wrap->awaiting_new_session = false;
-  TryStartParentWrite(wrap);
   Cycle(wrap);
   return Undefined(env);
 }
@@ -3402,10 +3662,7 @@ napi_value TlsWrapReceive(napi_env env, napi_callback_info info) {
   size_t len = 0;
   size_t offset = 0;
   if (!GetArrayBufferBytes(env, argv[0], &data, &len, &offset) || data == nullptr) return Undefined(env);
-  if (len > offset) {
-    (void)BIO_write(wrap->enc_in, data + offset, static_cast<int>(len - offset));
-  }
-  Cycle(wrap);
+  InjectParentStreamBytes(wrap, data + offset, len - offset);
   return Undefined(env);
 }
 
@@ -3418,7 +3675,7 @@ napi_value TlsWrapGetWriteQueueSize(napi_env env, napi_callback_info info) {
   uint32_t size = 0;
   if (wrap != nullptr) {
     for (const auto& pending : wrap->pending_encrypted_writes) {
-      size += static_cast<uint32_t>(pending.data.size());
+      size += static_cast<uint32_t>(pending.size);
     }
   }
 

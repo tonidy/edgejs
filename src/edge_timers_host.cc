@@ -11,10 +11,15 @@
 #include "edge_env_loop.h"
 #include "edge_runtime.h"
 #include "edge_runtime_platform.h"
+#include "edge_worker_env.h"
 
 namespace {
 
+struct TimersHostState;
 void DeleteRefIfAny(napi_env env, napi_ref* ref_slot);
+bool GetProcessReceiver(napi_env env, napi_value* recv_out);
+bool RunTimersCallbackCheckpoint(TimersHostState* st);
+bool CanCallTimersCallback(TimersHostState* st);
 
 struct TimersHostState {
   explicit TimersHostState(napi_env env_in) : env(env_in) {}
@@ -40,7 +45,6 @@ struct TimersHostState {
   bool idle_initialized = false;
   bool idle_running = false;
   bool running_timers_callback = false;
-  bool timer_rescheduled_in_callback = false;
   bool cleanup_started = false;
   uint32_t pending_handle_closes = 0;
 };
@@ -342,10 +346,10 @@ bool CallImmediateCallback(TimersHostState* st) {
 
   napi_value cb = nullptr;
   if (napi_get_reference_value(st->env, st->immediate_callback_ref, &cb) != napi_ok || cb == nullptr) return true;
-  napi_value global = nullptr;
-  napi_get_global(st->env, &global);
+  napi_value recv = nullptr;
+  if (!GetProcessReceiver(st->env, &recv) || recv == nullptr) return false;
   napi_value ignored = nullptr;
-  const napi_status status = EdgeMakeCallback(st->env, global, cb, 0, nullptr, &ignored);
+  const napi_status status = EdgeMakeCallback(st->env, recv, cb, 0, nullptr, &ignored);
   if (status != napi_ok) {
     DebugLog("CallImmediateCallback JS error (status=%d), stopping loop turn", static_cast<int>(status));
     StopLoopOnJsError(st);
@@ -364,13 +368,34 @@ double CallTimersCallback(TimersHostState* st, double now) {
   napi_value now_value = nullptr;
   if (napi_create_double(st->env, now, &now_value) != napi_ok || now_value == nullptr) return 0;
 
-  napi_value global = nullptr;
-  napi_get_global(st->env, &global);
+  napi_value recv = nullptr;
+  if (!GetProcessReceiver(st->env, &recv) || recv == nullptr) return 0;
   napi_value result = nullptr;
-  const napi_status call_status = EdgeMakeCallback(st->env, global, cb, 1, &now_value, &result);
-  if (call_status != napi_ok || result == nullptr) {
-    DebugLog("CallTimersCallback JS error (status=%d), stopping loop turn", static_cast<int>(call_status));
-    StopLoopOnJsError(st);
+  napi_status call_status = napi_ok;
+  do {
+    result = nullptr;
+    call_status = EdgeMakeCallbackWithFlags(
+        st->env,
+        recv,
+        cb,
+        1,
+        &now_value,
+        &result,
+        kEdgeMakeCallbackSkipTaskQueues);
+    if (call_status == napi_ok && result != nullptr) break;
+
+    bool pending = false;
+    if (napi_is_exception_pending(st->env, &pending) == napi_ok && pending) {
+      StopLoopOnJsError(st);
+      return 0;
+    }
+  } while (result == nullptr && CanCallTimersCallback(st));
+
+  if (result == nullptr) {
+    if (call_status != napi_ok) {
+      DebugLog("CallTimersCallback JS error (status=%d), stopping loop turn", static_cast<int>(call_status));
+      StopLoopOnJsError(st);
+    }
     return 0;
   }
 
@@ -378,6 +403,50 @@ double CallTimersCallback(TimersHostState* st, double now) {
   if (napi_get_value_double(st->env, result, &next) != napi_ok || !std::isfinite(next)) return 0;
   DebugLog("CallTimersCallback => next=%.3f", next);
   return next;
+}
+
+bool CanCallTimersCallback(TimersHostState* st) {
+  if (st == nullptr || st->cleanup_started || st->env == nullptr) return false;
+  if (!EdgeWorkerEnvOwnsProcessState(st->env) && EdgeWorkerEnvStopRequested(st->env)) return false;
+  return true;
+}
+
+bool GetProcessReceiver(napi_env env, napi_value* recv_out) {
+  if (recv_out == nullptr) return false;
+  *recv_out = nullptr;
+  if (env == nullptr) return false;
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+
+  napi_value process = nullptr;
+  if (napi_get_named_property(env, global, "process", &process) == napi_ok && process != nullptr) {
+    *recv_out = process;
+  } else {
+    *recv_out = global;
+  }
+  return true;
+}
+
+bool RunTimersCallbackCheckpoint(TimersHostState* st) {
+  if (st == nullptr || st->cleanup_started || st->env == nullptr) return false;
+  const napi_status status = EdgeRunCallbackScopeCheckpoint(st->env);
+  if (status == napi_ok) return true;
+
+  bool handled = false;
+  (void)EdgeHandlePendingExceptionNow(st->env, &handled);
+
+  bool pending = false;
+  if (napi_is_exception_pending(st->env, &pending) == napi_ok && pending) {
+    StopLoopOnJsError(st);
+    return false;
+  }
+
+  if (status != napi_pending_exception) {
+    StopLoopOnJsError(st);
+    return false;
+  }
+  return handled;
 }
 
 void ApplyTimerRefState(TimersHostState* st, bool ref) {
@@ -411,37 +480,17 @@ void ApplyImmediateRefState(TimersHostState* st, bool ref) {
 
 void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now);
 
-bool TimerCallbackResultNeedsRefresh(TimersHostState* st, double next_expiry) {
-  if (st == nullptr || st->env == nullptr || !std::isfinite(next_expiry)) return false;
-  const bool has_refed_timeouts = ActiveTimeoutCount(st) > 0;
-  if (next_expiry > 0) return !has_refed_timeouts;
-  if (next_expiry < 0) return has_refed_timeouts;
-  return has_refed_timeouts;
-}
-
 void RunTimersCallback(uv_timer_t* handle) {
   auto* state = static_cast<TimersHostState*>(handle->data);
   if (state == nullptr || state->cleanup_started) return;
 
   state->running_timers_callback = true;
-  state->timer_rescheduled_in_callback = false;
 
   double now_ms = GetNowMs(state);
   double next = CallTimersCallback(state, now_ms);
-  if (!state->timer_rescheduled_in_callback && TimerCallbackResultNeedsRefresh(state, next)) {
-    DebugLog("refreshing stale timer callback result next=%.3f active_refed=%d",
-             next,
-             ActiveTimeoutCount(state));
-    now_ms = GetNowMs(state);
-    next = CallTimersCallback(state, now_ms);
-  }
-
-  const bool timer_rescheduled = state->timer_rescheduled_in_callback;
   state->running_timers_callback = false;
-  state->timer_rescheduled_in_callback = false;
-  if (!timer_rescheduled) {
-    ScheduleFromNextExpiry(state, next, now_ms);
-  }
+  ScheduleFromNextExpiry(state, next, now_ms);
+  (void)RunTimersCallbackCheckpoint(state);
 }
 
 void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now) {
@@ -509,9 +558,6 @@ napi_value ScheduleTimer(napi_env env, napi_callback_info info) {
 
   EnsureTimerHandle(st);
   if (st->timer_initialized) {
-    if (st->running_timers_callback) {
-      st->timer_rescheduled_in_callback = true;
-    }
     uv_timer_start(&st->timer_handle, RunTimersCallback, static_cast<uint64_t>(duration), 0);
     ApplyTimerRefState(st, ActiveTimeoutCount(st) > 0);
   }

@@ -218,7 +218,7 @@ napi_value PipeCtor(napi_env env, napi_callback_info info) {
   }, nullptr, &wrap->base.wrapper_ref);
   EdgeStreamBaseSetWrapperRef(&wrap->base, wrap->base.wrapper_ref);
   EdgeStreamBaseSetInitialStreamProperties(&wrap->base, false, false);
-  if (socket_type == kPipeServer) {
+  if (socket_type != kPipeIPC) {
     napi_value undefined = EdgeStreamBaseUndefined(env);
     if (undefined != nullptr) {
       napi_set_named_property(env, self, "getsockname", undefined);

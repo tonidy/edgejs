@@ -4381,6 +4381,16 @@ napi_value SecureContextGetTicketKeys(napi_env env, napi_callback_info info) {
   return out != nullptr ? out : Undefined(env);
 }
 
+napi_value SecureContextEnableTicketKeyCallback(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
+  if (wrap == nullptr) return Undefined(env);
+  SecureContextCallBindingMethod(env, wrap, "secureContextEnableTicketKeyCallback", 0, nullptr);
+  return Undefined(env);
+}
+
 napi_value SecureContextSetAllowPartialTrustChain(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
@@ -8846,6 +8856,8 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
                    nullptr},
                   {"getTicketKeys", nullptr, SecureContextGetTicketKeys, nullptr, nullptr, nullptr, napi_default,
                    nullptr},
+                  {"enableTicketKeyCallback", nullptr, SecureContextEnableTicketKeyCallback, nullptr, nullptr,
+                   nullptr, napi_default, nullptr},
                   {"setAllowPartialTrustChain", nullptr, SecureContextSetAllowPartialTrustChain, nullptr, nullptr,
                    nullptr, napi_default, nullptr},
                   {"getCertificate", nullptr, SecureContextGetCertificate, nullptr, nullptr, nullptr, napi_default,

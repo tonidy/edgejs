@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -1959,10 +1960,14 @@ napi_value CryptoSecureContextSetKey(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   std::string passphrase;
-  bool has_passphrase = false;
+  bool has_passphrase = true;
   if (argc >= 3 && !ReadPassphrase(env, argv[2], &passphrase, &has_passphrase)) {
     ThrowError(env, "ERR_INVALID_ARG_TYPE", "passphrase must be a string or Buffer");
     return nullptr;
+  }
+  if (argc < 3 || IsNullOrUndefined(env, argv[2])) {
+    passphrase.clear();
+    has_passphrase = true;
   }
   EVP_PKEY* pkey = ParsePrivateKeyWithPassphrase(key_bytes,
                                                  key_len,
@@ -2190,6 +2195,21 @@ napi_value CryptoSecureContextGetTicketKeys(napi_env env, napi_callback_info inf
   }
   EnsureTicketCallback(holder);
   return CreateBufferCopy(env, holder->ticket_keys.data(), holder->ticket_keys.size());
+}
+
+napi_value CryptoSecureContextEnableTicketKeyCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  EnsureTicketCallback(holder);
+  napi_value true_v = nullptr;
+  napi_get_boolean(env, true, &true_v);
+  return true_v;
 }
 
 napi_value CryptoSecureContextLoadPKCS12(napi_env env, napi_callback_info info) {
@@ -2483,7 +2503,7 @@ EVP_PKEY* ParsePrivateKeyWithPassphraseImpl(const uint8_t* data,
                                             bool has_passphrase) {
   ERR_clear_error();
   struct PassphraseSpan {
-    const uint8_t* data = nullptr;
+    const char* data = reinterpret_cast<const char*>(-1);
     size_t len = 0;
   };
   auto password_callback = [](char* buf, int size, int /*rwflag*/, void* userdata) -> int {
@@ -2491,7 +2511,7 @@ EVP_PKEY* ParsePrivateKeyWithPassphraseImpl(const uint8_t* data,
     if (span == nullptr) return -1;
     const size_t buflen = static_cast<size_t>(size);
     if (buflen < span->len) return -1;
-    if (span->len > 0 && span->data != nullptr) {
+    if (span->len > 0) {
       std::memcpy(buf, span->data, span->len);
     }
     return static_cast<int>(span->len);
@@ -2500,8 +2520,12 @@ EVP_PKEY* ParsePrivateKeyWithPassphraseImpl(const uint8_t* data,
   BIO* bio = BIO_new_mem_buf(data, static_cast<int>(len));
   if (bio == nullptr) return nullptr;
   PassphraseSpan passphrase_span;
-  passphrase_span.data = has_passphrase ? passphrase : nullptr;
-  passphrase_span.len = has_passphrase ? passphrase_len : 0;
+  if (has_passphrase) {
+    if (passphrase != nullptr) {
+      passphrase_span.data = reinterpret_cast<const char*>(passphrase);
+    }
+    passphrase_span.len = passphrase_len;
+  }
   void* passphrase_arg = has_passphrase ? &passphrase_span : nullptr;
   pem_password_cb* password_cb = password_callback;
   EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, password_cb, passphrase_arg);
@@ -3072,7 +3096,7 @@ napi_value CryptoPublicEncrypt(napi_env env, napi_callback_info info) {
                                          has_passphrase);
   }
   if (pkey == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid public key");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse public key");
     return nullptr;
   }
   EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
@@ -3159,7 +3183,7 @@ napi_value CryptoPrivateEncrypt(napi_env env, napi_callback_info info) {
                                                  passphrase.size(),
                                                  has_passphrase);
   if (pkey == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid private key");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse private key");
     return nullptr;
   }
   RSA* rsa = EVP_PKEY_get1_RSA(pkey);
@@ -3224,7 +3248,7 @@ napi_value CryptoPrivateDecrypt(napi_env env, napi_callback_info info) {
                                                  passphrase.size(),
                                                  has_passphrase);
   if (pkey == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid private key");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse private key");
     return nullptr;
   }
   EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
@@ -3315,7 +3339,7 @@ napi_value CryptoPublicDecrypt(napi_env env, napi_callback_info info) {
                                          has_passphrase);
   }
   if (pkey == nullptr) {
-    ThrowLastOpenSslError(env, "ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE", "Invalid public key");
+    ThrowLastOpenSslError(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse public key");
     return nullptr;
   }
   RSA* rsa = EVP_PKEY_get1_RSA(pkey);
@@ -4197,6 +4221,7 @@ napi_value InstallCryptoBinding(napi_env env) {
   SetMethod(env, binding, "secureContextSetSessionTimeout", CryptoSecureContextSetSessionTimeout);
   SetMethod(env, binding, "secureContextSetTicketKeys", CryptoSecureContextSetTicketKeys);
   SetMethod(env, binding, "secureContextGetTicketKeys", CryptoSecureContextGetTicketKeys);
+  SetMethod(env, binding, "secureContextEnableTicketKeyCallback", CryptoSecureContextEnableTicketKeyCallback);
   SetMethod(env, binding, "secureContextLoadPKCS12", CryptoSecureContextLoadPKCS12);
   SetMethod(env, binding, "secureContextSetSigalgs", CryptoSecureContextSetSigalgs);
   SetMethod(env, binding, "secureContextSetECDHCurve", CryptoSecureContextSetECDHCurve);
