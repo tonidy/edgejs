@@ -1,6 +1,7 @@
 #include "internal_binding/dispatch.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -36,7 +37,11 @@ namespace {
 constexpr size_t kFsStatsLength = 18;
 constexpr size_t kFsStatFsLength = 7;
 
+struct AsyncFsReq;
+
 void ResetRef(napi_env env, napi_ref* ref_ptr);
+void DestroyAsyncFsReq(AsyncFsReq* async_req);
+void FinishAsyncFsReq(AsyncFsReq* async_req, int result);
 
 struct FsBindingState {
   explicit FsBindingState(napi_env env_in) : env(env_in) {}
@@ -50,6 +55,11 @@ struct FsBindingState {
     ResetRef(env, &fs_req_ctor_ref);
     ResetRef(env, &stat_watcher_ctor_ref);
     ResetRef(env, &k_use_promises_symbol_ref);
+    for (auto& entry : pending_fifo_writer_opens) {
+      for (auto* req : entry.second) {
+        DestroyAsyncFsReq(req);
+      }
+    }
   }
 
   napi_env env = nullptr;
@@ -59,6 +69,7 @@ struct FsBindingState {
   napi_ref fs_req_ctor_ref = nullptr;
   napi_ref stat_watcher_ctor_ref = nullptr;
   napi_ref k_use_promises_symbol_ref = nullptr;
+  std::unordered_map<std::string, std::vector<AsyncFsReq*>> pending_fifo_writer_opens;
 };
 int64_t g_next_file_handle_async_id = 600000;
 int64_t g_next_stat_watcher_async_id = 700000;
@@ -688,7 +699,8 @@ bool ScheduleDeferredReqCompletion(napi_env env,
                                    napi_value oncomplete,
                                    napi_value err,
                                    napi_value value,
-                                   napi_value extra = nullptr) {
+                                   napi_value extra = nullptr,
+                                   bool use_set_immediate = false) {
   if (env == nullptr || req == nullptr || oncomplete == nullptr) return false;
   auto* completion = new DeferredReqCompletion();
   completion->env = env;
@@ -720,24 +732,41 @@ bool ScheduleDeferredReqCompletion(napi_env env,
   }
 
   napi_value global = GetGlobal(env);
-  napi_value process = nullptr;
-  napi_value next_tick = nullptr;
-  napi_valuetype next_tick_type = napi_undefined;
-  if (global == nullptr ||
-      napi_get_named_property(env, global, "process", &process) != napi_ok ||
-      process == nullptr ||
-      napi_get_named_property(env, process, "nextTick", &next_tick) != napi_ok ||
-      next_tick == nullptr ||
-      napi_typeof(env, next_tick, &next_tick_type) != napi_ok ||
-      next_tick_type != napi_function) {
+  napi_value scheduler_recv = global;
+  napi_value scheduler = nullptr;
+  napi_valuetype scheduler_type = napi_undefined;
+  if (global == nullptr) {
     UntrackActiveRequest(env, req);
     DestroyDeferredReqCompletion(completion);
     return false;
   }
+  if (use_set_immediate) {
+    if (napi_get_named_property(env, global, "setImmediate", &scheduler) != napi_ok ||
+        scheduler == nullptr ||
+        napi_typeof(env, scheduler, &scheduler_type) != napi_ok ||
+        scheduler_type != napi_function) {
+      UntrackActiveRequest(env, req);
+      DestroyDeferredReqCompletion(completion);
+      return false;
+    }
+  } else {
+    napi_value process = nullptr;
+    if (napi_get_named_property(env, global, "process", &process) != napi_ok ||
+        process == nullptr ||
+        napi_get_named_property(env, process, "nextTick", &scheduler) != napi_ok ||
+        scheduler == nullptr ||
+        napi_typeof(env, scheduler, &scheduler_type) != napi_ok ||
+        scheduler_type != napi_function) {
+      UntrackActiveRequest(env, req);
+      DestroyDeferredReqCompletion(completion);
+      return false;
+    }
+    scheduler_recv = process;
+  }
 
   napi_value argv[1] = {callback};
   napi_value ignored = nullptr;
-  if (napi_call_function(env, process, next_tick, 1, argv, &ignored) != napi_ok) {
+  if (napi_call_function(env, scheduler_recv, scheduler, 1, argv, &ignored) != napi_ok) {
     UntrackActiveRequest(env, req);
     DestroyDeferredReqCompletion(completion);
     return false;
@@ -954,6 +983,7 @@ struct AsyncFsReq {
   napi_ref oncomplete_ref = nullptr;
   napi_ref extra_ref = nullptr;
   napi_deferred deferred = nullptr;
+  uv_work_t work{};
   uv_fs_t req{};
   AsyncFsResultKind result_kind = AsyncFsResultKind::kUndefined;
   const char* syscall = nullptr;
@@ -963,7 +993,28 @@ struct AsyncFsReq {
   uv_buf_t* bufs = nullptr;
   size_t nbufs = 0;
   bool track_unmanaged_fd = false;
+  bool uses_uv_fs_req = false;
+  int open_flags = 0;
+  int open_mode = 0;
+  int open_result = 0;
+  bool defer_callback_completion = false;
+  bool hold_fifo_writer_completion = false;
+  bool fifo_read_open = false;
 };
+
+void ReleasePendingFifoWriterOpens(napi_env env, const std::string& path) {
+  FsBindingState* st = GetState(env);
+  if (st == nullptr || path.empty()) return;
+  auto it = st->pending_fifo_writer_opens.find(path);
+  if (it == st->pending_fifo_writer_opens.end()) return;
+  std::vector<AsyncFsReq*> pending = std::move(it->second);
+  st->pending_fifo_writer_opens.erase(it);
+  for (AsyncFsReq* req : pending) {
+    if (req == nullptr) continue;
+    req->hold_fifo_writer_completion = false;
+    FinishAsyncFsReq(req, req->open_result);
+  }
+}
 
 void HoldFileHandleRef(FileHandleWrap* wrap) {
   if (wrap == nullptr || wrap->env == nullptr || wrap->wrapper_ref == nullptr) return;
@@ -995,8 +1046,23 @@ void DestroyAsyncFsReq(AsyncFsReq* async_req) {
   }
   delete[] async_req->hold_refs;
   delete[] async_req->bufs;
-  uv_fs_req_cleanup(&async_req->req);
+  if (async_req->uses_uv_fs_req) {
+    uv_fs_req_cleanup(&async_req->req);
+  }
   delete async_req;
+}
+
+bool ShouldUseBlockingFifoOpen(const std::string& path, int flags) {
+#ifdef _WIN32
+  (void)path;
+  (void)flags;
+  return false;
+#else
+  if ((flags & O_NONBLOCK) != 0 || path.empty()) return false;
+  struct stat st;
+  if (lstat(path.c_str(), &st) != 0) return false;
+  return S_ISFIFO(st.st_mode);
+#endif
 }
 
 bool IsNullOrUndefined(napi_env env, napi_value value) {
@@ -1291,6 +1357,12 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
     value = MakeAsyncFsResultValue(async_req, result);
   }
 
+  if (result >= 0 && async_req->hold_fifo_writer_completion) {
+    FsBindingState& st = EnsureState(env);
+    st.pending_fifo_writer_opens[async_req->path_storage].push_back(async_req);
+    return;
+  }
+
   if (async_req->req_kind == ReqKind::kPromise && async_req->deferred != nullptr) {
     if (result < 0) {
       (void)napi_reject_deferred(env, async_req->deferred, err != nullptr ? err : Undefined(env));
@@ -1298,6 +1370,9 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
       (void)napi_resolve_deferred(env, async_req->deferred, value != nullptr ? value : Undefined(env));
     }
     (void)EdgeRunCallbackScopeCheckpoint(env);
+    if (result >= 0 && async_req->fifo_read_open) {
+      ReleasePendingFifoWriterOpens(env, async_req->path_storage);
+    }
     DestroyAsyncFsReq(async_req);
     return;
   }
@@ -1318,8 +1393,26 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
         argv[1] = value;
         argc = (extra != nullptr && !IsUndefined(env, extra)) ? 3 : 2;
       }
+      if (async_req->defer_callback_completion &&
+          ScheduleDeferredReqCompletion(env,
+                                        req,
+                                        oncomplete,
+                                        result < 0 ? (argc >= 1 ? argv[0] : nullptr) : nullptr,
+                                        result >= 0 && argc >= 2 ? argv[1] : nullptr,
+                                        argc >= 3 ? argv[2] : nullptr,
+                                        true)) {
+        if (result >= 0 && async_req->fifo_read_open) {
+          ReleasePendingFifoWriterOpens(env, async_req->path_storage);
+        }
+        DestroyAsyncFsReq(async_req);
+        return;
+      }
       InvokeFsReqCallback(env, req, oncomplete, argc, argv);
     }
+  }
+
+  if (result >= 0 && async_req->fifo_read_open) {
+    ReleasePendingFifoWriterOpens(env, async_req->path_storage);
   }
 
   DestroyAsyncFsReq(async_req);
@@ -1329,6 +1422,27 @@ void AfterAsyncFsReq(uv_fs_t* req) {
   auto* async_req = static_cast<AsyncFsReq*>(req != nullptr ? req->data : nullptr);
   if (async_req == nullptr) return;
   FinishAsyncFsReq(async_req, static_cast<int>(req->result));
+}
+
+void BlockingOpenWork(uv_work_t* work) {
+  auto* async_req = static_cast<AsyncFsReq*>(work != nullptr ? work->data : nullptr);
+  if (async_req == nullptr) return;
+#ifdef _WIN32
+  async_req->open_result = UV_ENOSYS;
+#else
+  const int fd = ::open(async_req->path_storage.c_str(), async_req->open_flags, async_req->open_mode);
+  async_req->open_result = fd >= 0 ? fd : uv_translate_sys_error(errno);
+#endif
+}
+
+void AfterBlockingOpenWork(uv_work_t* work, int status) {
+  auto* async_req = static_cast<AsyncFsReq*>(work != nullptr ? work->data : nullptr);
+  if (async_req == nullptr) return;
+  if (status < 0) {
+    FinishAsyncFsReq(async_req, status);
+    return;
+  }
+  FinishAsyncFsReq(async_req, async_req->open_result);
 }
 
 AsyncFsReq* CreateAsyncFsReq(napi_env env,
@@ -2724,14 +2838,27 @@ napi_value FsOpen(napi_env env, napi_callback_info info) {
       async_req->path_storage = std::move(path);
 
       uv_loop_t* loop = EdgeGetEnvLoop(env);
-      const int rc = loop != nullptr
-                         ? uv_fs_open(loop,
-                                      &async_req->req,
-                                      async_req->path_storage.c_str(),
-                                      flags,
-                                      mode,
-                                      AfterAsyncFsReq)
-                         : UV_EINVAL;
+      int rc = UV_EINVAL;
+      if (loop != nullptr) {
+        if (ShouldUseBlockingFifoOpen(async_req->path_storage, flags)) {
+          const int access_mode = flags & O_ACCMODE;
+          async_req->defer_callback_completion = true;
+          async_req->hold_fifo_writer_completion = access_mode == O_WRONLY;
+          async_req->fifo_read_open = access_mode == O_RDONLY;
+          async_req->open_flags = flags;
+          async_req->open_mode = mode;
+          async_req->work.data = async_req;
+          rc = uv_queue_work(loop, &async_req->work, BlockingOpenWork, AfterBlockingOpenWork);
+        } else {
+          async_req->uses_uv_fs_req = true;
+          rc = uv_fs_open(loop,
+                          &async_req->req,
+                          async_req->path_storage.c_str(),
+                          flags,
+                          mode,
+                          AfterAsyncFsReq);
+        }
+      }
       if (rc < 0) FinishAsyncFsReq(async_req, rc);
       return req_kind == ReqKind::kPromise ? promise : Undefined(env);
     }
@@ -3229,14 +3356,27 @@ napi_value FsOpenFileHandle(napi_env env, napi_callback_info info) {
       async_req->result_kind = AsyncFsResultKind::kFileHandle;
       async_req->path_storage = std::move(path);
       uv_loop_t* loop = EdgeGetEnvLoop(env);
-      const int rc = loop != nullptr
-                         ? uv_fs_open(loop,
-                                      &async_req->req,
-                                      async_req->path_storage.c_str(),
-                                      flags,
-                                      mode,
-                                      AfterAsyncFsReq)
-                         : UV_EINVAL;
+      int rc = UV_EINVAL;
+      if (loop != nullptr) {
+        if (ShouldUseBlockingFifoOpen(async_req->path_storage, flags)) {
+          const int access_mode = flags & O_ACCMODE;
+          async_req->defer_callback_completion = true;
+          async_req->hold_fifo_writer_completion = access_mode == O_WRONLY;
+          async_req->fifo_read_open = access_mode == O_RDONLY;
+          async_req->open_flags = flags;
+          async_req->open_mode = mode;
+          async_req->work.data = async_req;
+          rc = uv_queue_work(loop, &async_req->work, BlockingOpenWork, AfterBlockingOpenWork);
+        } else {
+          async_req->uses_uv_fs_req = true;
+          rc = uv_fs_open(loop,
+                          &async_req->req,
+                          async_req->path_storage.c_str(),
+                          flags,
+                          mode,
+                          AfterAsyncFsReq);
+        }
+      }
       if (rc < 0) FinishAsyncFsReq(async_req, rc);
       return req_kind == ReqKind::kPromise ? promise : Undefined(env);
     }

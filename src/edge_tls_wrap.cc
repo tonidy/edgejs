@@ -2901,14 +2901,6 @@ napi_value TlsWrapRenegotiate(napi_env env, napi_callback_info info) {
     napi_throw(env, CreateLastOpenSslError(env, nullptr, "TLS renegotiation failed"));
     return nullptr;
   }
-  const int handshake_result = SSL_do_handshake(wrap->ssl);
-  if (handshake_result != 1) {
-    const int ssl_error = SSL_get_error(wrap->ssl, handshake_result);
-    if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
-      napi_throw(env, CreateLastOpenSslError(env, nullptr, "TLS renegotiation failed"));
-      return nullptr;
-    }
-  }
 #endif
   return Undefined(env);
 }
