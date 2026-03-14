@@ -370,6 +370,9 @@ const EdgeStreamBaseOps kTlsWrapOps = {
     nullptr,
     nullptr,
     nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
     TlsWrapStreamBaseWriteBuffer,
 };
 
@@ -870,7 +873,7 @@ void NotifyTlsStreamClosed(TlsWrap* wrap) {
 void EmitOnReadData(TlsWrap* wrap, const uint8_t* data, size_t len) {
   if (wrap == nullptr || wrap->env == nullptr) return;
   size_t offset = 0;
-  while (offset < len) {
+  while (offset < len && wrap->ssl != nullptr) {
     uv_buf_t buf = uv_buf_init(nullptr, 0);
     if (!EdgeStreamEmitAlloc(&wrap->base.listener_state, len - offset, &buf) ||
         buf.base == nullptr ||
@@ -889,7 +892,7 @@ void EmitOnReadData(TlsWrap* wrap, const uint8_t* data, size_t len) {
       free(buf.base);
     }
     offset += chunk_len;
-    if (chunk_len == 0) return;
+    if (chunk_len == 0 || wrap->ssl == nullptr || wrap->base.destroy_notified) return;
   }
 }
 
@@ -1188,6 +1191,7 @@ bool SetSecureContextOnSsl(TlsWrap* wrap, edge::crypto::SecureContextHolder* hol
   SSL_CTX_set_tlsext_status_cb(holder->ctx, TLSExtStatusCallback);
   SSL_CTX_set_tlsext_status_arg(holder->ctx, nullptr);
   if (SSL_set_SSL_CTX(wrap->ssl, holder->ctx) == nullptr) return false;
+  SSL_set_options(wrap->ssl, SSL_CTX_get_options(holder->ctx));
   wrap->secure_context = holder;
   X509_STORE* store = SSL_CTX_get_cert_store(holder->ctx);
   if (store != nullptr && SSL_set1_verify_cert_store(wrap->ssl, store) != 1) return false;
@@ -2289,9 +2293,9 @@ bool WritePendingCleartextInput(TlsWrap* wrap) {
   QueueNewEncryptedBytes(wrap);
   const int err = SSL_get_error(wrap->ssl, rc);
   if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+    const std::string error_string = PeekLastOpenSslErrorString("TLS write failed");
     wrap->pending_cleartext_input.clear();
     wrap->write_callback_scheduled = true;
-    const std::string error_string = PeekLastOpenSslErrorString("TLS write failed");
     InvokeQueued(wrap, UV_EPROTO, error_string.c_str());
     return true;
   }
@@ -2310,6 +2314,9 @@ bool ReadCleartext(TlsWrap* wrap) {
     if (rc > 0) {
       EmitOnReadData(wrap, reinterpret_cast<const uint8_t*>(buffer), static_cast<size_t>(rc));
       made_progress = true;
+      if (wrap->ssl == nullptr || wrap->base.destroy_notified) {
+        return made_progress;
+      }
       continue;
     }
     const int err = SSL_get_error(wrap->ssl, rc);
@@ -2323,10 +2330,11 @@ bool ReadCleartext(TlsWrap* wrap) {
       break;
     }
     if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+      napi_value error = CreateLastOpenSslError(wrap->env, "ERR_TLS_READ", "TLS read failed");
       QueueNewEncryptedBytes(wrap);
       EncOut(wrap);
       made_progress = made_progress || wrap->parent_write_in_progress;
-      EmitError(wrap, CreateLastOpenSslError(wrap->env, "ERR_TLS_READ", "TLS read failed"));
+      EmitError(wrap, error);
       break;
     }
     break;
@@ -3414,7 +3422,10 @@ napi_value BuildDetailedPeerCertificateObject(napi_env env, SSL* ssl, bool is_se
 napi_value TlsWrapVerifyError(napi_env env, napi_callback_info info) {
   TlsWrap* wrap = UnwrapThis(env, info, nullptr, nullptr, nullptr);
   if (wrap == nullptr || wrap->ssl == nullptr) return Null(env);
-  const long verify_error = SSL_get_verify_result(wrap->ssl);
+  ncrypto::SSLPointer ssl_view(wrap->ssl);
+  long verify_error = static_cast<long>(
+      ssl_view.verifyPeerCertificate().value_or(X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT));
+  ssl_view.release();
   if (verify_error == X509_V_OK) return Null(env);
   const char* code = ncrypto::X509Pointer::ErrorCode(static_cast<int32_t>(verify_error));
   const char* reason = X509_verify_cert_error_string(verify_error);
