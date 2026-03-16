@@ -118,7 +118,7 @@ dist-only:
 	cd $(DIST_DIR) && zip -r ../$(ZIP_NAME) bin bin-compat README.md lib
 
 framework-test: $(EDGE_BINARY)
-	@"$(EDGE_BINARY)" "$(FRAMEWORK_TEST_SCRIPT)" setup $(FRAMEWORK_TEST_SELECTOR)
+	@"$(EDGE_BINARY)" "$(FRAMEWORK_TEST_SCRIPT)" test $(FRAMEWORK_TEST_SELECTOR)
 
 framework-test-reset:
 	@if [ -x "$(EDGE_BINARY)" ]; then \
