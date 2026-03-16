@@ -1206,9 +1206,22 @@ napi_value CryptoRandomFillSync(napi_env env, napi_callback_info info) {
     ThrowError(env, "ERR_OUT_OF_RANGE", "offset/size out of range");
     return nullptr;
   }
-  if (!ncrypto::CSPRNG(data + offset, static_cast<size_t>(size))) {
+  if (size == 0) return argv[0];
+  // Generate random bytes into a local buffer, then write them back to the
+  // JS typed array through N-API.  Direct writes via the raw data pointer are
+  // lost in the WASIX N-API bridge because the guest linear memory and the
+  // host-side ArrayBuffer backing store are not shared.  See
+  // wasix/WASIX_TODO.md ("external ArrayBuffer / Buffer backing semantics")
+  // and napi/v8/src/js_native_api_v8.cc napi_get_typedarray_info (line ~920).
+  std::vector<uint8_t> tmp(static_cast<size_t>(size));
+  if (!ncrypto::CSPRNG(tmp.data(), tmp.size())) {
     ThrowError(env, "ERR_CRYPTO_OPERATION_FAILED", "CSPRNG failed");
     return nullptr;
+  }
+  for (int32_t i = 0; i < size; i++) {
+    napi_value byte_val = nullptr;
+    napi_create_uint32(env, tmp[i], &byte_val);
+    napi_set_element(env, argv[0], static_cast<uint32_t>(offset + i), byte_val);
   }
   return argv[0];
 }
