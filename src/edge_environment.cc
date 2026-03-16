@@ -1,16 +1,23 @@
 #include "edge_environment.h"
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <new>
 #include <utility>
 
+#include "edge_runtime_platform.h"
+#include "edge_timers_host.h"
+#include "edge_worker_env.h"
 #include "unofficial_napi.h"
 
 namespace {
 
 std::mutex g_environment_mu;
 std::unordered_map<napi_env, std::unique_ptr<edge::Environment>> g_environments;
+constexpr int kImmediateCount = 0;
+constexpr int kImmediateRefCount = 1;
+constexpr int kImmediateHasOutstanding = 2;
 
 struct DetachedSlotState {
   std::unordered_map<size_t, edge::SlotEntry> slots;
@@ -170,6 +177,13 @@ void AppendStringValue(napi_env env, napi_value array, uint32_t* index, const st
   napi_value str = nullptr;
   if (napi_create_string_utf8(env, value.c_str(), value.size(), &str) != napi_ok || str == nullptr) return;
   AppendArrayValue(env, array, index, str);
+}
+
+void StopLoopOnJsError(edge::Environment* env) {
+  if (env == nullptr) return;
+  if (uv_loop_t* loop = env->GetExistingEventLoop(); loop != nullptr) {
+    uv_stop(loop);
+  }
 }
 
 }  // namespace
@@ -489,7 +503,7 @@ uv_loop_t* Environment::ReleaseEventLoop() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     wait_for_threadsafe_async_close = threadsafe_immediate_async_initialized_;
-    CloseThreadsafeImmediateHandleLocked();
+    ClosePerEnvHandlesLocked();
     loop = loop_;
     loop_ = nullptr;
   }
@@ -527,6 +541,40 @@ bool Environment::EnsureThreadsafeImmediateHandleLocked() {
   return true;
 }
 
+bool Environment::EnsureTimerHandleLocked() {
+  if (timer_handle_initialized_) return true;
+  if (loop_ == nullptr) return false;
+  if (uv_timer_init(loop_, &timer_handle_) != 0) return false;
+  timer_handle_.data = this;
+  uv_unref(reinterpret_cast<uv_handle_t*>(&timer_handle_));
+  timer_handle_initialized_ = true;
+  return true;
+}
+
+bool Environment::EnsureImmediateCheckHandleLocked() {
+  if (immediate_check_handle_initialized_) return true;
+  if (loop_ == nullptr) return false;
+  if (uv_check_init(loop_, &immediate_check_handle_) != 0) return false;
+  immediate_check_handle_.data = this;
+  uv_unref(reinterpret_cast<uv_handle_t*>(&immediate_check_handle_));
+  if (uv_check_start(&immediate_check_handle_, OnImmediateCheck) != 0) {
+    uv_close(reinterpret_cast<uv_handle_t*>(&immediate_check_handle_), nullptr);
+    return false;
+  }
+  immediate_check_handle_initialized_ = true;
+  immediate_check_handle_running_ = true;
+  return true;
+}
+
+bool Environment::EnsureImmediateIdleHandleLocked() {
+  if (immediate_idle_handle_initialized_) return true;
+  if (loop_ == nullptr) return false;
+  if (uv_idle_init(loop_, &immediate_idle_handle_) != 0) return false;
+  immediate_idle_handle_.data = this;
+  immediate_idle_handle_initialized_ = true;
+  return true;
+}
+
 void Environment::CloseThreadsafeImmediateHandleLocked() {
   if (!threadsafe_immediate_async_initialized_) return;
   threadsafe_immediate_async_initialized_ = false;
@@ -537,8 +585,158 @@ void Environment::CloseThreadsafeImmediateHandleLocked() {
   }
 }
 
+void Environment::ClosePerEnvHandlesLocked() {
+  CloseThreadsafeImmediateHandleLocked();
+
+  if (timer_handle_initialized_) {
+    timer_handle_initialized_ = false;
+    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&timer_handle_)) == 0) {
+      uv_timer_stop(&timer_handle_);
+      uv_close(reinterpret_cast<uv_handle_t*>(&timer_handle_), nullptr);
+    }
+  }
+
+  if (immediate_check_handle_initialized_) {
+    immediate_check_handle_initialized_ = false;
+    immediate_check_handle_running_ = false;
+    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&immediate_check_handle_)) == 0) {
+      uv_check_stop(&immediate_check_handle_);
+      uv_close(reinterpret_cast<uv_handle_t*>(&immediate_check_handle_), nullptr);
+    }
+  }
+
+  if (immediate_idle_handle_initialized_) {
+    immediate_idle_handle_initialized_ = false;
+    immediate_idle_handle_running_ = false;
+    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&immediate_idle_handle_)) == 0) {
+      uv_idle_stop(&immediate_idle_handle_);
+      uv_close(reinterpret_cast<uv_handle_t*>(&immediate_idle_handle_), nullptr);
+    }
+  }
+}
+
+void Environment::ScheduleTimerFromExpiry(double next_expiry, double now_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (cleanup_started_ || !timer_handle_initialized_) return;
+
+  if (next_expiry == 0 || !std::isfinite(next_expiry)) {
+    uv_timer_stop(&timer_handle_);
+    uv_unref(reinterpret_cast<uv_handle_t*>(&timer_handle_));
+    return;
+  }
+
+  const bool ref = next_expiry > 0;
+  const double absolute_expiry = std::abs(next_expiry);
+  const double delta = absolute_expiry - now_ms;
+  const uint64_t timeout = static_cast<uint64_t>(delta > 1 ? delta : 1);
+  uv_timer_start(&timer_handle_, OnTimer, timeout, 0);
+  if (ref) {
+    uv_ref(reinterpret_cast<uv_handle_t*>(&timer_handle_));
+  } else {
+    uv_unref(reinterpret_cast<uv_handle_t*>(&timer_handle_));
+  }
+}
+
 void Environment::CloseAndDestroyEventLoop() {
   DestroyReleasedEventLoop(ReleaseEventLoop());
+}
+
+napi_status Environment::InitializeTimers() {
+  if (EnsureEventLoop(nullptr) != napi_ok) return napi_generic_failure;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!EnsureTimerHandleLocked()) return napi_generic_failure;
+  if (!EnsureImmediateCheckHandleLocked()) return napi_generic_failure;
+  if (!EnsureImmediateIdleHandleLocked()) return napi_generic_failure;
+  return napi_ok;
+}
+
+double Environment::GetNowMs() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (loop_ == nullptr) return 0;
+  uv_update_time(loop_);
+  const double now = static_cast<double>(uv_now(loop_));
+  if (timer_base_ms_ < 0) {
+    timer_base_ms_ = now;
+  }
+  const double relative = now - timer_base_ms_;
+  return relative >= 0 ? relative : 0;
+}
+
+void Environment::ScheduleTimer(int64_t duration_ms) {
+  if (duration_ms < 1) duration_ms = 1;
+  if (EnsureEventLoop(nullptr) != napi_ok) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (cleanup_started_ || !EnsureTimerHandleLocked()) return;
+  uv_timer_start(&timer_handle_, OnTimer, static_cast<uint64_t>(duration_ms), 0);
+}
+
+void Environment::ToggleTimerRef(bool ref) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (cleanup_started_ || !timer_handle_initialized_) return;
+  if (ref) {
+    uv_ref(reinterpret_cast<uv_handle_t*>(&timer_handle_));
+  } else {
+    uv_unref(reinterpret_cast<uv_handle_t*>(&timer_handle_));
+  }
+}
+
+void Environment::EnsureImmediatePump() {
+  if (EnsureEventLoop(nullptr) != napi_ok) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  (void)EnsureImmediateCheckHandleLocked();
+}
+
+void Environment::ToggleImmediateRef(bool ref) {
+  if (EnsureEventLoop(nullptr) != napi_ok) return;
+  const bool has_refed_native_immediates = EdgeRuntimePlatformHasRefedImmediateTasks(env_);
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (cleanup_started_ ||
+      !EnsureImmediateCheckHandleLocked() ||
+      !EnsureImmediateIdleHandleLocked()) {
+    return;
+  }
+
+  const bool should_ref =
+      ref ||
+      (immediate_info_.fields != nullptr && immediate_info_.fields[kImmediateRefCount] > 0) ||
+      has_refed_native_immediates;
+
+  if (should_ref) {
+    if (!immediate_idle_handle_running_ &&
+        uv_idle_start(&immediate_idle_handle_, [](uv_idle_t* /*handle*/) {}) == 0) {
+      immediate_idle_handle_running_ = true;
+    }
+  } else if (immediate_idle_handle_running_) {
+    uv_idle_stop(&immediate_idle_handle_);
+    immediate_idle_handle_running_ = false;
+  }
+}
+
+int32_t Environment::active_timeout_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (timeout_info_.fields == nullptr) return 0;
+  const int32_t count = timeout_info_.fields[0];
+  return count > 0 ? count : 0;
+}
+
+uint32_t Environment::immediate_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (immediate_info_.fields == nullptr) return 0;
+  const int32_t count = immediate_info_.fields[kImmediateCount];
+  return count > 0 ? static_cast<uint32_t>(count) : 0;
+}
+
+uint32_t Environment::immediate_ref_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (immediate_info_.fields == nullptr) return 0;
+  const int32_t count = immediate_info_.fields[kImmediateRefCount];
+  return count > 0 ? static_cast<uint32_t>(count) : 0;
+}
+
+bool Environment::immediate_has_outstanding() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return immediate_info_.fields != nullptr &&
+         immediate_info_.fields[kImmediateHasOutstanding] != 0;
 }
 
 void Environment::AddCleanupHook(CleanupHookCallback callback, void* arg) {
@@ -1181,6 +1379,51 @@ void Environment::OnThreadsafeImmediateClosed(uv_handle_t* handle) {
   env->threadsafe_immediate_async_closed_ = true;
 }
 
+void Environment::OnTimer(uv_timer_t* handle) {
+  auto* env = static_cast<Environment*>(handle != nullptr ? handle->data : nullptr);
+  if (env == nullptr || !env->can_call_into_js()) return;
+
+  const double now_ms = env->GetNowMs();
+  const double next_expiry = EdgeTimersHostCallTimersCallback(env->env(), now_ms);
+  env->ScheduleTimerFromExpiry(next_expiry, now_ms);
+  if (!EdgeTimersHostRunCallbackCheckpoint(env->env())) {
+    StopLoopOnJsError(env);
+  }
+}
+
+void Environment::OnImmediateCheck(uv_check_t* handle) {
+  auto* env = static_cast<Environment*>(handle != nullptr ? handle->data : nullptr);
+  if (env == nullptr) return;
+
+  if (env->immediate_count() == 0 && !EdgeRuntimePlatformHasImmediateTasks(env->env())) {
+    if (env->immediate_ref_count() == 0 &&
+        !EdgeRuntimePlatformHasRefedImmediateTasks(env->env())) {
+      env->ToggleImmediateRef(false);
+    }
+    return;
+  }
+
+  (void)EdgeRuntimePlatformDrainImmediateTasks(env->env());
+  if (!env->can_call_into_js()) return;
+
+  bool pending_exception = false;
+  if (napi_is_exception_pending(env->env(), &pending_exception) == napi_ok &&
+      pending_exception) {
+    StopLoopOnJsError(env);
+    return;
+  }
+
+  if (env->immediate_count() != 0 && !EdgeTimersHostCallImmediateCallback(env->env())) {
+    StopLoopOnJsError(env);
+    return;
+  }
+
+  if (env->immediate_ref_count() == 0 &&
+      !EdgeRuntimePlatformHasRefedImmediateTasks(env->env())) {
+    env->ToggleImmediateRef(false);
+  }
+}
+
 void Environment::OnInterruptFromV8(napi_env env, void* data) {
   auto* environment = static_cast<Environment*>(data);
   if (environment == nullptr || environment->env_ != env) return;
@@ -1309,6 +1552,11 @@ void Environment::RunCleanup(bool close_event_loop) {
     if (stage.callback != nullptr) {
       stage.callback(env_, stage.arg);
     }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ClosePerEnvHandlesLocked();
   }
 
   for (size_t guard = 0; guard < 256; ++guard) {

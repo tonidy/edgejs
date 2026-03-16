@@ -2,67 +2,27 @@
 
 #include <cmath>
 
-#include <uv.h>
-
 #include "edge_environment.h"
-#include "edge_env_loop.h"
 #include "edge_runtime.h"
-#include "edge_runtime_platform.h"
 #include "edge_worker_env.h"
 
 namespace {
 
-struct TimersHostState;
-void DeleteRefIfAny(napi_env env, napi_ref* ref_slot);
-bool GetProcessReceiver(napi_env env, napi_value* recv_out);
-bool RunTimersCallbackCheckpoint(TimersHostState* st);
-bool CanCallTimersCallback(TimersHostState* st);
-
 struct TimersHostState {
   explicit TimersHostState(napi_env env_in) : env(env_in) {}
   ~TimersHostState() {
-    DeleteRefIfAny(env, &timers_callback_ref);
-    DeleteRefIfAny(env, &immediate_callback_ref);
-    DeleteRefIfAny(env, &immediate_info_ref);
-    DeleteRefIfAny(env, &timeout_info_ref);
+    if (env != nullptr && immediate_callback_ref != nullptr) {
+      napi_delete_reference(env, immediate_callback_ref);
+    }
+    if (env != nullptr && timers_callback_ref != nullptr) {
+      napi_delete_reference(env, timers_callback_ref);
+    }
   }
 
   napi_env env = nullptr;
   napi_ref timers_callback_ref = nullptr;
   napi_ref immediate_callback_ref = nullptr;
-  uv_timer_t timer_handle{};
-  uv_check_t check_handle{};
-  uv_idle_t idle_handle{};
-  napi_ref immediate_info_ref = nullptr;
-  napi_ref timeout_info_ref = nullptr;
-  double timer_base_ms = -1;
-  bool timer_initialized = false;
-  bool check_initialized = false;
-  bool check_running = false;
-  bool idle_initialized = false;
-  bool idle_running = false;
-  bool running_timers_callback = false;
-  bool cleanup_started = false;
-  uint32_t pending_handle_closes = 0;
 };
-
-bool TimersHostStateIsUnavailable(const TimersHostState* st) {
-  return st == nullptr || st->cleanup_started;
-}
-
-constexpr int kImmediateCount = 0;
-constexpr int kImmediateRefCount = 1;
-constexpr int kImmediateHasOutstanding = 2;
-
-uv_loop_t* GetLoop(TimersHostState* st) {
-  if (st == nullptr || st->env == nullptr) return nullptr;
-  return EdgeGetEnvLoop(st->env);
-}
-
-void StopLoopOnJsError(TimersHostState* st) {
-  uv_loop_t* loop = GetLoop(st);
-  if (loop != nullptr) uv_stop(loop);
-}
 
 void DeleteRefIfAny(napi_env env, napi_ref* ref_slot) {
   if (env == nullptr || ref_slot == nullptr || *ref_slot == nullptr) return;
@@ -75,95 +35,10 @@ TimersHostState* GetState(napi_env env) {
       env, kEdgeEnvironmentSlotTimersHostState);
 }
 
-double GetNowMs(TimersHostState* st) {
-  uv_loop_t* loop = GetLoop(st);
-  if (loop == nullptr || st == nullptr) return 0;
-  uv_update_time(loop);
-  const double now = static_cast<double>(uv_now(loop));
-  if (st->timer_base_ms < 0) {
-    st->timer_base_ms = now;
-  }
-  const double rel = now - st->timer_base_ms;
-  return rel >= 0 ? rel : 0;
-}
-
-void MaybeDestroyState(TimersHostState* st) {
-  (void)st;
-}
-
-void OnHandleClosed(uv_handle_t* handle) {
-  auto* st = static_cast<TimersHostState*>(handle->data);
-  if (st == nullptr) return;
-
-  if (handle == reinterpret_cast<uv_handle_t*>(&st->timer_handle)) {
-    st->timer_initialized = false;
-  } else if (handle == reinterpret_cast<uv_handle_t*>(&st->check_handle)) {
-    st->check_initialized = false;
-    st->check_running = false;
-  } else if (handle == reinterpret_cast<uv_handle_t*>(&st->idle_handle)) {
-    st->idle_initialized = false;
-    st->idle_running = false;
-  }
-
-  if (st->pending_handle_closes > 0) {
-    --st->pending_handle_closes;
-  }
-  MaybeDestroyState(st);
-}
-
-void CloseHandleIfInitialized(TimersHostState* st, uv_handle_t* handle, bool* initialized_flag) {
-  if (st == nullptr || handle == nullptr || initialized_flag == nullptr || !*initialized_flag) return;
-  *initialized_flag = false;
-  if (uv_is_closing(handle) != 0) return;
-  ++st->pending_handle_closes;
-  uv_close(handle, OnHandleClosed);
-}
-
-void OnTimersEnvCleanup(void* arg) {
-  napi_env env = static_cast<napi_env>(arg);
-  TimersHostState* st = GetState(env);
-  if (st == nullptr) return;
-
-  st->cleanup_started = true;
-  DeleteRefIfAny(st->env, &st->timers_callback_ref);
-  DeleteRefIfAny(st->env, &st->immediate_callback_ref);
-  DeleteRefIfAny(st->env, &st->immediate_info_ref);
-  DeleteRefIfAny(st->env, &st->timeout_info_ref);
-  if (auto* environment = EdgeEnvironmentGet(st->env); environment != nullptr) {
-    DeleteRefIfAny(st->env, &environment->immediate_info()->ref);
-    DeleteRefIfAny(st->env, &environment->timeout_info()->ref);
-    environment->immediate_info()->fields = nullptr;
-    environment->timeout_info()->fields = nullptr;
-  }
-
-  if (st->timer_initialized) {
-    uv_timer_stop(&st->timer_handle);
-  }
-  if (st->check_initialized) {
-    uv_check_stop(&st->check_handle);
-    st->check_running = false;
-  }
-  if (st->idle_initialized) {
-    uv_idle_stop(&st->idle_handle);
-    st->idle_running = false;
-  }
-
-  CloseHandleIfInitialized(st, reinterpret_cast<uv_handle_t*>(&st->timer_handle), &st->timer_initialized);
-  CloseHandleIfInitialized(st, reinterpret_cast<uv_handle_t*>(&st->check_handle), &st->check_initialized);
-  CloseHandleIfInitialized(st, reinterpret_cast<uv_handle_t*>(&st->idle_handle), &st->idle_initialized);
-
-  MaybeDestroyState(st);
-}
-
 TimersHostState* GetOrCreateState(napi_env env) {
   if (env == nullptr) return nullptr;
-  (void)EdgeEnsureEnvLoop(env, nullptr);
   return &EdgeEnvironmentGetOrCreateSlotData<TimersHostState>(
       env, kEdgeEnvironmentSlotTimersHostState);
-}
-
-TimersHostState* GetStateForJsBindingCall(napi_env env) {
-  return env != nullptr ? GetState(env) : nullptr;
 }
 
 void SetFunctionRef(napi_env env, napi_value fn, napi_ref* ref_slot) {
@@ -175,209 +50,6 @@ void SetFunctionRef(napi_env env, napi_value fn, napi_ref* ref_slot) {
   napi_create_reference(env, fn, 1, ref_slot);
 }
 
-bool CallImmediateCallback(TimersHostState* st);
-void ApplyImmediateRefState(TimersHostState* st, bool ref);
-
-bool GetInt32ArrayDataFromRef(napi_env env,
-                              napi_ref ref,
-                              size_t min_length,
-                              int32_t** data_out,
-                              size_t* length_out = nullptr) {
-  if (data_out == nullptr) return false;
-  *data_out = nullptr;
-  if (length_out != nullptr) *length_out = 0;
-  if (env == nullptr || ref == nullptr) return false;
-
-  napi_value value = nullptr;
-  if (napi_get_reference_value(env, ref, &value) != napi_ok || value == nullptr) return false;
-
-  bool is_typedarray = false;
-  if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok || !is_typedarray) return false;
-
-  napi_typedarray_type type = napi_uint8_array;
-  size_t length = 0;
-  void* data = nullptr;
-  napi_value arraybuffer = nullptr;
-  size_t offset = 0;
-  if (napi_get_typedarray_info(env, value, &type, &length, &data, &arraybuffer, &offset) != napi_ok ||
-      type != napi_int32_array || data == nullptr || length < min_length) {
-    return false;
-  }
-
-  *data_out = static_cast<int32_t*>(data);
-  if (length_out != nullptr) *length_out = length;
-  return true;
-}
-
-int32_t ActiveTimeoutCount(const TimersHostState* st) {
-  int32_t* timeout_info = nullptr;
-  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->timeout_info_ref, 1, &timeout_info)) return 0;
-  const int32_t count = timeout_info[0];
-  return count > 0 ? count : 0;
-}
-
-uint32_t ImmediateCount(const TimersHostState* st) {
-  int32_t* immediate_info = nullptr;
-  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) return 0;
-  const int32_t count = immediate_info[kImmediateCount];
-  return count > 0 ? static_cast<uint32_t>(count) : 0;
-}
-
-uint32_t ImmediateRefCount(const TimersHostState* st) {
-  int32_t* immediate_info = nullptr;
-  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) return 0;
-  const int32_t count = immediate_info[kImmediateRefCount];
-  return count > 0 ? static_cast<uint32_t>(count) : 0;
-}
-
-bool ImmediateHasOutstanding(const TimersHostState* st) {
-  int32_t* immediate_info = nullptr;
-  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) {
-    return false;
-  }
-  return immediate_info[kImmediateHasOutstanding] != 0;
-}
-
-bool HasNativeImmediateTasks(const TimersHostState* st) {
-  return st != nullptr && st->env != nullptr && EdgeRuntimePlatformHasImmediateTasks(st->env);
-}
-
-bool HasRefedNativeImmediateTasks(const TimersHostState* st) {
-  return st != nullptr && st->env != nullptr && EdgeRuntimePlatformHasRefedImmediateTasks(st->env);
-}
-
-void EnsureTimerHandle(TimersHostState* st) {
-  if (st == nullptr || st->timer_initialized) return;
-  uv_loop_t* loop = GetLoop(st);
-  if (loop == nullptr) return;
-  if (uv_timer_init(loop, &st->timer_handle) == 0) {
-    st->timer_handle.data = st;
-    uv_unref(reinterpret_cast<uv_handle_t*>(&st->timer_handle));
-    st->timer_initialized = true;
-  }
-}
-
-void EnsureCheckHandle(TimersHostState* st) {
-  if (st == nullptr || st->check_initialized) return;
-  uv_loop_t* loop = GetLoop(st);
-  if (loop == nullptr) return;
-  if (uv_check_init(loop, &st->check_handle) != 0) return;
-  st->check_handle.data = st;
-  uv_unref(reinterpret_cast<uv_handle_t*>(&st->check_handle));
-  if (uv_check_start(&st->check_handle,
-                     [](uv_check_t* handle) {
-                       auto* state = static_cast<TimersHostState*>(handle->data);
-                       if (state == nullptr || state->cleanup_started) {
-                         return;
-                       }
-                       if (ImmediateCount(state) == 0 && !HasNativeImmediateTasks(state)) {
-                         if (ImmediateRefCount(state) == 0 && !HasRefedNativeImmediateTasks(state)) {
-                           ApplyImmediateRefState(state, false);
-                         }
-                         return;
-                       }
-                       (void)EdgeRuntimePlatformDrainImmediateTasks(state->env);
-                       if (state->env == nullptr) {
-                         return;
-                       }
-                       bool pending = false;
-                       if (napi_is_exception_pending(state->env, &pending) == napi_ok && pending) {
-                         StopLoopOnJsError(state);
-                         return;
-                       }
-                       if (ImmediateCount(state) != 0) {
-                         if (!CallImmediateCallback(state)) {
-                           return;
-                         }
-                       }
-
-                       if (ImmediateRefCount(state) == 0 && !HasRefedNativeImmediateTasks(state)) {
-                         ApplyImmediateRefState(state, false);
-                       }
-                     }) != 0) {
-    return;
-  }
-  st->check_initialized = true;
-  st->check_running = true;
-}
-
-void EnsureIdleHandle(TimersHostState* st) {
-  if (st == nullptr || st->idle_initialized) return;
-  uv_loop_t* loop = GetLoop(st);
-  if (loop == nullptr) return;
-  if (uv_idle_init(loop, &st->idle_handle) == 0) {
-    st->idle_handle.data = st;
-    uv_unref(reinterpret_cast<uv_handle_t*>(&st->idle_handle));
-    st->idle_initialized = true;
-  }
-}
-
-bool CallImmediateCallback(TimersHostState* st) {
-  if (st == nullptr || st->cleanup_started || st->immediate_callback_ref == nullptr) return true;
-
-  napi_value cb = nullptr;
-  if (napi_get_reference_value(st->env, st->immediate_callback_ref, &cb) != napi_ok || cb == nullptr) return true;
-  napi_value recv = nullptr;
-  if (!GetProcessReceiver(st->env, &recv) || recv == nullptr) return false;
-  napi_value ignored = nullptr;
-  const napi_status status = EdgeMakeCallback(st->env, recv, cb, 0, nullptr, &ignored);
-  if (status != napi_ok) {
-    StopLoopOnJsError(st);
-    return false;
-  }
-  return true;
-}
-
-double CallTimersCallback(TimersHostState* st, double now) {
-  if (st == nullptr || st->cleanup_started || st->timers_callback_ref == nullptr) return 0;
-
-  napi_value cb = nullptr;
-  if (napi_get_reference_value(st->env, st->timers_callback_ref, &cb) != napi_ok || cb == nullptr) return 0;
-
-  napi_value now_value = nullptr;
-  if (napi_create_double(st->env, now, &now_value) != napi_ok || now_value == nullptr) return 0;
-
-  napi_value recv = nullptr;
-  if (!GetProcessReceiver(st->env, &recv) || recv == nullptr) return 0;
-  napi_value result = nullptr;
-  napi_status call_status = napi_ok;
-  do {
-    result = nullptr;
-    call_status = EdgeMakeCallbackWithFlags(
-        st->env,
-        recv,
-        cb,
-        1,
-        &now_value,
-        &result,
-        kEdgeMakeCallbackSkipTaskQueues);
-    if (call_status == napi_ok && result != nullptr) break;
-
-    bool pending = false;
-    if (napi_is_exception_pending(st->env, &pending) == napi_ok && pending) {
-      StopLoopOnJsError(st);
-      return 0;
-    }
-  } while (result == nullptr && CanCallTimersCallback(st));
-
-  if (result == nullptr) {
-    if (call_status != napi_ok) {
-      StopLoopOnJsError(st);
-    }
-    return 0;
-  }
-
-  double next = 0;
-  if (napi_get_value_double(st->env, result, &next) != napi_ok || !std::isfinite(next)) return 0;
-  return next;
-}
-
-bool CanCallTimersCallback(TimersHostState* st) {
-  if (st == nullptr || st->cleanup_started || st->env == nullptr) return false;
-  if (!EdgeWorkerEnvOwnsProcessState(st->env) && EdgeWorkerEnvStopRequested(st->env)) return false;
-  return true;
-}
-
 bool GetProcessReceiver(napi_env env, napi_value* recv_out) {
   if (recv_out == nullptr) return false;
   *recv_out = nullptr;
@@ -387,7 +59,8 @@ bool GetProcessReceiver(napi_env env, napi_value* recv_out) {
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
 
   napi_value process = nullptr;
-  if (napi_get_named_property(env, global, "process", &process) == napi_ok && process != nullptr) {
+  if (napi_get_named_property(env, global, "process", &process) == napi_ok &&
+      process != nullptr) {
     *recv_out = process;
   } else {
     *recv_out = global;
@@ -395,93 +68,131 @@ bool GetProcessReceiver(napi_env env, napi_value* recv_out) {
   return true;
 }
 
-bool RunTimersCallbackCheckpoint(TimersHostState* st) {
-  if (st == nullptr || st->cleanup_started || st->env == nullptr) return false;
-  const napi_status status = EdgeRunCallbackScopeCheckpoint(st->env);
-  if (status == napi_ok) return true;
-
-  bool handled = false;
-  (void)EdgeHandlePendingExceptionNow(st->env, &handled);
-
-  bool pending = false;
-  if (napi_is_exception_pending(st->env, &pending) == napi_ok && pending) {
-    StopLoopOnJsError(st);
+bool CanCallTimersCallback(napi_env env) {
+  if (env == nullptr) return false;
+  auto* environment = EdgeEnvironmentGet(env);
+  if (environment == nullptr || !environment->can_call_into_js()) return false;
+  if (!EdgeWorkerEnvOwnsProcessState(env) && EdgeWorkerEnvStopRequested(env)) {
     return false;
   }
-
-  if (status != napi_pending_exception) {
-    StopLoopOnJsError(st);
-    return false;
-  }
-  return handled;
+  return true;
 }
 
-void ApplyTimerRefState(TimersHostState* st, bool ref) {
-  if (st == nullptr || !st->timer_initialized) return;
-  if (ref) {
-    uv_ref(reinterpret_cast<uv_handle_t*>(&st->timer_handle));
-  } else {
-    uv_unref(reinterpret_cast<uv_handle_t*>(&st->timer_handle));
+bool CallImmediateCallback(TimersHostState* st) {
+  if (st == nullptr || st->env == nullptr || st->immediate_callback_ref == nullptr) return true;
+
+  napi_value cb = nullptr;
+  if (napi_get_reference_value(st->env, st->immediate_callback_ref, &cb) != napi_ok ||
+      cb == nullptr) {
+    return true;
   }
+  napi_value recv = nullptr;
+  if (!GetProcessReceiver(st->env, &recv) || recv == nullptr) return false;
+  napi_value ignored = nullptr;
+  const napi_status status = EdgeMakeCallback(st->env, recv, cb, 0, nullptr, &ignored);
+  return status == napi_ok;
 }
 
-void ApplyImmediateRefState(TimersHostState* st, bool ref) {
-  if (st == nullptr) return;
-  EnsureCheckHandle(st);
-  EnsureIdleHandle(st);
-  if (!st->idle_initialized) return;
-  const bool should_ref = ref || ImmediateRefCount(st) != 0 || HasRefedNativeImmediateTasks(st);
-  if (should_ref) {
-    uv_ref(reinterpret_cast<uv_handle_t*>(&st->idle_handle));
-  } else {
-    uv_unref(reinterpret_cast<uv_handle_t*>(&st->idle_handle));
+double CallTimersCallback(TimersHostState* st, double now) {
+  if (st == nullptr || st->env == nullptr || st->timers_callback_ref == nullptr) return 0;
+
+  napi_value cb = nullptr;
+  if (napi_get_reference_value(st->env, st->timers_callback_ref, &cb) != napi_ok ||
+      cb == nullptr) {
+    return 0;
   }
-  if (should_ref) {
-    if (!st->idle_running && uv_idle_start(&st->idle_handle, [](uv_idle_t* /*handle*/) {}) == 0) {
-      st->idle_running = true;
+
+  napi_value now_value = nullptr;
+  if (napi_create_double(st->env, now, &now_value) != napi_ok || now_value == nullptr) return 0;
+
+  napi_value recv = nullptr;
+  if (!GetProcessReceiver(st->env, &recv) || recv == nullptr) return 0;
+
+  napi_value result = nullptr;
+  napi_status call_status = napi_ok;
+  do {
+    result = nullptr;
+    call_status = EdgeMakeCallbackWithFlags(st->env,
+                                            recv,
+                                            cb,
+                                            1,
+                                            &now_value,
+                                            &result,
+                                            kEdgeMakeCallbackSkipTaskQueues);
+    if (call_status == napi_ok && result != nullptr) break;
+
+    bool pending = false;
+    if (napi_is_exception_pending(st->env, &pending) == napi_ok && pending) {
+      return 0;
     }
-  } else {
-    if (st->idle_running) {
-      uv_idle_stop(&st->idle_handle);
-      st->idle_running = false;
-    }
+  } while (result == nullptr && CanCallTimersCallback(st->env));
+
+  if (result == nullptr) return 0;
+
+  double next = 0;
+  if (napi_get_value_double(st->env, result, &next) != napi_ok || !std::isfinite(next)) {
+    return 0;
   }
+  return next;
 }
 
-void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now);
-
-void RunTimersCallback(uv_timer_t* handle) {
-  auto* state = static_cast<TimersHostState*>(handle->data);
-  if (state == nullptr || state->cleanup_started) return;
-
-  state->running_timers_callback = true;
-
-  double now_ms = GetNowMs(state);
-  double next = CallTimersCallback(state, now_ms);
-  state->running_timers_callback = false;
-  ScheduleFromNextExpiry(state, next, now_ms);
-  (void)RunTimersCallbackCheckpoint(state);
-}
-
-void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now) {
-  if (st == nullptr || !st->timer_initialized) return;
-  if (next_expiry == 0 || !std::isfinite(next_expiry)) {
-    uv_timer_stop(&st->timer_handle);
-    ApplyTimerRefState(st, false);
+void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
+  napi_value fn = nullptr;
+  if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) != napi_ok ||
+      fn == nullptr) {
     return;
   }
+  napi_set_named_property(env, obj, name, fn);
+}
 
-  const bool ref = next_expiry > 0;
-  const double abs_expiry = std::abs(next_expiry);
-  const double delta = abs_expiry - now;
-  const uint64_t timeout = static_cast<uint64_t>(delta > 1 ? delta : 1);
-  uv_timer_start(&st->timer_handle, RunTimersCallback, timeout, 0);
-  ApplyTimerRefState(st, ref);
+void AttachInfoArrays(napi_env env, napi_value binding) {
+  auto* environment = EdgeEnvironmentGet(env);
+  if (environment == nullptr) return;
+
+  napi_value immediate_ab = nullptr;
+  void* immediate_data = nullptr;
+  if (napi_create_arraybuffer(env, 3 * sizeof(int32_t), &immediate_data, &immediate_ab) == napi_ok &&
+      immediate_ab != nullptr && immediate_data != nullptr) {
+    auto* ptr = static_cast<int32_t*>(immediate_data);
+    ptr[0] = 0;
+    ptr[1] = 0;
+    ptr[2] = 0;
+    napi_value immediate_info = nullptr;
+    if (napi_create_typedarray(env, napi_int32_array, 3, immediate_ab, 0, &immediate_info) == napi_ok &&
+        immediate_info != nullptr) {
+      napi_set_named_property(env, binding, "immediateInfo", immediate_info);
+      environment->immediate_info()->fields = ptr;
+      if (environment->immediate_info()->ref != nullptr) {
+        napi_delete_reference(env, environment->immediate_info()->ref);
+        environment->immediate_info()->ref = nullptr;
+      }
+      napi_create_reference(env, immediate_info, 1, &environment->immediate_info()->ref);
+    }
+  }
+
+  napi_value timeout_ab = nullptr;
+  void* timeout_data = nullptr;
+  if (napi_create_arraybuffer(env, sizeof(int32_t), &timeout_data, &timeout_ab) == napi_ok &&
+      timeout_ab != nullptr && timeout_data != nullptr) {
+    auto* ptr = static_cast<int32_t*>(timeout_data);
+    ptr[0] = 0;
+    napi_value timeout_info = nullptr;
+    if (napi_create_typedarray(env, napi_int32_array, 1, timeout_ab, 0, &timeout_info) == napi_ok &&
+        timeout_info != nullptr) {
+      napi_set_named_property(env, binding, "timeoutInfo", timeout_info);
+      environment->timeout_info()->fields = ptr;
+      if (environment->timeout_info()->ref != nullptr) {
+        napi_delete_reference(env, environment->timeout_info()->ref);
+        environment->timeout_info()->ref = nullptr;
+      }
+      napi_create_reference(env, timeout_info, 1, &environment->timeout_info()->ref);
+    }
+  }
 }
 
 napi_value SetupTimers(napi_env env, napi_callback_info info) {
-  TimersHostState* st = GetStateForJsBindingCall(env);
-  if (st == nullptr || TimersHostStateIsUnavailable(st)) {
+  TimersHostState* st = GetOrCreateState(env);
+  if (st == nullptr) {
     napi_value undefined = nullptr;
     napi_get_undefined(env, &undefined);
     return undefined;
@@ -499,13 +210,6 @@ napi_value SetupTimers(napi_env env, napi_callback_info info) {
 }
 
 napi_value ScheduleTimer(napi_env env, napi_callback_info info) {
-  TimersHostState* st = GetStateForJsBindingCall(env);
-  if (st == nullptr || TimersHostStateIsUnavailable(st)) {
-    napi_value undefined = nullptr;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-  }
-
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -516,10 +220,8 @@ napi_value ScheduleTimer(napi_env env, napi_callback_info info) {
   }
   if (duration < 1) duration = 1;
 
-  EnsureTimerHandle(st);
-  if (st->timer_initialized) {
-    uv_timer_start(&st->timer_handle, RunTimersCallback, static_cast<uint64_t>(duration), 0);
-    ApplyTimerRefState(st, ActiveTimeoutCount(st) > 0);
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->ScheduleTimer(duration);
   }
 
   napi_value undefined = nullptr;
@@ -528,103 +230,41 @@ napi_value ScheduleTimer(napi_env env, napi_callback_info info) {
 }
 
 napi_value ToggleTimerRef(napi_env env, napi_callback_info info) {
-  TimersHostState* st = GetStateForJsBindingCall(env);
-  if (st == nullptr || TimersHostStateIsUnavailable(st)) {
-    napi_value undefined = nullptr;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-  }
-
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   bool ref = true;
   if (argc >= 1) napi_get_value_bool(env, argv[0], &ref);
-  ApplyTimerRefState(st, ref);
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->ToggleTimerRef(ref);
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
 }
 
 napi_value ToggleImmediateRef(napi_env env, napi_callback_info info) {
-  TimersHostState* st = GetStateForJsBindingCall(env);
-  if (st == nullptr || TimersHostStateIsUnavailable(st)) {
-    napi_value undefined = nullptr;
-    napi_get_undefined(env, &undefined);
-    return undefined;
-  }
-
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   bool ref = true;
   if (argc >= 1) napi_get_value_bool(env, argv[0], &ref);
-  ApplyImmediateRefState(st, ref);
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->ToggleImmediateRef(ref);
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
 }
 
 napi_value GetLibuvNow(napi_env env, napi_callback_info /*info*/) {
-  TimersHostState* st = GetStateForJsBindingCall(env);
   napi_value out = nullptr;
-  const double now = (st == nullptr || TimersHostStateIsUnavailable(st)) ? 0 : GetNowMs(st);
+  double now = 0;
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    now = environment->GetNowMs();
+  }
   napi_create_double(env, now, &out);
   return out;
-}
-
-void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
-  napi_value fn = nullptr;
-  if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) != napi_ok || fn == nullptr) {
-    return;
-  }
-  napi_set_named_property(env, obj, name, fn);
-}
-
-void AttachInfoArrays(napi_env env, napi_value binding, TimersHostState* st) {
-  if (st == nullptr) return;
-
-  napi_value immediate_ab = nullptr;
-  void* immediate_data = nullptr;
-  if (napi_create_arraybuffer(env, 3 * sizeof(int32_t), &immediate_data, &immediate_ab) == napi_ok &&
-      immediate_ab != nullptr && immediate_data != nullptr) {
-    auto* ptr = static_cast<int32_t*>(immediate_data);
-    ptr[0] = 0;
-    ptr[1] = 0;
-    ptr[2] = 0;
-    napi_value immediate_info = nullptr;
-    if (napi_create_typedarray(env, napi_int32_array, 3, immediate_ab, 0, &immediate_info) == napi_ok &&
-        immediate_info != nullptr) {
-      napi_set_named_property(env, binding, "immediateInfo", immediate_info);
-      DeleteRefIfAny(env, &st->immediate_info_ref);
-      napi_create_reference(env, immediate_info, 1, &st->immediate_info_ref);
-      if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
-        environment->immediate_info()->fields = ptr;
-        DeleteRefIfAny(env, &environment->immediate_info()->ref);
-        napi_create_reference(env, immediate_info, 1, &environment->immediate_info()->ref);
-      }
-    }
-  }
-
-  napi_value timeout_ab = nullptr;
-  void* timeout_data = nullptr;
-  if (napi_create_arraybuffer(env, sizeof(int32_t), &timeout_data, &timeout_ab) == napi_ok &&
-      timeout_ab != nullptr && timeout_data != nullptr) {
-    auto* ptr = static_cast<int32_t*>(timeout_data);
-    ptr[0] = 0;
-    napi_value timeout_info = nullptr;
-    if (napi_create_typedarray(env, napi_int32_array, 1, timeout_ab, 0, &timeout_info) == napi_ok &&
-        timeout_info != nullptr) {
-      napi_set_named_property(env, binding, "timeoutInfo", timeout_info);
-      DeleteRefIfAny(env, &st->timeout_info_ref);
-      napi_create_reference(env, timeout_info, 1, &st->timeout_info_ref);
-      if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
-        environment->timeout_info()->fields = ptr;
-        DeleteRefIfAny(env, &environment->timeout_info()->ref);
-        napi_create_reference(env, timeout_info, 1, &environment->timeout_info()->ref);
-      }
-    }
-  }
 }
 
 }  // namespace
@@ -633,8 +273,6 @@ napi_value EdgeInstallTimersHostBinding(napi_env env) {
   if (env == nullptr) return nullptr;
 
   if (EdgeInitializeTimersHost(env) != napi_ok) return nullptr;
-  TimersHostState* st = GetState(env);
-  if (st == nullptr) return nullptr;
 
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) {
@@ -645,52 +283,68 @@ napi_value EdgeInstallTimersHostBinding(napi_env env) {
   SetMethod(env, binding, "toggleTimerRef", ToggleTimerRef);
   SetMethod(env, binding, "toggleImmediateRef", ToggleImmediateRef);
   SetMethod(env, binding, "getLibuvNow", GetLibuvNow);
-  AttachInfoArrays(env, binding, st);
+  AttachInfoArrays(env, binding);
 
   return binding;
 }
 
 napi_status EdgeInitializeTimersHost(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
-  TimersHostState* st = GetOrCreateState(env);
-  if (st == nullptr) return napi_generic_failure;
-  EnsureTimerHandle(st);
-  EnsureCheckHandle(st);
-  EnsureIdleHandle(st);
-  return napi_ok;
+  if (GetOrCreateState(env) == nullptr) return napi_generic_failure;
+  auto* environment = EdgeEnvironmentGet(env);
+  if (environment == nullptr) return napi_generic_failure;
+  return environment->InitializeTimers();
 }
 
 int32_t EdgeGetActiveTimeoutCount(napi_env env) {
-  const TimersHostState* st = GetState(env);
-  int32_t* timeout_info = nullptr;
-  if (st == nullptr || !GetInt32ArrayDataFromRef(env, st->timeout_info_ref, 1, &timeout_info)) return 0;
-  const int32_t count = timeout_info[0];
-  return count > 0 ? count : 0;
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    return environment->active_timeout_count();
+  }
+  return 0;
 }
 
 uint32_t EdgeGetActiveImmediateRefCount(napi_env env) {
-  const TimersHostState* st = GetState(env);
-  int32_t* immediate_info = nullptr;
-  if (st == nullptr || !GetInt32ArrayDataFromRef(env, st->immediate_info_ref, 3, &immediate_info)) return 0;
-  const int32_t count = immediate_info[kImmediateRefCount];
-  return count > 0 ? static_cast<uint32_t>(count) : 0;
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    return environment->immediate_ref_count();
+  }
+  return 0;
 }
 
 void EdgeEnsureTimersImmediatePump(napi_env env) {
-  TimersHostState* st = GetState(env);
-  if (st == nullptr) return;
-  if (TimersHostStateIsUnavailable(st)) return;
-  EnsureCheckHandle(st);
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->EnsureImmediatePump();
+  }
 }
 
 void EdgeToggleImmediateRefFromNative(napi_env env, bool ref) {
-  TimersHostState* st = GetState(env);
-  if (st == nullptr) return;
-  if (TimersHostStateIsUnavailable(st)) return;
-  ApplyImmediateRefState(st, ref);
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->ToggleImmediateRef(ref);
+  }
 }
 
-void EdgeRunTimersHostEnvCleanup(napi_env env) {
-  if (env == nullptr) return;
-  OnTimersEnvCleanup(env);
+bool EdgeTimersHostCallImmediateCallback(napi_env env) {
+  return CallImmediateCallback(GetState(env));
+}
+
+double EdgeTimersHostCallTimersCallback(napi_env env, double now) {
+  return CallTimersCallback(GetState(env), now);
+}
+
+bool EdgeTimersHostRunCallbackCheckpoint(napi_env env) {
+  if (env == nullptr) return false;
+  const napi_status status = EdgeRunCallbackScopeCheckpoint(env);
+  if (status == napi_ok) return true;
+
+  bool handled = false;
+  (void)EdgeHandlePendingExceptionNow(env, &handled);
+
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+    return false;
+  }
+
+  if (status != napi_pending_exception) {
+    return false;
+  }
+  return handled;
 }

@@ -332,6 +332,8 @@ void CleanupWorkerForParentEnvShutdown(Worker* worker) {
     EdgeAsyncWrapQueueDestroyId(worker->env, worker->async_id);
     worker->async_id = 0;
   }
+  CloseWorkerMessagePort(worker);
+  DeleteRefIfPresent(worker->env, &worker->message_port_ref);
   ClearCompletedWorkerTasks(worker->env, worker);
   CloseWorkerCompletionAsync(worker);
 }
@@ -991,6 +993,16 @@ void CloseWorkerMessagePort(Worker* wrap) {
   EdgeCloseMessagePortForValue(wrap->env, port);
 }
 
+void UnrefWorkerMessagePort(Worker* wrap) {
+  if (wrap == nullptr || wrap->env == nullptr || wrap->message_port_ref == nullptr) return;
+  napi_value port = GetRefValue(wrap->env, wrap->message_port_ref);
+  if (port == nullptr) return;
+  napi_value unref = GetNamed(wrap->env, port, "unref");
+  if (!IsFunction(wrap->env, unref)) return;
+  napi_value ignored = nullptr;
+  (void)napi_call_function(wrap->env, port, unref, 0, nullptr, &ignored);
+}
+
 void FinishWorkerOnParentThread(Worker* wrap) {
   if (wrap == nullptr || wrap->env == nullptr) return;
   if (wrap->parent_env_closing.load(std::memory_order_acquire)) {
@@ -1014,6 +1026,7 @@ void FinishWorkerOnParentThread(Worker* wrap) {
   }
   ResetWorkerMessagePort(wrap);
   CallWorkerOnExit(wrap);
+  CloseWorkerMessagePort(wrap);
   DeleteRefIfPresent(wrap->env, &wrap->message_port_ref);
   ClearCompletedWorkerTasks(wrap->env, wrap);
   DetachWorkerFromJs(wrap);
@@ -1493,6 +1506,7 @@ napi_value WorkerImplStopThread(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   Worker* wrap = UnwrapWorker(env, this_arg);
   if (wrap == nullptr || !wrap->started.load(std::memory_order_acquire)) return Undefined(env);
+  UnrefWorkerMessagePort(wrap);
   RequestWorkerStop(wrap);
   return Undefined(env);
 }

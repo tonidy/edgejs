@@ -240,6 +240,16 @@ class Environment {
   uv_loop_t* ReleaseEventLoop();
   static void DestroyReleasedEventLoop(uv_loop_t* loop);
   void CloseAndDestroyEventLoop();
+  napi_status InitializeTimers();
+  double GetNowMs();
+  void ScheduleTimer(int64_t duration_ms);
+  void ToggleTimerRef(bool ref);
+  void EnsureImmediatePump();
+  void ToggleImmediateRef(bool ref);
+  int32_t active_timeout_count() const;
+  uint32_t immediate_count() const;
+  uint32_t immediate_ref_count() const;
+  bool immediate_has_outstanding() const;
 
   void AddCleanupHook(CleanupHookCallback callback, void* arg);
   void RemoveCleanupHook(CleanupHookCallback callback, void* arg);
@@ -323,11 +333,18 @@ class Environment {
  private:
   static void OnThreadsafeImmediate(uv_async_t* handle);
   static void OnThreadsafeImmediateClosed(uv_handle_t* handle);
+  static void OnTimer(uv_timer_t* handle);
+  static void OnImmediateCheck(uv_check_t* handle);
 
   void ResetTrackedRefs();
   void DeleteRefIfPresent(napi_ref* ref);
   bool EnsureThreadsafeImmediateHandleLocked();
+  bool EnsureTimerHandleLocked();
+  bool EnsureImmediateCheckHandleLocked();
+  bool EnsureImmediateIdleHandleLocked();
   void CloseThreadsafeImmediateHandleLocked();
+  void ClosePerEnvHandlesLocked();
+  void ScheduleTimerFromExpiry(double next_expiry, double now_ms);
   static void OnInterruptFromV8(napi_env env, void* data);
   void CleanupActiveRegistryEntries();
   void EmitProcessWarning(const std::string& message,
@@ -349,6 +366,15 @@ class Environment {
   bool stopping_ = false;
   bool emit_filehandle_warning_ = true;
   uv_loop_t* loop_ = nullptr;
+  uv_timer_t timer_handle_{};
+  uv_check_t immediate_check_handle_{};
+  uv_idle_t immediate_idle_handle_{};
+  bool timer_handle_initialized_ = false;
+  bool immediate_check_handle_initialized_ = false;
+  bool immediate_check_handle_running_ = false;
+  bool immediate_idle_handle_initialized_ = false;
+  bool immediate_idle_handle_running_ = false;
+  double timer_base_ms_ = -1;
   size_t callback_scope_depth_ = 0;
   size_t open_callback_scopes_ = 0;
   size_t async_callback_scope_depth_ = 0;

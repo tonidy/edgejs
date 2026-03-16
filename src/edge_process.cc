@@ -2,6 +2,7 @@
 #include "edge_active_resource.h"
 #include "edge_env_loop.h"
 #include "edge_module_loader.h"
+#include "edge_option_helpers.h"
 #include "edge_runtime.h"
 #include "edge_worker_env.h"
 #include "edge_environment.h"
@@ -231,13 +232,6 @@ constexpr const char kUvwasiVersion[] = "0.0.23";
 
 std::string ReadTextFileIfExists(const std::filesystem::path& path);
 
-std::optional<std::filesystem::path> TryGetCurrentPath() {
-  std::error_code ec;
-  std::filesystem::path cwd = std::filesystem::current_path(ec);
-  if (ec) return std::nullopt;
-  return cwd.lexically_normal();
-}
-
 bool TryGetCurrentWorkingDirectoryString(std::string* out, int* uv_error_out = nullptr) {
   if (out == nullptr) return false;
   out->clear();
@@ -274,7 +268,7 @@ void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
 void AppendCwdCandidates(const std::filesystem::path& relative_path,
                          std::vector<std::filesystem::path>* out) {
   if (out == nullptr) return;
-  const std::optional<std::filesystem::path> cwd = TryGetCurrentPath();
+  const std::optional<std::filesystem::path> cwd = edge_options::TryGetCurrentPath();
   if (!cwd.has_value()) return;
   out->push_back((*cwd / relative_path).lexically_normal());
   out->push_back((cwd->parent_path() / relative_path).lexically_normal());
