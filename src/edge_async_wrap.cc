@@ -123,8 +123,29 @@ bool SetResourceAsyncIds(napi_env env, napi_value resource, int64_t async_id, in
     return false;
   }
 
-  return napi_set_property(env, resource, async_id_symbol, async_id_value) == napi_ok &&
-         napi_set_property(env, resource, trigger_async_id_symbol, trigger_async_id_value) == napi_ok;
+  napi_property_descriptor descriptors[2] = {
+      napi_property_descriptor{
+          nullptr,
+          async_id_symbol,
+          nullptr,
+          nullptr,
+          nullptr,
+          async_id_value,
+          napi_default,
+          nullptr,
+      },
+      napi_property_descriptor{
+          nullptr,
+          trigger_async_id_symbol,
+          nullptr,
+          nullptr,
+          nullptr,
+          trigger_async_id_value,
+          napi_default,
+          nullptr,
+      },
+  };
+  return napi_define_properties(env, resource, 2, descriptors) == napi_ok;
 }
 
 int64_t GetResourceAsyncId(napi_env env, napi_value resource, const char* symbol_name) {

@@ -3365,6 +3365,20 @@ napi_value FsClose(napi_env env, napi_callback_info info) {
 
   EdgeWorkerEnvRemoveUnmanagedFd(env, fd);
 
+  if (req_kind != ReqKind::kNone) {
+    napi_value promise = nullptr;
+    AsyncFsReq* async_req = CreateAsyncFsReq(env, req_kind, req, oncomplete, &promise);
+    if (async_req != nullptr) {
+      async_req->syscall = "close";
+      async_req->uses_uv_fs_req = true;
+
+      uv_loop_t* loop = EdgeGetEnvLoop(env);
+      const int rc = loop != nullptr ? uv_fs_close(loop, &async_req->req, fd, AfterAsyncFsReq) : UV_EINVAL;
+      if (rc < 0) FinishAsyncFsReq(async_req, rc);
+      return req_kind == ReqKind::kPromise ? promise : Undefined(env);
+    }
+  }
+
   napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
   napi_value out = nullptr;
   napi_value err = nullptr;

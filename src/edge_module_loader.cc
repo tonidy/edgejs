@@ -2104,6 +2104,13 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       }
       continue;
     }
+    if (token.rfind("--print=", 0) == 0) {
+      SetBoolProperty(env, out, "--print", true);
+      const std::string value = edge_options::MaybeUnescapeLeadingDashOptionValue(token.substr(8));
+      SetStringProperty(env, out, "--eval", value.c_str());
+      SetBoolProperty(env, out, "[has_eval_string]", true);
+      continue;
+    }
     if (token == "-e" || token == "--eval") {
       if (i + 1 < tokens.size()) {
         const std::string value = edge_options::MaybeUnescapeLeadingDashOptionValue(tokens[i + 1]);
@@ -2111,6 +2118,12 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
         SetBoolProperty(env, out, "[has_eval_string]", true);
         i++;
       }
+      continue;
+    }
+    if (token.rfind("--eval=", 0) == 0) {
+      const std::string value = edge_options::MaybeUnescapeLeadingDashOptionValue(token.substr(7));
+      SetStringProperty(env, out, "--eval", value.c_str());
+      SetBoolProperty(env, out, "[has_eval_string]", true);
       continue;
     }
     if (token == "-c") {

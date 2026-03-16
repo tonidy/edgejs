@@ -3674,6 +3674,7 @@ napi_value MessagePortConstructorCallback(napi_env env, napi_callback_info info)
   const int rc = loop != nullptr ? uv_async_init(loop, &wrap->async, OnMessagePortAsync) : UV_EINVAL;
   if (rc == 0) {
     wrap->async.data = wrap;
+    uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->async));
     wrap->handle_wrap.state = kEdgeHandleInitialized;
     EdgeHandleWrapAttach(&wrap->handle_wrap,
                         wrap,

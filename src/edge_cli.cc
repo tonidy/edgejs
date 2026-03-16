@@ -1226,6 +1226,18 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
       mode = print_flag ? CliMode::kPrint : CliMode::kEval;
       continue;
     }
+    if (token.rfind("--eval=", 0) == 0) {
+      if (saw_check) {
+        if (error_out != nullptr) {
+          *error_out = FormatCliError("either --check or --eval can be used, not both");
+        }
+        return 9;
+      }
+      raw_exec_argv.push_back(token);
+      has_eval_string = true;
+      mode = print_flag ? CliMode::kPrint : CliMode::kEval;
+      continue;
+    }
     if (token == "-p" || token == "--print") {
       raw_exec_argv.push_back(token);
       print_flag = true;
@@ -1238,6 +1250,13 @@ int EdgeRunCli(int argc, const char* const* argv, std::string* error_out) {
           continue;
         }
       }
+      continue;
+    }
+    if (token.rfind("--print=", 0) == 0) {
+      raw_exec_argv.push_back(token);
+      print_flag = true;
+      has_eval_string = true;
+      mode = CliMode::kPrint;
       continue;
     }
     if (token == "--run") {
