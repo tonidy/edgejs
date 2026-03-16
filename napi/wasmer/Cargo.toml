@@ -1,7 +1,9 @@
 [package]
 name = "napi_wasmer"
-version = "0.1.0"
-edition = "2021"
+version = "0.0.1"
+edition = "2024"
+description = "Wasmer NAPI integration"
+license = "MIT OR Apache-2.0"
 
 [features]
 default = ["wasix"]
@@ -15,22 +17,22 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Published crates variant:
-# wasmer = { version = "=7.1.0-alpha.1", features = ["llvm"] }
-# wasmer-compiler-llvm = { version = "=7.1.0-alpha.1" }
-# wasmer-types = { version = "=7.1.0-alpha.1" }
-# wasmer-wasix = { version = "=0.701.0-alpha.1", optional = true }
-# virtual-fs = { version = "0.701.0-alpha.1" }
-# virtual-mio = { version = "0.701.0-alpha.1" }
-# wasmer-cache = { version = "=7.1.0-alpha.1" }
+wasmer = { version = "*", features = ["llvm"] }
+wasmer-compiler-llvm = { version = "*" }
+wasmer-types = { version = "*" }
+wasmer-wasix = { version = "*", optional = true }
+virtual-fs = { version = "*" }
+virtual-mio = { version = "*" }
+wasmer-cache = { version = "*" }
 
 # Git dependency on wasmer main:
-wasmer = { git = "https://github.com/wasmerio/wasmer", branch ="napi", features = ["llvm"] }
-wasmer-compiler-llvm = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
-wasmer-types = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer", branch ="napi", optional = true }
-virtual-fs = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
-virtual-mio = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
-wasmer-cache = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
+# wasmer = { git = "https://github.com/wasmerio/wasmer", branch ="napi", features = ["llvm"] }
+# wasmer-compiler-llvm = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
+# wasmer-types = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
+# wasmer-wasix = { git = "https://github.com/wasmerio/wasmer", branch ="napi", optional = true }
+# virtual-fs = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
+# virtual-mio = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
+# wasmer-cache = { git = "https://github.com/wasmerio/wasmer", branch ="napi" }
 
 # Local path variant:
 # wasmer = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/api", features = ["llvm"] }
