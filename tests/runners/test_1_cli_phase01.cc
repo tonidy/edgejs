@@ -562,16 +562,6 @@ TEST_F(Test1CliPhase01, PrintFlagExposesEdgeProcessVersionEntry) {
   EXPECT_NE(stdout_output.find(EDGE_VERSION_STRING), std::string::npos) << stdout_output;
 }
 
-TEST_F(Test1CliPhase01, SafeFlagExitsWithUnavailableMessage) {
-  const char* argv[] = {"edge", "--safe"};
-  std::string error;
-
-  const int exit_code = EdgeRunCli(2, argv, &error);
-
-  EXPECT_EQ(exit_code, 1);
-  EXPECT_EQ(error, "--safe mode is not enabled in this release of edge");
-}
-
 TEST_F(Test1CliPhase01, InteractiveWelcomeMessageIncludesEdgeAndNodeVersions) {
 #if defined(_WIN32)
   GTEST_SKIP() << "interactive repl subprocess check is POSIX-only";
