@@ -1,392 +1,345 @@
 # Framework Integration Tests Plan
 
-## Objective
+## Status
 
-Create a repo workflow for the JS framework examples in `wasmer-examples/` that:
+This document describes the framework integration test implementation that now
+exists in the repo. It replaces the earlier design draft that only covered the
+setup phase.
 
-1. prepares each example to run through a selected runtime binary instead of the host `node`; and
-2. later validates that each framework can actually boot a local HTTP server under that selected runtime.
+The feature scope for this merge is:
 
-The user-facing entrypoint should be the `Makefile`, not an ad hoc shell command.
+- repo-level framework compatibility testing through `make framework-test`;
+- optional single-framework selection;
+- a three-layer compatibility matrix:
+  - `Node.js`
+  - `EdgeJS Native`
+  - `Wasmer + EdgeJS Safe`
+- per-project logs and matrix summaries that make regressions easy to spot;
+- a reset path through `make framework-test-reset`.
 
-This plan is split into two phases:
+## Purpose
 
-- Phase 1 is the setup phase.
-- Phase 2 is the runtime validation phase.
+The framework test flow validates the JS framework examples in
+`wasmer-examples/` as application workloads rather than unit tests.
 
-The immediate focus is Phase 1, but the plan below also lays out how Phase 2 should work so the setup work does not paint us into a corner.
+The current goal is to answer:
 
-## Repo Facts Confirmed
+1. does the framework boot and serve locally under host `Node.js`?
+2. does the same framework boot and serve under native `EdgeJS`?
+3. if native `EdgeJS` passes, does it also boot and serve through
+   `edge --safe`, i.e. `Wasmer + EdgeJS Safe`?
 
-- EdgeJS is built via the repo `Makefile`.
-- The current EdgeJS binary path is `build-edge/edge`.
-- The examples live in the `wasmer-examples` git submodule.
-- The current `js-*` examples are:
-  - `wasmer-examples/js-astro-staticsite`
-  - `wasmer-examples/js-docusaurus-staticsite`
-  - `wasmer-examples/js-docusaurus2-staticsite`
-  - `wasmer-examples/js-docusaurusold-staticsite`
-  - `wasmer-examples/js-gatsby-staticsite`
-  - `wasmer-examples/js-gatsby-staticsite2`
-  - `wasmer-examples/js-next-staticsite`
-  - `wasmer-examples/js-remix-staticsite`
-  - `wasmer-examples/js-svelte`
+The intended output is a compatibility matrix, not just a single pass/fail bit.
 
-## Key Mechanism We Are Exploiting
+## Public Interface
 
-`pnpm install` creates shell launchers in `node_modules/.bin/`. A launcher like:
-
-`node_modules/.bin/astro`
-
-contains logic equivalent to:
-
-```sh
-basedir=$(dirname "$0")
-
-if [ -x "$basedir/node" ]; then
-  exec "$basedir/node" ...
-else
-  exec node ...
-fi
-```
-
-That means the leverage point is not the framework binary itself. The leverage point is:
-
-`node_modules/.bin/node`
-
-If we create a symlink there that points to the selected runner binary, then the existing `pnpm`-generated framework launchers will execute through that runtime without rewriting each framework command.
-
-## Operator Interface
-
-The intended operator interface is:
+The supported operator entrypoints are:
 
 - `make framework-test`
 - `make framework-test <framework>`
 - `make framework-test-reset`
+- `make framework-test-reset <framework>`
 
-The runner binary should also be configurable via:
+The helper script also supports direct invocation:
+
+- `scripts/framework-test.js setup [js-framework-name]`
+- `scripts/framework-test.js test [js-framework-name]`
+- `scripts/framework-test.js reset [js-framework-name]`
+
+### Supported Environment Variables
 
 - `SYMLINK_TARGET=<path>`
+  - selects the comparison runner for the non-Node stages
+  - defaults to `build-edge/edge`
+- `FRAMEWORK_TEST_PORT_BASE=<port>`
+  - defaults to `4300`
+- `FRAMEWORK_TEST_PORT_BLOCK_SIZE=<count>`
+  - defaults to `10`
 
-Where:
+## Target Discovery
 
-- `make framework-test` runs the full prepare-and-test workflow for all supported `js-*` examples.
-- `make framework-test <framework>` limits the run to one selected framework example.
-- `make framework-test-reset` removes generated state so the framework workflow can be re-run from a clean slate.
-- `SYMLINK_TARGET` selects which executable `node_modules/.bin/node` should point to during setup and test.
+Framework selection is automatic:
 
-### SYMLINK_TARGET Semantics
+- search `wasmer-examples/` for top-level directories matching `js-*`
+- only include entries that contain `package.json`
+- sort deterministically
+- optionally narrow to one selected framework
 
-- `SYMLINK_TARGET` should default to the repo-local EdgeJS binary at `build-edge/edge`.
-- If `SYMLINK_TARGET` is unset, the workflow should behave as an EdgeJS compatibility run.
-- If `SYMLINK_TARGET` is set, the workflow should use that executable instead of assuming EdgeJS.
-- This is intended to support repeated runs against different runtimes so results can be cross-compared.
-- The target should be validated as an existing executable before any symlink injection happens.
-- Logs and status output should print the effective symlink target clearly at the start of the run.
+If `wasmer-examples/` is missing or uninitialized, the flow fails with an
+actionable submodule hint.
 
-### Notes About The Single-Framework Selector
+## Setup Phase
 
-The requirement is for an optional extra make argument that selects one framework.
+The setup portion of `framework-test` currently does the following:
 
-Examples of the intended UX:
+1. Creates framework-test state directories under `.framework-test/`.
+2. Verifies `pnpm` is available on `PATH`.
+3. Resolves the comparison runner from `SYMLINK_TARGET` or `build-edge/edge`.
+4. Builds the default EdgeJS binary if the default target is missing and the
+   helper script is invoked directly. The `Makefile` entrypoint already depends
+   on `build-edge/edge`.
+5. Runs `pnpm install --no-lockfile --store-dir .framework-test/pnpm-store` in
+   parallel across the selected frameworks.
+6. Verifies that each framework has at least one `pnpm` launcher in
+   `node_modules/.bin/` that routes through `"$basedir/node"`.
+7. Injects `node_modules/.bin/node` so later framework launches run through the
+   selected runtime.
 
-- `make framework-test js-next-staticsite`
-- `make framework-test js-svelte`
+### Shim Injection Model
 
-This is a spec requirement for the command shape. The eventual implementation can satisfy it either by:
+There are now two shim forms:
 
-- using `MAKECMDGOALS` to treat the extra goal as a framework selector; or
-- using a helper target pattern that preserves this CLI shape.
+- single-binary stages use a symlink:
+  - `node_modules/.bin/node -> <runner>`
+- the safe stage uses an executable wrapper script:
+  - `exec <runner> --safe "$@"`
 
-The important point is the user-facing command form, not the internal Make implementation detail.
+That wrapper is required because safe mode needs an extra CLI layer before the
+framework entrypoint.
 
-## Phase 1: Setup
+## Matrix Stages
 
-### Goal
+`make framework-test` now runs a staged compatibility matrix rather than a
+single comparison run.
 
-Make every `wasmer-examples/js-*` project locally runnable through the selected runner, with EdgeJS as the default target, using one repo-level setup flow.
+### Stage 1: `Node.js`
 
-### Phase 1 Requirements
+- always uses the host `node` discovered from `PATH`
+- runs against all selected frameworks
+- acts as the baseline for the rest of the matrix
 
-#### 1. Fast prerequisite checks
+### Stage 2: `EdgeJS Native`
 
-The setup flow should begin with cheap checks that fail fast before any expensive work:
+- uses the resolved comparison runner, normally `build-edge/edge`
+- only runs frameworks that passed the `Node.js` stage
+- reports regressions relative to `Node.js`
 
-- Verify `pnpm` is installed and reachable on `PATH`.
-- If `pnpm` is missing, fail with a short actionable message.
-- Verify `wasmer-examples/` exists and is populated enough to use.
-- Treat an empty, missing, or uninitialized submodule as an error.
-- The recovery instruction should be a direct git command, for example:
-  `git submodule update --init --recursive wasmer-examples`
+If `SYMLINK_TARGET` resolves to the same executable as host `node`, this stage
+and the safe stage are skipped.
 
-These checks are intentionally first because they are fast and remove avoidable failure cases before build or install work starts.
+If `SYMLINK_TARGET` points at a non-default custom runner, the stage label is
+`Comparison Runner` instead of `EdgeJS Native`.
 
-#### 2. Ensure EdgeJS exists
+### Stage 3: `Wasmer + EdgeJS Safe`
 
-The setup flow should ensure the effective runner target exists and is executable.
+- uses `<comparison-runner> --safe`
+- only runs frameworks that passed the comparison stage
+- reports regressions relative to the previous stage
 
-Expected behavior:
+This stage is only created when the comparison runner looks like an EdgeJS
+binary. If the comparison runner is some other executable, the safe stage is
+skipped.
 
-- Resolve the effective runner path from `SYMLINK_TARGET`, defaulting to `build-edge/edge`.
-- If the effective runner is the default `build-edge/edge` path and it already exists and is executable, reuse it.
-- If the effective runner is the default `build-edge/edge` path and it does not exist, invoke the repo build through the `Makefile`.
-- The default expectation is `make build` from the repo root.
-- If the effective runner comes from an explicit `SYMLINK_TARGET`, do not build anything automatically; just verify that the path exists and is executable.
-- If build or validation fails, stop immediately.
+### Matrix Reporting
 
-This keeps the default experience aligned with EdgeJS development while allowing the same harness to target alternate runtimes.
+Each run prints:
 
-#### 3. Discover target examples
+- a stage-by-stage pass/fail/skip summary
+- a full framework summary matrix
+- adjacent-stage regression summaries:
+  - `Node.js -> EdgeJS Native`
+  - `EdgeJS Native -> Wasmer + EdgeJS Safe`
 
-Target discovery should be automatic:
+Skipped frameworks preserve a reason, so later stages explain whether they were
+skipped because the prior stage failed or because the prior stage was itself
+skipped.
 
-- Search under `wasmer-examples/` for top-level directories matching `js-*`.
-- Only include directories that also contain a `package.json`.
-- Sort the list deterministically so output is stable between runs.
-- Treat zero matches as an error.
+## Runtime Selection And Validation
 
-This keeps the workflow generic so newly added JS examples are picked up automatically.
+The runtime phase is fully implemented, not just planned.
 
-#### 4. Install dependencies in parallel
+### Runtime Script Selection
 
-For each discovered example:
+The harness looks for scripts named:
 
-- run `pnpm install` from that example directory;
-- run these installs in parallel;
-- capture per-project logs;
-- fail the overall setup if any project install fails.
+- `preview`
+- `serve`
+- `start`
+- `dev`
+- `develop`
 
-The setup flow should not move on to launcher injection for a project whose install did not complete successfully.
+The current scoring prefers more production-style server commands:
 
-#### 5. Inject EdgeJS at the shim layer
+- `preview` highest
+- then `serve`
+- then `start`
+- then `dev`
+- then `develop`
 
-After install completes for a project:
+The score is adjusted upward when the command already appears to support host
+and port flags, and downward when it looks development-oriented.
 
-- inspect `node_modules/.bin/`;
-- verify that at least one generated launcher contains the `"$basedir/node"` pattern or equivalent relative-node launcher behavior;
-- create or replace `node_modules/.bin/node` as a symlink to the effective `SYMLINK_TARGET`.
+### Build Behavior
 
-The intent is to use the existing `pnpm` launcher behavior rather than mutate `package.json` scripts.
+The harness runs `pnpm run build` before validation when:
 
-Implementation assumptions for Phase 1:
+- the project has a `build` script; and
+- the chosen runtime script is not obviously dev-only.
 
-- the symlink target should come from `SYMLINK_TARGET`, defaulting to `build-edge/edge`;
-- re-running setup should refresh the symlink cleanly;
-- a project with no compatible launcher pattern should be surfaced explicitly rather than silently marked as prepared.
+Generated framework outputs are then reused by later stages whenever possible,
+so `Node.js` does the initial build and the later stages generally validate the
+same build output.
 
-#### 6. Setup validation
+### Static Export Handling
 
-Before Phase 1 reports success, it should verify:
+Projects that resolve to a Next export flow are treated specially:
 
-- `node_modules/.bin/` exists for every prepared project;
-- `node_modules/.bin/node` exists and resolves to the effective `SYMLINK_TARGET`;
-- at least one launcher in that `.bin/` directory appears capable of using the `basedir/node` shortcut.
+- the harness serves `out/` through a generated static server helper
+- that helper is written inside the framework project itself as:
+  - `.framework-test-static-server.js`
 
-This is still setup-only validation. It does not yet mean the framework server boots successfully.
+The helper is project-local on purpose so the safe stage can execute it without
+depending on an out-of-tree script path.
 
-### Phase 1 Output
+### Host And Port Injection
 
-At the end of setup, each JS example should be in this state:
+The runtime launcher tries framework-specific argument shapes where needed,
+including dedicated handling for:
 
-- dependencies installed;
-- local launcher shims present;
-- `node_modules/.bin/node` pointing at the effective runner target;
-- ready for a later runtime test via `pnpm run ...`.
+- Docusaurus `start`
+- `serve -l`
+- Vite-style commands
+- Next hostname/port flags
+- generic host/port permutations
 
-### Phase 1 Success Criteria
+Each framework gets a deterministic port block derived from:
 
-Phase 1 is complete when:
+- `FRAMEWORK_TEST_PORT_BASE`
+- `FRAMEWORK_TEST_PORT_BLOCK_SIZE`
 
-- all JS examples were discovered correctly;
-- all `pnpm install` runs completed successfully;
-- all eligible examples have the runner symlink in the expected shim location;
-- the setup flow can be re-run without manual cleanup.
+### Success Criteria
+
+A runtime stage only passes when the framework:
+
+- starts a local process;
+- responds on localhost;
+- returns an HTTP response that looks like HTML.
+
+The harness validates HTTP success, not just process liveness.
+
+## Retry And Speed Behavior
+
+The runtime stage is intentionally conservative about command shapes, but it now
+fails faster on non-retryable startup errors.
+
+### What Retries
+
+The harness still retries alternate launch shapes on a port, and will move to
+another port for errors that are plausibly port-related, such as:
+
+- listener conflicts
+- address binding failures
+- connection resets/refusals
+- startup timeouts
+
+### What No Longer Retries Across Ports
+
+If the failure is clearly not port-related, the harness stops trying the rest of
+the port block and fails immediately for that framework/stage.
+
+Examples include:
+
+- module resolution failures
+- runtime traps
+- unsupported runtime behavior
+- other deterministic startup crashes
+
+This keeps the compatibility signal intact while avoiding slow repeated failures
+such as trying ten ports for the same Wasmer trap.
+
+### Current Concurrency Model
+
+Current parallelism is intentionally limited to setup:
+
+- `pnpm install` runs in parallel across frameworks
+- runtime validation itself is still sequential within each stage
+
+Cross-framework runtime parallelism is not part of this merge.
 
 ## Reset Behavior
 
-### Goal
+`make framework-test-reset` now supports either all frameworks or one selected
+framework.
 
-Provide a clean-slate recovery path when framework setup or runtime testing leaves behind broken or stale generated state.
+The reset scope includes:
 
-### Callsign
+- selected framework `node_modules/`
+- common generated framework outputs such as:
+  - `dist`
+  - `build`
+  - `out`
+  - `.next`
+  - `.svelte-kit`
+  - `.astro`
+  - `.docusaurus`
+  - `.cache`
+  - `public/build`
+  - `public/_gatsby`
+  - `public/page-data`
+- project-local `.framework-test-static-server.js`
+- `.framework-test/`
+- `build-edge/`
+- repo-root `.pnpm-store/`
 
-The reset entrypoint should be:
+The reset path avoids touching source-controlled files. It also only removes an
+untracked `public/` directory when that directory is not tracked in the
+`wasmer-examples` submodule.
 
-- `make framework-test-reset`
+## Logs And Artifacts
 
-### Reset Scope
+Framework-test state lives under `.framework-test/`.
 
-The reset target should remove any generated state that affects framework-test reproducibility, including:
+Important outputs include:
 
-- the EdgeJS build output used by the default framework workflow, at minimum `build-edge/edge`, and likely the full `build-edge/` directory;
-- installed JS dependencies under the targeted example directories, especially `node_modules/`;
-- the injected `node_modules/.bin/node` symlinks created for runner interception;
-- any framework-test log directories, temp files, pid files, or cached probe artifacts created by the test harness.
+- `.framework-test/logs/<project>.pnpm-install.log`
+- `.framework-test/logs/<project>.<stage>.build.log`
+- `.framework-test/logs/<project>.<stage>.server.log`
 
-### Reset Semantics
+These logs are the primary debugging artifact for framework startup failures and
+stage-to-stage regressions.
 
-- The reset target should leave source-controlled files untouched.
-- The reset target should be safe to run even if some generated paths do not exist.
-- After reset, `make framework-test` should rebuild and reinstall everything it needs without any manual repair steps.
-- If the workflow later supports single-framework selection for reset, that is optional. The baseline requirement is a full reset target.
+## Current Limitations
 
-## Phase 2: Runtime Validation
+The following are current intentional limits of the implementation:
 
-### Goal
+- runtime validation is boot-and-serve validation, not deep application
+  correctness
+- runtime stages are sequential, not parallelized across frameworks
+- safe mode is only attempted for an EdgeJS-like comparison runner
+- the harness compares one baseline and one comparison runner, not an arbitrary
+  N-way runtime matrix
 
-Prove that each prepared example can start a dev or serve-style HTTP process through EdgeJS and respond to at least one local HTTP request.
+## Verified Behavior
 
-### Main Problem To Solve
+The implementation has been validated through `make framework-test` itself.
 
-The runtime test phase is harder because two things are not uniform:
+The focused proof run used:
 
-- the correct script name to start the framework differs by project;
-- the port is not consistently declared up front.
+- `make framework-test js-next-staticsite`
 
-So Phase 2 needs a discovery and launch strategy instead of a single hardcoded command.
+Observed behavior:
 
-### Current Script Inventory
+- `Node.js` passed
+- `EdgeJS Native` passed
+- `Wasmer + EdgeJS Safe` ran as a true third stage
+- the safe-stage failure was surfaced as a real runtime compatibility error,
+  not a harness-only path issue
 
-From the current `package.json` files, the likely runtime entrypoints are:
-
-- `js-astro-staticsite`: `dev`, `start`, `preview`
-- `js-docusaurus-staticsite`: `start`, `serve`
-- `js-docusaurus2-staticsite`: `start`, `serve`
-- `js-docusaurusold-staticsite`: `dev`, `start`
-- `js-gatsby-staticsite`: `develop`, `start`, `serve`
-- `js-gatsby-staticsite2`: `develop`, `start`, `serve`
-- `js-next-staticsite`: `dev`, `start`
-- `js-remix-staticsite`: `dev`, `start`
-- `js-svelte`: `dev`, `preview`
-
-This is the starting inventory for runtime-command selection. It is not yet a validated command matrix.
-
-### Proposed Phase 2 Strategy
-
-#### 1. Prefer explicit port assignment over port discovery
-
-Instead of starting a framework on an unknown port and then trying to discover it, Phase 2 should try to force the port up front.
-
-Benefits:
-
-- simpler readiness checks;
-- simpler HTTP probing;
-- simpler cleanup;
-- less log scraping.
-
-The basic shape should be:
-
-- assign a deterministic free port per project from a reserved local range;
-- launch the framework with that chosen port;
-- bind to `127.0.0.1` where the framework supports it;
-- poll the chosen URL until it responds or times out.
-
-#### 2. Use a script-selection heuristic
-
-The first pass for choosing which script to run should be:
-
-1. prefer a development server script;
-2. fall back to a serve script;
-3. only use preview where that is the framework's local server mode.
-
-A reasonable initial preference order is:
-
-`dev` -> `develop` -> `start` -> `serve` -> `preview`
-
-This may still need framework-specific overrides.
-
-#### 3. Use framework-specific CLI arg injection where needed
-
-The runtime harness will likely need a small command matrix rather than pretending every framework accepts the same flags.
-
-Current working hypothesis:
-
-- Astro: `pnpm run dev -- --host 127.0.0.1 --port <port>`
-- Svelte/Vite: `pnpm run dev -- --host 127.0.0.1 --port <port>`
-- Next: `pnpm run dev -- --hostname 127.0.0.1 --port <port>`
-- Gatsby: `pnpm run develop -- --host 127.0.0.1 -p <port>`
-- Docusaurus 2/3: `pnpm run start -- --host 127.0.0.1 --port <port>`
-- Docusaurus 1: `PORT=<port> pnpm run dev`
-- Remix: `pnpm run dev -- --port <port>`
-
-These are planning assumptions only. They still need validation when Phase 2 work starts.
-
-#### 4. Detect readiness through HTTP, not just process liveness
-
-A process staying alive is not enough. Runtime success should mean:
-
-- the process started;
-- it accepted a TCP listener on the chosen port;
-- an HTTP request to the local URL returned a meaningful response.
-
-Likely probe targets:
-
-- `GET /`
-- optionally one static asset or framework-specific route if `/` is insufficient
-
-#### 5. Always clean up background processes
-
-Each runtime test should:
-
-- launch the framework in the background;
-- capture logs to a per-project file;
-- enforce a startup timeout;
-- terminate the process on success, failure, or timeout.
-
-### Phase 2 Risks
-
-- Some frameworks may require a build before a serve-style command works.
-- Some scripts named `start` are aliases for dev mode, while others assume a prior build.
-- CLI flag forwarding through `pnpm run <script> -- ...` may not be consistent across all frameworks.
-- Alternate `SYMLINK_TARGET` runtimes may differ in CLI, unsupported builtins, or process behavior, which can change failure modes even when setup succeeds.
-- Some frameworks may boot successfully but fail on first HTTP request due to missing browser-only features, unsupported filesystem assumptions, or runtime incompatibilities in EdgeJS.
-
-### Phase 2 Success Criteria
-
-Phase 2 is complete when, for each prepared example:
-
-- the runtime harness can choose a start command;
-- the harness can force or reliably know the port;
-- the app can be queried over HTTP on localhost;
-- logs make failures diagnosable when startup or serving breaks.
-
-## Suggested Final Shape
-
-The eventual workflow should be exposed through `Makefile` targets:
-
-- `framework-test`
-- `framework-test-reset`
-
-Internally, those targets may delegate to one helper script with at least two logical stages:
-
-- `setup`
-- `test`
-
-The immediate task is still only Phase 1 setup design, but the implementation should be structured so `framework-test` can own the full flow and a later `test` stage can be attached cleanly.
-
-## Non-Goals For The First Implementation
-
-- Do not rewrite framework package scripts.
-- Do not hardcode a single framework binary path.
-- Do not assume every project uses the same start script.
-- Do not claim runtime success at the end of Phase 1.
-
-## Immediate Next Step
-
-Design the first implementation around these public targets:
+This is the expected shape for the full-matrix command:
 
 - `make framework-test`
-- `make framework-test <framework>`
-- `make framework-test-reset`
 
-Within that shape, Phase 1 should still do the same core work:
+## Merge Scope Summary
 
-- fast checks;
-- resolve `SYMLINK_TARGET` and build EdgeJS only when using the default target and it is missing;
-- discover target `js-*` examples;
-- optionally narrow to one framework when requested;
-- run `pnpm install` in parallel for the selected set;
-- attach `node_modules/.bin/node -> $SYMLINK_TARGET`;
-- verify the shim-based setup succeeded.
+This feature is now fully scoped for merge as:
 
-Phase 2 should begin only after that setup path is working cleanly.
+- a Makefile-driven framework compatibility harness
+- automatic discovery of `wasmer-examples/js-*`
+- per-stage runner injection
+- a three-stage compatibility matrix
+- clear per-stage and delta summaries
+- reset support
+- fail-fast retry behavior for non-port-related startup failures
+
+Any future work after this merge should be treated as follow-up optimization,
+not as missing scope from the current feature.

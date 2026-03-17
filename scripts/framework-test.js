@@ -17,7 +17,7 @@ const LOG_DIR = path.join(STATE_DIR, 'logs');
 const PNPM_STORE_DIR = path.join(STATE_DIR, 'pnpm-store');
 const DEFAULT_RUNNER = path.join(ROOT_DIR, 'build-edge', 'edge');
 const DEFAULT_HOST = '127.0.0.1';
-const STATIC_SERVER_SCRIPT_PATH = path.join(STATE_DIR, 'static-server.js');
+const STATIC_SERVER_SCRIPT_BASENAME = '.framework-test-static-server.js';
 const SUBMODULE_HINT = 'git submodule update --init --recursive wasmer-examples';
 const NODE_HINT = 'Install Node.js and make sure `node` is on PATH before running framework-test.';
 const PNPM_HINT = 'Install pnpm and make sure it is on PATH. For example: corepack enable pnpm';
@@ -162,47 +162,88 @@ function resolveHostNodeRunner() {
   return {
     color: 'cyan',
     key: 'node',
-    label: 'Node Baseline',
+    label: 'Node.js',
     targetPath,
   };
 }
 
 function buildRunnerStages(nodeRunner, comparisonRunner) {
   const stages = [
-    {
+    createIndependentRunnerStage({
       color: nodeRunner.color,
       key: nodeRunner.key,
       label: nodeRunner.label,
-      selectProjects(projects) {
-        return projects.slice();
-      },
-      skippedProjects() {
-        return [];
-      },
-      targetPath: nodeRunner.targetPath,
-    },
+      runnerCommandParts: [nodeRunner.targetPath],
+    }),
   ];
 
   if (path.resolve(nodeRunner.targetPath) === path.resolve(comparisonRunner.targetPath)) {
-    logWarn(`comparison runner matches the Node baseline (${comparisonRunner.targetPath}); skipping the second stage`);
+    logWarn(`comparison runner matches the Node baseline (${comparisonRunner.targetPath}); skipping the EdgeJS and safe stages`);
     return stages;
   }
 
   const comparisonLabel = path.resolve(comparisonRunner.targetPath) === path.resolve(DEFAULT_RUNNER)
-    ? 'EdgeJS Comparison'
+    ? 'EdgeJS Native'
     : 'Comparison Runner';
   const comparisonKey = path.resolve(comparisonRunner.targetPath) === path.resolve(DEFAULT_RUNNER)
     ? 'edgejs'
     : 'comparison';
 
-  stages.push({
+  const comparisonStage = createDependentRunnerStage({
     color: 'magenta',
     key: comparisonKey,
     label: comparisonLabel,
+    runnerCommandParts: [comparisonRunner.targetPath],
+  });
+  stages.push(comparisonStage);
+
+  if (!supportsSafeRunner(comparisonRunner.targetPath)) {
+    logWarn(`comparison runner does not look like an EdgeJS binary (${comparisonRunner.targetPath}); skipping the safe stage`);
+    return stages;
+  }
+
+  stages.push(createDependentRunnerStage({
+    color: 'yellow',
+    key: `${comparisonKey}-safe`,
+    label: path.resolve(comparisonRunner.targetPath) === path.resolve(DEFAULT_RUNNER)
+      ? 'Wasmer + EdgeJS Safe'
+      : 'Comparison Runner Safe',
+    runnerCommandParts: [comparisonRunner.targetPath, '--safe'],
+  }));
+
+  return stages;
+}
+
+function createIndependentRunnerStage(options) {
+  return {
+    color: options.color,
+    key: options.key,
+    label: options.label,
+    runnerCommandParts: options.runnerCommandParts.slice(),
+    runnerDisplay: buildRunnerDisplay(options.runnerCommandParts),
+    selectProjects(projects) {
+      return projects.slice();
+    },
+    skippedProjects() {
+      return [];
+    },
+  };
+}
+
+function createDependentRunnerStage(options) {
+  const runnerCommandParts = options.runnerCommandParts.slice();
+
+  return {
+    color: options.color,
+    key: options.key,
+    label: options.label,
+    runnerCommandParts,
+    runnerDisplay: buildRunnerDisplay(runnerCommandParts),
     selectProjects(projects, previousResult) {
       if (!previousResult) {
         return [];
       }
+
       return previousResult.passed.map((entry) => entry.project);
     },
     skippedProjects(projects, selectedProjects, previousResult) {
@@ -211,21 +252,41 @@ function buildRunnerStages(nodeRunner, comparisonRunner) {
       }
 
       const selectedNames = new Set(selectedProjects.map((project) => project.name));
+      const skippedReasons = new Map();
+
+      for (const failure of previousResult.failed) {
+        skippedReasons.set(failure.project.name, `${previousResult.stage.label} failed`);
+      }
+      for (const skipped of previousResult.skipped) {
+        skippedReasons.set(skipped.project.name, skipped.reason || `${previousResult.stage.label} skipped`);
+      }
+
       return projects
         .filter((project) => !selectedNames.has(project.name))
         .map((project) => ({
           project,
-          reason: 'Node baseline failed',
+          reason: skippedReasons.get(project.name) || `${previousResult.stage.label} failed`,
         }));
     },
-    targetPath: comparisonRunner.targetPath,
-  });
+  };
+}
 
-  return stages;
+function buildRunnerDisplay(runnerCommandParts) {
+  return normalizeRunnerCommandParts(runnerCommandParts)
+    .map(shellQuote)
+    .join(' ');
+}
+
+function supportsSafeRunner(targetPath) {
+  if (path.resolve(targetPath) === path.resolve(DEFAULT_RUNNER)) {
+    return true;
+  }
+
+  return /(^|[^a-z])edge(js)?([^a-z]|$)/i.test(path.basename(targetPath));
 }
 
 async function runRunnerStage(stage, projects, skippedProjects) {
-  printSection(stage.label, stage.color, stage.targetPath);
+  printSection(stage.label, stage.color, stage.runnerDisplay);
 
   if (projects.length === 0) {
     logSkip(`no frameworks selected for ${stage.label.toLowerCase()}`);
@@ -280,7 +341,7 @@ function prepareProjectForStage(project, stage) {
   } else {
     removeGeneratedFrameworkArtifacts(project);
   }
-  const injection = injectRunner(project, stage.targetPath);
+  const injection = injectRunner(project, stage.runnerCommandParts);
   return {
     compatibleLaunchers: injection.compatibleLaunchers,
     reuseExistingBuild,
@@ -669,6 +730,7 @@ async function startProjectServer(project, runtime, portCandidates, stage) {
   let attempt = 0;
   for (const port of portCandidates) {
     const candidates = buildRuntimeCandidates(runtime, port);
+    let shouldTryAnotherPort = false;
     for (let index = 0; index < candidates.length; index += 1) {
       attempt += 1;
       const candidate = candidates[index];
@@ -697,8 +759,14 @@ async function startProjectServer(project, runtime, portCandidates, stage) {
       } catch (error) {
         lastError = error;
         await stopProcess(handle);
+        shouldTryAnotherPort = shouldTryAnotherPort || shouldRetryWithAnotherPort(error, logPath);
         logWarn(`start attempt failed for ${project.name} on ${DEFAULT_HOST}:${port}: ${error.message}`);
       }
+    }
+
+    if (!shouldTryAnotherPort && lastError) {
+      logWarn(`stopping additional port retries for ${project.name} on ${stage.label}; the startup failure is not port-related`);
+      break;
     }
   }
 
@@ -713,14 +781,14 @@ async function startStaticExportServer(project, runtime, portCandidates, stage) 
     fail(`expected static output directory for ${project.name}: ${runtime.outputDir}`);
   }
 
-  ensureStaticServerScript();
+  ensureStaticServerScript(project);
   const logPath = serverLogPath(project, stage);
   removeFileOrSymlink(logPath);
 
   let lastError = null;
   for (let index = 0; index < portCandidates.length; index += 1) {
     const port = portCandidates[index];
-    const commandDisplay = buildStaticServerCommand(stage.targetPath, runtime.outputDir, port);
+    const commandDisplay = buildStaticServerCommand(project, stage.runnerCommandParts, runtime.outputDir, port);
     log(`starting ${project.name} on ${DEFAULT_HOST}:${port} with static export fallback (attempt ${index + 1})`);
 
     const handle = spawnLoggedProcess({
@@ -751,6 +819,10 @@ async function startStaticExportServer(project, runtime, portCandidates, stage) 
       lastError = error;
       await stopProcess(handle);
       logWarn(`static export fallback failed for ${project.name} on ${DEFAULT_HOST}:${port}: ${error.message}`);
+      if (!shouldRetryWithAnotherPort(error, logPath)) {
+        logWarn(`stopping additional port retries for ${project.name} on ${stage.label}; the startup failure is not port-related`);
+        break;
+      }
     }
   }
 
@@ -818,13 +890,13 @@ function serverLogPath(project, stage) {
   return path.join(LOG_DIR, `${project.name}.${stage.key}.server.log`);
 }
 
-function ensureStaticServerScript() {
-  if (fs.existsSync(STATIC_SERVER_SCRIPT_PATH)) {
-    return;
+function ensureStaticServerScript(project) {
+  const scriptPath = staticServerScriptPath(project);
+  if (fs.existsSync(scriptPath)) {
+    return scriptPath;
   }
 
-  ensureDir(path.dirname(STATIC_SERVER_SCRIPT_PATH));
-  fs.writeFileSync(STATIC_SERVER_SCRIPT_PATH, [
+  fs.writeFileSync(scriptPath, [
     "'use strict';",
     '',
     "const fs = require('node:fs');",
@@ -894,10 +966,28 @@ function ensureStaticServerScript() {
     "  process.stdout.write(`static export server listening on http://${host}:${port}\\n`);",
     '});',
   ].join('\n'));
+  return scriptPath;
 }
 
-function buildStaticServerCommand(runnerPath, outputDir, port) {
-  return `exec ${shellQuote(runnerPath)} ${shellQuote(STATIC_SERVER_SCRIPT_PATH)} ${shellQuote(outputDir)} ${shellQuote(String(port))} ${shellQuote(DEFAULT_HOST)}`;
+function buildStaticServerCommand(project, runnerCommandParts, outputDir, port) {
+  const scriptPath = toProjectRelativePath(project.dir, staticServerScriptPath(project));
+  const relativeOutputDir = toProjectRelativePath(project.dir, outputDir);
+  const commandParts = normalizeRunnerCommandParts(runnerCommandParts)
+    .concat([scriptPath, relativeOutputDir, String(port), DEFAULT_HOST]);
+  return `exec ${commandParts.map(shellQuote).join(' ')}`;
+}
+
+function staticServerScriptPath(project) {
+  return path.join(project.dir, STATIC_SERVER_SCRIPT_BASENAME);
+}
+
+function toProjectRelativePath(projectDir, targetPath) {
+  const relativePath = path.relative(projectDir, targetPath);
+  if (!relativePath || relativePath === '') {
+    return '.';
+  }
+
+  return relativePath.startsWith('.') ? relativePath : `./${relativePath}`;
 }
 
 function makeProjectEnv(port) {
@@ -1302,6 +1392,32 @@ function summarizeLogFailure(logPath, fallbackError) {
   return fallbackError && fallbackError.message ? fallbackError.message : 'see log for details';
 }
 
+function shouldRetryWithAnotherPort(error, logPath) {
+  const detail = describeStartupFailure(error, logPath).toLowerCase();
+  const retryablePatterns = [
+    /\btimed out waiting\b/,
+    /\brequest timed out\b/,
+    /\beaddrinuse\b/,
+    /\beaddrnotavail\b/,
+    /\beacces\b/,
+    /\balready in use\b/,
+    /\blisten e[a-z]+\b/,
+    /\beconnrefused\b/,
+    /\beconnreset\b/,
+    /\bsocket hang up\b/,
+  ];
+
+  return retryablePatterns.some((pattern) => pattern.test(detail));
+}
+
+function describeStartupFailure(error, logPath) {
+  if (error && typeof error.detail === 'string' && error.detail) {
+    return error.detail;
+  }
+
+  return summarizeLogFailure(logPath, error);
+}
+
 function buildPortCandidates(index) {
   const startPort = PORT_BASE + (index * PORT_BLOCK_SIZE);
   return Array.from({ length: PORT_BLOCK_SIZE }, (_, offset) => startPort + offset);
@@ -1310,6 +1426,7 @@ function buildPortCandidates(index) {
 function injectRunner(project, runnerTarget) {
   const binDir = path.join(project.dir, 'node_modules', '.bin');
   const compatibleLaunchers = findCompatibleLaunchers(binDir);
+  const runnerCommandParts = normalizeRunnerCommandParts(runnerTarget);
 
   if (compatibleLaunchers.length === 0) {
     fail(`no compatible pnpm launcher was found for ${project.name} in ${binDir}`);
@@ -1317,18 +1434,64 @@ function injectRunner(project, runnerTarget) {
 
   const nodeShimPath = path.join(binDir, 'node');
   removeFileOrSymlink(nodeShimPath);
-  fs.symlinkSync(runnerTarget, nodeShimPath);
-
-  const resolvedShim = fs.realpathSync(nodeShimPath);
-  const resolvedTarget = fs.realpathSync(runnerTarget);
-  if (resolvedShim !== resolvedTarget) {
-    fail(`runner shim for ${project.name} does not resolve to ${runnerTarget}`);
-  }
+  installRunnerShim(nodeShimPath, runnerCommandParts);
+  validateRunnerShim(project, nodeShimPath, runnerCommandParts);
 
   return {
     compatibleLaunchers,
     project,
   };
+}
+
+function normalizeRunnerCommandParts(runnerTarget) {
+  if (Array.isArray(runnerTarget)) {
+    return runnerTarget.slice();
+  }
+
+  if (typeof runnerTarget === 'string' && runnerTarget) {
+    return [runnerTarget];
+  }
+
+  fail(`invalid runner target: ${runnerTarget == null ? 'missing' : String(runnerTarget)}`);
+}
+
+function installRunnerShim(nodeShimPath, runnerCommandParts) {
+  if (runnerCommandParts.length === 1) {
+    fs.symlinkSync(runnerCommandParts[0], nodeShimPath);
+    return;
+  }
+
+  fs.writeFileSync(nodeShimPath, buildRunnerShimScript(runnerCommandParts), { mode: 0o755 });
+  fs.chmodSync(nodeShimPath, 0o755);
+}
+
+function validateRunnerShim(project, nodeShimPath, runnerCommandParts) {
+  if (runnerCommandParts.length === 1) {
+    const resolvedShim = fs.realpathSync(nodeShimPath);
+    const resolvedTarget = fs.realpathSync(runnerCommandParts[0]);
+    if (resolvedShim !== resolvedTarget) {
+      fail(`runner shim for ${project.name} does not resolve to ${runnerCommandParts[0]}`);
+    }
+    return;
+  }
+
+  if (!isExecutable(nodeShimPath)) {
+    fail(`runner shim for ${project.name} is not executable: ${nodeShimPath}`);
+  }
+
+  const expectedScript = buildRunnerShimScript(runnerCommandParts);
+  const actualScript = fs.readFileSync(nodeShimPath, 'utf8');
+  if (actualScript !== expectedScript) {
+    fail(`runner shim for ${project.name} did not match the expected wrapper`);
+  }
+}
+
+function buildRunnerShimScript(runnerCommandParts) {
+  return [
+    '#!/bin/sh',
+    `exec ${runnerCommandParts.map(shellQuote).join(' ')} "$@"`,
+    '',
+  ].join('\n');
 }
 
 function findCompatibleLaunchers(binDir) {
@@ -1421,6 +1584,12 @@ function reset(selector) {
 }
 
 function removeGeneratedFrameworkArtifacts(project) {
+  const staticServerPath = staticServerScriptPath(project);
+  if (fs.existsSync(staticServerPath)) {
+    log(`removing ${staticServerPath}`);
+    fs.rmSync(staticServerPath, { force: true });
+  }
+
   for (const relativePath of GENERATED_FRAMEWORK_PATHS) {
     const targetPath = path.join(project.dir, relativePath);
     if (!fs.existsSync(targetPath)) {
@@ -1555,6 +1724,9 @@ function printStageSummary(result) {
 
   if (result.skipped.length > 0) {
     logSkip(`${result.stage.label} skipped (${result.skipped.length}): ${result.skipped.map((entry) => entry.project.name).join(', ')}`);
+    for (const skipped of result.skipped) {
+      process.stdout.write(`${colorize('  SKIP', 'yellow', ['bold'])} ${skipped.project.name}: ${skipped.reason || 'skipped'}${os.EOL}`);
+    }
   }
 }
 
@@ -1572,21 +1744,22 @@ function printMatrixSummary(stageResults, allProjects) {
     process.stdout.write(`  ${colorize('SKIP', 'yellow', ['bold'])} ${skippedNames.length > 0 ? skippedNames.join(', ') : 'none'}${os.EOL}`);
   }
 
-  if (stageResults.length >= 2) {
-    const baselineResult = stageResults[0];
-    const comparisonResult = stageResults[1];
-    printSection('Node To Comparison Delta', 'magenta', `${baselineResult.stage.label} -> ${comparisonResult.stage.label}`);
+  for (let index = 1; index < stageResults.length; index += 1) {
+    const previousResult = stageResults[index - 1];
+    const currentResult = stageResults[index];
+    printSection('Framework Delta', currentResult.stage.color, `${previousResult.stage.label} -> ${currentResult.stage.label}`);
 
-    const regressions = comparisonResult.failed.filter((failure) =>
-      baselineResult.passed.some((entry) => entry.project.name === failure.project.name));
+    const regressions = currentResult.failed.filter((failure) =>
+      previousResult.passed.some((entry) => entry.project.name === failure.project.name));
 
     if (regressions.length === 0) {
-      logSuccess(`no regressions between ${baselineResult.stage.label} and ${comparisonResult.stage.label}`);
-    } else {
-      logError(`regressions (${regressions.length}) where ${baselineResult.stage.label} passed but ${comparisonResult.stage.label} failed`);
-      for (const regression of regressions) {
-        process.stderr.write(`${colorize('  FAIL', 'red', ['bold'])} ${regression.project.name}: ${regression.detail}${regression.logPath ? ` [log: ${regression.logPath}]` : ''}${os.EOL}`);
-      }
+      logSuccess(`no regressions between ${previousResult.stage.label} and ${currentResult.stage.label}`);
+      continue;
+    }
+
+    logError(`regressions (${regressions.length}) where ${previousResult.stage.label} passed but ${currentResult.stage.label} failed`);
+    for (const regression of regressions) {
+      process.stderr.write(`${colorize('  FAIL', 'red', ['bold'])} ${regression.project.name}: ${regression.detail}${regression.logPath ? ` [log: ${regression.logPath}]` : ''}${os.EOL}`);
     }
   }
 }
