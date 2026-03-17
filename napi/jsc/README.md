@@ -4,25 +4,28 @@ The bundled JavaScriptCore provider requires a JavaScriptCore runtime with `Shar
 
 ## Default Layout
 
-- Bun WebKit SDK: `/Users/syrusakbary/Development/bun-webkit/autobuild-00e825523d549a556d75985f486e4954af6ab8c7`
+- Bun WebKit release tag: `autobuild-00e825523d549a556d75985f486e4954af6ab8c7`
+- CI Bun WebKit SDK path: `<repo>/.ci/jsc/<tag>/macos-<arch>`
+- Local Bun WebKit SDK path: `/Users/syrusakbary/Development/bun-webkit/<tag>`
 - Override Bun SDK location with `BUN_WEBKIT_ROOT`
 - Fallback WebKit checkout: `/Users/syrusakbary/Development/WebKit`
 - Override source checkout location with `WEBKIT_ROOT`
-- Default edgejs build directory: `<repo>/build-jsc-macos-release`
+- Default edgejs JSC build directory: `<repo>/build-napi-jsc`
 
 ## Scripts
 
 - [`fetch_bun_webkit_macos.sh`](/Users/syrusakbary/Development/edgejs/napi/jsc/tools/fetch_bun_webkit_macos.sh)
-  downloads and extracts the Bun macOS WebKit SDK for the current machine architecture.
+  downloads and extracts the pinned Bun macOS WebKit SDK for the current machine architecture.
 - [`build_webkit_macos.sh`](/Users/syrusakbary/Development/edgejs/napi/jsc/tools/build_webkit_macos.sh)
   clones or updates the Apple/macOS WebKit checkout and runs `Tools/Scripts/build-webkit --release`. This remains the source-build fallback.
 - [`run_napi_jsc_tests_macos.sh`](/Users/syrusakbary/Development/edgejs/napi/jsc/tools/run_napi_jsc_tests_macos.sh)
-  configures the repo with `EDGE_NAPI_PROVIDER=bundled-jsc`, auto-detects either the Bun static SDK or a local WebKit framework build, runs a direct JavaScriptCore runtime probe, then runs the JSC smoke suite and full `ctest` suite.
+  reuses `make build-napi-jsc`, auto-detects either the Bun static SDK or a local WebKit framework build, runs a direct JavaScriptCore runtime probe, then runs the JSC smoke suite and full `ctest` suite.
 
 ## Typical Flow
 
 ```bash
 napi/jsc/tools/fetch_bun_webkit_macos.sh
+make build-napi-jsc BUN_WEBKIT_ROOT="$(pwd)/.ci/jsc/autobuild-00e825523d549a556d75985f486e4954af6ab8c7/macos-<arch>"
 napi/jsc/tools/run_napi_jsc_tests_macos.sh
 ```
 
@@ -33,6 +36,8 @@ The fast path uses the Bun SDK with:
 - `NAPI_JSC_EXTRA_LIBS=$BUN_WEBKIT_ROOT/lib/libWTF.a;$BUN_WEBKIT_ROOT/lib/libbmalloc.a;icucore`
 
 No `DYLD_*` injection is needed in Bun mode because the JSC archive links statically into the test binaries.
+
+The GitHub Actions `build-napi-jsc-macos` job uses this Bun SDK path only for N-API validation. It does not change the default `make build` provider or the release packaging path, which remain on bundled V8.
 
 The source-build fallback still uses:
 

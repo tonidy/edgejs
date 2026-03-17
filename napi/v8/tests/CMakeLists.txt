@@ -21,6 +21,7 @@ if(NAPI_V8_LIBRARY)
     "${NAPI_V8_GTEST_ROOT}/src/gtest-all.cc"
     "${NAPI_V8_GTEST_ROOT}/src/gtest_main.cc"
   )
+  add_custom_target(napi_v8_tests)
 
   target_include_directories(napi_v8_gtest
     PRIVATE
@@ -55,10 +56,9 @@ if(NAPI_V8_LIBRARY)
         napi_v8_gtest
         napi_v8
         "${NAPI_V8_LIBRARY}"
+        $<TARGET_NAME_IF_EXISTS:edge_environment_core>
+        $<TARGET_NAME_IF_EXISTS:uv_a>
     )
-    if(TARGET edge_environment_core)
-      target_link_libraries(${target_name} PRIVATE edge_environment_core)
-    endif()
     target_compile_definitions(${target_name}
       PRIVATE
         NAPI_V8_NODE_ROOT_PATH="${NAPI_V8_NODE_ROOT}"
@@ -81,6 +81,7 @@ if(NAPI_V8_LIBRARY)
       BUILD_RPATH "${NAPI_V8_LIB_DIR}"
       INSTALL_RPATH "${NAPI_V8_LIB_DIR}"
     )
+    add_dependencies(napi_v8_tests ${target_name})
     gtest_discover_tests(
       ${target_name}
       DISCOVERY_TIMEOUT 30

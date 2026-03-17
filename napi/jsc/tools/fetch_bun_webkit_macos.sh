@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-default_tag="autobuild-00e825523d549a556d75985f486e4954af6ab8c7"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/../../.." && pwd)"
+
+default_tag="$(bash "${script_dir}/bun_webkit_release_tag.sh")"
 tag="${BUN_WEBKIT_TAG:-$default_tag}"
 
 arch="$(uname -m)"
@@ -11,9 +14,12 @@ case "${arch}" in
   *) printf '[fetch_bun_webkit_macos] Unsupported macOS architecture: %s\n' "${arch}" >&2; exit 1 ;;
 esac
 
-default_root="/Users/syrusakbary/Development/bun-webkit/${tag}"
-if [[ "${HOME:-}" != "/Users/syrusakbary" ]]; then
-  default_root="${HOME}/Development/bun-webkit/${tag}"
+default_root="${repo_root}/.ci/jsc/${tag}/macos-${asset_arch}"
+if [[ -z "${GITHUB_WORKSPACE:-}" ]]; then
+  default_root="/Users/syrusakbary/Development/bun-webkit/${tag}"
+  if [[ "${HOME:-}" != "/Users/syrusakbary" ]]; then
+    default_root="${HOME}/Development/bun-webkit/${tag}"
+  fi
 fi
 
 destination_root="${BUN_WEBKIT_ROOT:-$default_root}"

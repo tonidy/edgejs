@@ -3,21 +3,32 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd "${script_dir}/../../.." && pwd)"
+default_tag="$(bash "${script_dir}/bun_webkit_release_tag.sh")"
+
+arch="$(uname -m)"
+case "${arch}" in
+  arm64) asset_arch="arm64" ;;
+  x86_64) asset_arch="amd64" ;;
+  *) asset_arch="${arch}" ;;
+esac
 
 default_webkit_root="/Users/syrusakbary/Development/WebKit"
 if [[ "${HOME:-}" != "/Users/syrusakbary" ]]; then
   default_webkit_root="${HOME}/Development/WebKit"
 fi
 
-default_bun_root="/Users/syrusakbary/Development/bun-webkit/autobuild-00e825523d549a556d75985f486e4954af6ab8c7"
-if [[ "${HOME:-}" != "/Users/syrusakbary" ]]; then
-  default_bun_root="${HOME}/Development/bun-webkit/autobuild-00e825523d549a556d75985f486e4954af6ab8c7"
+default_bun_root="${project_root}/.ci/jsc/${default_tag}/macos-${asset_arch}"
+if [[ ! -d "${default_bun_root}" ]]; then
+  default_bun_root="/Users/syrusakbary/Development/bun-webkit/${default_tag}"
+  if [[ "${HOME:-}" != "/Users/syrusakbary" ]]; then
+    default_bun_root="${HOME}/Development/bun-webkit/${default_tag}"
+  fi
 fi
 
 webkit_root="${WEBKIT_ROOT:-$default_webkit_root}"
 webkit_configuration="${WEBKIT_CONFIGURATION:-Release}"
 bun_root="${BUN_WEBKIT_ROOT:-$default_bun_root}"
-build_dir="${BUILD_DIR:-${project_root}/build-jsc-macos-release}"
+build_dir="${BUILD_DIR:-${project_root}/build-napi-jsc}"
 stock_host_build_dir="${STOCK_HOST_BUILD_DIR:-${project_root}/build-jsc-stock-host}"
 jobs="${JOBS:-$(sysctl -n hw.ncpu)}"
 probe_output="${build_dir}/jsc-runtime-probe.txt"
@@ -95,18 +106,24 @@ fi
 
 mkdir -p "${build_dir}"
 
-log "Configuring top-level build in ${build_dir}"
-cmake -S "${project_root}" -B "${build_dir}" \
-  "${generator_args[@]}" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DEDGE_NAPI_PROVIDER=bundled-jsc \
-  -DEDGE_NAPI_PROVIDER_BUILD_TESTS=ON \
-  -DNAPI_JSC_INCLUDE_DIR="${jsc_headers}" \
-  -DNAPI_JSC_LIBRARY="${jsc_library}" \
-  -DNAPI_JSC_EXTRA_LIBS="${jsc_extra_libs}"
+build_env=()
+if [[ "${runtime_kind}" == "bun-webkit-static" ]]; then
+  build_env+=(BUN_WEBKIT_ROOT="${runtime_root}")
+else
+  build_env+=(
+    NAPI_JSC_INCLUDE_DIR="${jsc_headers}"
+    NAPI_JSC_LIBRARY="${jsc_library}"
+    NAPI_JSC_EXTRA_LIBS="${jsc_extra_libs}"
+  )
+fi
 
-log "Building JSC provider tests and runtime probe"
-cmake --build "${build_dir}" --parallel "${jobs}" --target napi_jsc_tests
+log "Building JSC provider tests in ${build_dir} via make build-napi-jsc"
+env "${build_env[@]}" \
+  make -C "${project_root}" build-napi-jsc \
+    BUILD_DIR="${build_dir}" \
+    JOBS="${jobs}" \
+    CMAKE_BUILD_TYPE=Release \
+    EXTRA_CMAKE_ARGS="${generator_args[*]}"
 
 probe_bin="${build_dir}/napi-jsc/tests/napi_jsc_runtime_probe"
 guard_bin="${build_dir}/napi-jsc/tests/napi_jsc_test_67_jsc_config_guard"

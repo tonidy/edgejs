@@ -17,8 +17,28 @@ function(napi_jsc_resolve_configuration)
   _napi_jsc_read_value(_library NAPI_JSC_LIBRARY)
   _napi_jsc_read_value(_extra NAPI_JSC_EXTRA_LIBS)
   _napi_jsc_read_value(_defines NAPI_JSC_DEFINES)
+  _napi_jsc_read_value(_bun_root BUN_WEBKIT_ROOT)
   set(_auto_extra)
   set(_auto_defines)
+  set(_bun_sdk_root "")
+
+  if(NOT _bun_root STREQUAL "" AND
+     (_include STREQUAL "" OR _library STREQUAL ""))
+    if(NOT EXISTS "${_bun_root}/include/JavaScriptCore/JavaScript.h" OR
+       NOT EXISTS "${_bun_root}/lib/libJavaScriptCore.a" OR
+       NOT EXISTS "${_bun_root}/lib/libWTF.a" OR
+       NOT EXISTS "${_bun_root}/lib/libbmalloc.a")
+      message(FATAL_ERROR
+        "BUN_WEBKIT_ROOT='${_bun_root}' does not look like a Bun WebKit SDK.")
+    endif()
+    set(_bun_sdk_root "${_bun_root}")
+    if(_include STREQUAL "")
+      set(_include "${_bun_root}/include")
+    endif()
+    if(_library STREQUAL "")
+      set(_library "${_bun_root}/lib/libJavaScriptCore.a")
+    endif()
+  endif()
 
   if(APPLE)
     if(_library STREQUAL "")
@@ -41,32 +61,36 @@ function(napi_jsc_resolve_configuration)
     endif()
   endif()
 
-  if(NOT _library STREQUAL "")
+  if(_bun_sdk_root STREQUAL "" AND NOT _library STREQUAL "")
     get_filename_component(_library_name "${_library}" NAME)
     if(_library_name STREQUAL "libJavaScriptCore.a")
       get_filename_component(_library_dir "${_library}" DIRECTORY)
       get_filename_component(_candidate_root "${_library_dir}" DIRECTORY)
-      if(EXISTS "${_candidate_root}/package.json" AND
+      if(EXISTS "${_candidate_root}/include/JavaScriptCore/JavaScript.h" AND
          EXISTS "${_candidate_root}/lib/libWTF.a" AND
          EXISTS "${_candidate_root}/lib/libbmalloc.a")
+        set(_bun_sdk_root "${_candidate_root}")
         if(_include STREQUAL "" AND
            EXISTS "${_candidate_root}/include/JavaScriptCore/JavaScript.h")
           set(_include "${_candidate_root}/include")
         endif()
-        list(APPEND _auto_extra
-          "${_candidate_root}/lib/libWTF.a"
-          "${_candidate_root}/lib/libbmalloc.a"
-        )
-        list(APPEND _auto_defines
-          NAPI_JSC_ENABLE_PRIVATE_RUNTIME_OPTIONS=1
-          NAPI_JSC_STATIC_BUN_SDK=1
-        )
-        if(APPLE)
-          list(APPEND _auto_extra icucore)
-        endif()
-        message(STATUS "Detected Bun WebKit static SDK at ${_candidate_root}")
       endif()
     endif()
+  endif()
+
+  if(NOT _bun_sdk_root STREQUAL "")
+    list(APPEND _auto_extra
+      "${_bun_sdk_root}/lib/libWTF.a"
+      "${_bun_sdk_root}/lib/libbmalloc.a"
+    )
+    list(APPEND _auto_defines
+      NAPI_JSC_ENABLE_PRIVATE_RUNTIME_OPTIONS=1
+      NAPI_JSC_STATIC_BUN_SDK=1
+    )
+    if(APPLE)
+      list(APPEND _auto_extra icucore)
+    endif()
+    message(STATUS "Detected Bun WebKit static SDK at ${_bun_sdk_root}")
   endif()
 
   if(_include STREQUAL "")
