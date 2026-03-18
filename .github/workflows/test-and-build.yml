@@ -340,3 +340,93 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
+
+  top-n-tests:
+    name: top-n-tests
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux
+      - build-wasix-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-linux-amd64
+          path: artifacts/linux
+
+      - name: Download WASIX artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: edge-wasix
+          path: artifacts/wasix
+
+      - name: Unpack artifacts and prepare EdgeJS binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q artifacts/linux/edge-linux-amd64.zip -d artifacts/linux/dist
+          unzip -q artifacts/wasix/edge-wasix.zip -d artifacts/wasix/dist
+          chmod +x artifacts/linux/dist/bin/edge
+
+          mkdir -p build-wasix
+          echo "WASIX artifact files:"
+          find artifacts/wasix/dist -maxdepth 4 -type f | sort
+
+          wasm_source="$(find artifacts/wasix/dist -type f \( -name 'edgejs.wasm' -o -name 'edge.wasm' -o -name 'edge' \) | head -n 1)"
+          if [[ -z "${wasm_source}" ]]; then
+            echo "Failed to locate WASIX wasm module in edge-wasix artifact." >&2
+            exit 1
+          fi
+          cp "${wasm_source}" build-wasix/edgejs.wasm
+
+      - name: Install Wasmer CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSfL https://get.wasmer.io | sh -s "v7.1.0-rc.2"
+          echo "${HOME}/.wasmer/bin" >> "${GITHUB_PATH}"
+          "${HOME}/.wasmer/bin/wasmer" --version
+
+      - name: Install top-n test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tests/top-n-test
+          npm ci --legacy-peer-deps
+
+      - name: Run top-n tests (node)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tests/top-n-test
+          node runner.js -r node --all
+
+      - name: Run top-n tests (edgejs)
+        shell: bash
+        env:
+          EDGEJS_BIN: ${{ github.workspace }}/artifacts/linux/dist/bin/edge
+        run: |
+          set -euo pipefail
+          cd tests/top-n-test
+          node runner.js -r edgejs --all
+
+      - name: Run top-n tests (wasix_edgejs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          wasmer package build .
+          webc_path="$(find "${GITHUB_WORKSPACE}" -maxdepth 2 -type f -name '*.webc' | head -n 1)"
+          if [[ -z "${webc_path}" ]]; then
+            echo "Failed to locate generated .webc package after 'wasmer package build .'." >&2
+            exit 1
+          fi
+          cd tests/top-n-test
+          WASMER_BIN=wasmer EDGEJS_PACKAGE="${webc_path}" node runner.js -r wasix_edgejs --all --skip which, cross-spawn, playwright-core
