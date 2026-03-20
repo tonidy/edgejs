@@ -6,7 +6,7 @@
 // Building native addon against node
 #define NAPI_EXTERN __declspec(dllimport)
 #elif defined(__wasm__)
-#define NAPI_EXTERN __attribute__((__import_module__("napi")))
+#define NAPI_EXTERN __attribute__((__import_module__("napi_v10")))
 #endif
 #endif
 #include "js_native_api.h"
